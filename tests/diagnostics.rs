@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use hyakume::diagnostics::{BoundedLines, MAX_LINE_BYTES, Redacted, subscriber};
 use tracing::level_filters::LevelFilter;
+use tracing_subscriber::fmt::MakeWriter;
 
 /// A cloneable in-memory sink so the test can read what was written.
 #[derive(Clone, Default)]
@@ -68,4 +69,38 @@ fn oversized_events_are_cut_and_marked() {
         "{}",
         &out[out.len() - 40..]
     );
+}
+
+/// Records the size of each formatted event before any sink limit applies.
+#[derive(Clone, Default)]
+struct EventSizes(Arc<Mutex<Vec<usize>>>);
+
+impl std::io::Write for EventSizes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().push(bytes.len());
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for EventSizes {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+#[test]
+fn huge_fields_are_not_formatted_past_the_line_limit() {
+    let sizes = EventSizes::default();
+    let dispatch = subscriber(LevelFilter::TRACE, sizes.clone()).finish();
+    let huge = "x".repeat(MAX_LINE_BYTES * 64);
+    tracing::subscriber::with_default(dispatch, || {
+        tracing::info!(value = %huge, debug = ?huge, "big");
+    });
+    let sizes = sizes.0.lock().unwrap().clone();
+    assert_eq!(sizes.len(), 1, "{sizes:?}");
+    assert!(sizes[0] <= MAX_LINE_BYTES, "{sizes:?}");
 }

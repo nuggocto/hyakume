@@ -12,12 +12,21 @@
 //! - Every event passes through [`BoundedLines`], which writes one line per
 //!   event, escapes control characters so logged text cannot move the
 //!   cursor or forge extra lines, and cuts lines at [`MAX_LINE_BYTES`].
+//!
+//! Formatting is bounded too. The subscriber stops keeping an event's text,
+//! and a span's fields, once they reach [`MAX_LINE_BYTES`], so a huge field
+//! never grows the formatting buffer.
 
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::Mutex;
 
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing::{Event, Subscriber, span};
+use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::fmt::format::{DefaultFields, Format, Writer};
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
+use tracing_subscriber::registry::LookupSpan;
 
 /// Longest diagnostic line, including the shortened marker.
 pub const MAX_LINE_BYTES: usize = 4 * 1024;
@@ -65,23 +74,96 @@ pub fn init_from_env() {
 }
 
 /// Builds the subscriber used by [`init_from_env`] around any sink.
-pub fn subscriber<W>(
+pub fn subscriber<M>(
     level: LevelFilter,
-    sink: BoundedLines<W>,
-) -> tracing_subscriber::fmt::SubscriberBuilder<
-    tracing_subscriber::fmt::format::DefaultFields,
-    tracing_subscriber::fmt::format::Format,
-    LevelFilter,
-    BoundedLines<W>,
->
+    sink: M,
+) -> tracing_subscriber::fmt::SubscriberBuilder<BoundedFields, BoundedFormat, LevelFilter, M>
 where
-    W: Write + Send + 'static,
+    M: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
+    let format = tracing_subscriber::fmt::format()
+        .with_ansi(false)
+        .with_target(false);
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_ansi(false)
-        .with_target(false)
+        .fmt_fields(BoundedFields)
+        .event_format(BoundedFormat(format))
         .with_writer(sink)
+}
+
+/// The default event layout, keeping at most [`MAX_LINE_BYTES`] of each event.
+pub struct BoundedFormat(Format);
+
+impl<S, N> FormatEvent<S, N> for BoundedFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut capped = Capped::new(&mut writer, MAX_LINE_BYTES);
+        self.0.format_event(ctx, Writer::new(&mut capped), event)
+    }
+}
+
+/// The default field layout, keeping at most [`MAX_LINE_BYTES`] per span or event.
+pub struct BoundedFields;
+
+impl<'writer> FormatFields<'writer> for BoundedFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        mut writer: Writer<'writer>,
+        fields: R,
+    ) -> fmt::Result {
+        let mut capped = Capped::new(&mut writer, MAX_LINE_BYTES);
+        DefaultFields::new().format_fields(Writer::new(&mut capped), fields)
+    }
+
+    fn add_fields(
+        &self,
+        current: &'writer mut FormattedFields<Self>,
+        fields: &span::Record<'_>,
+    ) -> fmt::Result {
+        // Repeated records on one span must not grow its fields without end.
+        if current.fields.len() >= MAX_LINE_BYTES {
+            return Ok(());
+        }
+        if !current.fields.is_empty() {
+            current.fields.push(' ');
+        }
+        self.format_fields(current.as_writer(), fields)
+    }
+}
+
+/// Passes text through until `room` bytes are used, then drops the rest.
+///
+/// Dropping is not an error, so formatting finishes and the event is still
+/// written. [`BoundedLines`] marks any line that reached the limit.
+struct Capped<'a> {
+    inner: &'a mut dyn fmt::Write,
+    room: usize,
+}
+
+impl<'a> Capped<'a> {
+    fn new(inner: &'a mut dyn fmt::Write, room: usize) -> Self {
+        Self { inner, room }
+    }
+}
+
+impl fmt::Write for Capped<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let mut end = text.len().min(self.room);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.room = if end < text.len() { 0 } else { self.room - end };
+        self.inner.write_str(&text[..end])
+    }
 }
 
 /// A sink that writes each diagnostic event as one bounded, escaped line.
