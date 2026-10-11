@@ -1,0 +1,35 @@
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tasks.fmt]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Run Clippy with warnings treated as errors"
+run = "cargo clippy --locked --all-targets -- -D warnings"
+
+[tasks.check]
+description = "Check all Rust targets without building binaries"
+run = "cargo check --locked --all-targets"
+
+[tasks.test]
+description = "Run Rust tests"
+run = "cargo test --locked"
+
+[tasks.build]
+description = "Build the application"
+run = "cargo build --locked"
+
+[tasks.ci]
+description = "Run the CI checks in order"
+run = [
+  "mise run fmt-check",
+  "mise run lint",
+  "mise run test",
+  "mise run build",
+]
