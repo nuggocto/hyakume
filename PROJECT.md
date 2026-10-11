@@ -1054,6 +1054,8 @@ dependencies justify it.
   Record how the authenticated exchange binds long-term identity and visual
   verification, including the verifier that identifies an individual temporary
   claim.
+  Record the exact Iroh version and API evidence the identity design relies on,
+  so the design is not proved against an assumed transport capability.
 - [ ] Implement the accepted pairing and session primitives through maintained
   libraries.
 - [ ] Transfer text and a small generated file between two loopback endpoints.

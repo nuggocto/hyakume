@@ -38,6 +38,31 @@ documentation, and downloads; pairing and transfers stay in the installed apps.
 
 See [PROJECT.md](PROJECT.md) for the full plan.
 
+## Where things stand
+
+`hyakume` prints help and version, and nothing else yet:
+
+```sh
+cargo run --locked -- --help
+```
+
+It has no pairing, transfers, or key storage, and it opens no network
+connections.
+
+**Current work:** the deterministic core and loopback protocol.
+
+**Blockers:** none. The core design needs an external review before it is
+finished, so arrange a reviewer early.
+
+**Next three tasks:**
+
+1. Model invitations, trust, revocation, item and batch outcomes, and the
+   order of revocation against publication as explicit Rust states.
+2. Define bounded, escaped projections of peer text and limits for control
+   messages, before peer values reach consent prompts or logs.
+3. Choose and record the PAKE, identity, and session design, with the Iroh
+   version and API evidence it relies on and non-secret test vectors.
+
 ## Development
 
 Use [mise](https://mise.jdx.dev/) to install Rust from `rust-toolchain.toml` and
@@ -64,7 +89,8 @@ Clippy already checks compilation, so CI does not repeat `mise run check`.
 
 Set `HYAKUME_LOG=debug` (or `error`, `warn`, `info`, `trace`) to write
 diagnostics to standard error. Diagnostics redact secrets, escape control
-characters, and keep each event to one line of at most 4 KiB.
+characters, and keep each event to one line of at most 4 KiB. Formatting
+stops at the same limit, so a huge value costs no extra memory.
 
 The lint policy is in `Cargo.toml`: no `unsafe` code, and Clippy warnings
 for `unwrap`, `expect`, `panic!`, `todo!`, and `dbg!` outside tests. CI
