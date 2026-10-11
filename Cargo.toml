@@ -3,5 +3,21 @@ name = "hyakume"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Pass files, text, and links between your own devices"
+repository = "https://github.com/nuggocto/hyakume"
+publish = false
 
 [dependencies]
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unwrap_used = "warn"

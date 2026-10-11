@@ -38,6 +38,27 @@ documentation, and downloads; pairing and transfers stay in the installed apps.
 
 See [PROJECT.md](PROJECT.md) for the full plan.
 
+## Where things stand
+
+**Current work:** the deterministic core and loopback protocol.
+
+What exists:
+
+- `hyakume`, which prints help and version (`cargo run -- --help`). It has
+  no pairing or transfers yet, and it opens no network connections.
+
+Blockers:
+
+- Machines without a Secret Service have no accepted way to store keys yet.
+
+Next three tasks:
+
+1. Choose the PAKE, identity design, and session construction, and record
+   how the exchange binds identity to the visual verification.
+2. Model device identity, trust, invitations, offers, transfers, and
+   revocation as explicit Rust states.
+3. Transfer text and a small generated file between two loopback endpoints.
+
 ## Development
 
 Use [mise](https://mise.jdx.dev/) to install Rust from `rust-toolchain.toml` and
@@ -62,6 +83,23 @@ mise run ci
 The Linux CI runs the same task for pull requests and pushes to `shrek`.
 Clippy already checks compilation, so CI does not repeat `mise run check`.
 
+Set `HYAKUME_LOG=debug` (or `error`, `warn`, `info`, `trace`) to write
+diagnostics to standard error. Diagnostics redact secrets, escape control
+characters, and keep each event to one line of at most 4 KiB.
+
+The lint policy is in `Cargo.toml`: no `unsafe` code, and Clippy warnings
+for `unwrap`, `expect`, `panic!`, `todo!`, and `dbg!` outside tests. CI
+treats warnings as errors.
+
 Contact: [vincent@sshmoi.com](mailto:vincent@sshmoi.com).
 
+## License
+
 Licensed under [Apache-2.0](LICENSE).
+
+Third-party code reaches Hyakume only through the crates in `Cargo.lock`.
+Each binary release will include the license text and copyright notices of
+every crate compiled into it, generated from the locked graph at release
+time. Dependencies must use licenses compatible with Apache-2.0. Source
+code copied from elsewhere is not accepted without a recorded license and
+attribution.
