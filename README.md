@@ -38,27 +38,6 @@ documentation, and downloads; pairing and transfers stay in the installed apps.
 
 See [PROJECT.md](PROJECT.md) for the full plan.
 
-## Where things stand
-
-**Current work:** the deterministic core and loopback protocol.
-
-What exists:
-
-- `hyakume`, which prints help and version (`cargo run -- --help`). It has
-  no pairing or transfers yet, and it opens no network connections.
-
-Blockers:
-
-- Machines without a Secret Service have no accepted way to store keys yet.
-
-Next three tasks:
-
-1. Choose the PAKE, identity design, and session construction, and record
-   how the exchange binds identity to the visual verification.
-2. Model device identity, trust, invitations, offers, transfers, and
-   revocation as explicit Rust states.
-3. Transfer text and a small generated file between two loopback endpoints.
-
 ## Development
 
 Use [mise](https://mise.jdx.dev/) to install Rust from `rust-toolchain.toml` and
