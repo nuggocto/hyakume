@@ -1,6 +1,6 @@
 # Hyakume ༼⁠ ⁠つ⁠ ⁠◕⁠‿⁠◕⁠ ⁠༽⁠つ
 
-> A quiet bridge between trusted devices, where sharing is a choice and trust
+> A lovely bridge between trusted devices, where sharing is a choice and trust
 > is earned.
 
 Hyakume is a planned app for sending files, text, links, and explicitly chosen
