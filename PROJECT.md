@@ -498,6 +498,51 @@ A missing or corrupt spool makes resume unavailable; never reread the current
 stdin or substitute new bytes under the old transfer ID. Other sources with an
 unknown length use the same preparation contract or are refused before offer.
 
+### Local key storage
+
+The device key and the per-pair secrets never reach a plain file, a log, or
+command output. Each device chooses one store at `hyakume init` and keeps it.
+Hyakume never switches stores silently, and never because of how the user
+connected, so a device's identity lives in exactly one place.
+
+| Platform | Stores |
+| --- | --- |
+| Linux | Secret Service, or a passphrase-encrypted key file |
+| Windows | Credential Manager / DPAPI |
+| Android | Android Keystore |
+| iOS (post-v1) | Keychain |
+
+On Linux, `hyakume init` offers the Secret Service when it is reachable and
+unlocked. Otherwise it offers the passphrase-encrypted key file: over SSH, on
+headless machines, and where the keyring is locked or missing. If the user
+declines both, init refuses and explains how to set up either one.
+
+- The key file uses a maintained format and crates, such as `age` with a
+  passphrase, or Argon2id with XChaCha20-Poly1305. It adds no new primitive.
+- Hyakume reads the passphrase from the terminal without echo. Scripts may pass
+  `--passphrase-fd`, with a warning that a stored passphrase gives up the
+  protection against a stolen disk.
+- `hyakume unlock` decrypts the keys into the desktop service, which keeps
+  them in memory until `hyakume lock`, service stop, or reboot. Running the
+  service as a systemd user service with lingering keeps it unlocked after the
+  SSH session ends.
+- While the store is locked, the device answers no discovery queries, peers see
+  it as offline, and queued work waits. `hyakume status` reports the store and
+  whether it is locked.
+- Every Secret Service call has a short timeout. A keyring that would need a
+  graphical unlock prompt reads as locked; it never hangs an SSH session.
+- A forgotten passphrase or a lost store follows the lost-identity rule: local
+  reset and fresh pairing.
+
+This protects keys from other local users and from a stolen disk, backup, or
+copied home directory. It does not protect them from malware running as the
+same user while the store is unlocked; no supported store does.
+
+Hyakume does not use plain permission-only key files, keys derived from an SSH
+agent, or automatic fallback between stores. TPM sealing or `systemd-creds`
+are considered only if a recorded need appears for unattended restart without
+anyone unlocking the device.
+
 ## Domain Model
 
 The product relationships are decided. Phase 1 chooses the cryptographic
@@ -630,7 +675,7 @@ stronger boundary only where an OS sandbox supplies one.
 | Peer presentation | bounded safe text projections, escaped controls, explicit consent fields, redacted logs |
 | Files | safe names, no-follow writes, spool quotas, private partials, qualified atomic no-clobber publish, separate provider export |
 | Local IPC | per-user permissions, peer checks where available, request authorization |
-| Local state | secure-store adapter, hardened fallback, migrations, corruption handling |
+| Local state | OS secret store or passphrase-encrypted key file chosen at init, no silent fallback, migrations, corruption handling |
 | Rendezvous and relay | no payload storage, minimal metadata retention, redacted logs, quotas, endpoint encryption |
 | Website | strict CSP, no third-party assets, immutable identified builds, deployment provenance, verified download links |
 | Android bridge | narrow Rust FFI boundary with a typed Kotlin wrapper, intent allowlist, lifecycle tests |
@@ -724,7 +769,7 @@ must not introduce different lifecycle rules.
 | One item of a batch fails | Retain published items and derive progress or terminal outcome from all item states under Transfer states |
 | Export fails or the provider cannot guarantee no-clobber creation | `Received; export failed`; the published local file is kept and partial external output is reported |
 | Local identity missing or corrupt | Fail closed with an explicit local reset path that requires fresh pairing |
-| Secure store unavailable | Hardened fallback or typed refusal; key material is never stored unprotected |
+| Key store locked, unreachable, or absent | Report `locked` and wait for `hyakume unlock`; an unresponsive Secret Service reads as locked after a short timeout; init refuses when no store is set up; key material is never stored unprotected |
 | Rendezvous or relay unavailable | LAN and direct paths continue; typed unavailable result for internet operation |
 | Relay is compromised or observes traffic | Payloads stay encrypted; the relay can observe metadata, record ciphertext, or deny service; replayed or modified traffic cannot create authorization or false completion |
 | Another local OS user opens the IPC socket | Rejected by per-user permissions and peer checks before any request runs |
@@ -908,6 +953,7 @@ or interrupted work as complete.
 | Website | Static Astro in `hyakume-front`, pnpm, Cloudflare Pages at the acquired `hyakume.org` domain; introduced in Phase 12 |
 | Hosted APIs | Axum + Tower where the Iroh integration needs them |
 | Persistence | SQLite through rusqlite, or simpler files if Phase 2 proves better |
+| Key storage | Linux Secret Service or passphrase-encrypted key file in Phase 2; Windows Credential Manager / DPAPI in Phase 7; Android Keystore in Phase 8 |
 | Config and DTOs | serde, JSON, TOML |
 | Errors | thiserror in libraries, anyhow at executable boundaries |
 | Logging | tracing with bounded redacted sinks |
@@ -1057,6 +1103,12 @@ dependencies justify it.
 - [ ] Persist identity, trust, invitation, and transfer state with migrations.
 - [ ] Fail closed on missing or corrupt identity material and provide an explicit
   local reset path that requires fresh pairing.
+- [ ] Store the device key and pair secrets in the Secret Service or a
+  passphrase-encrypted key file, chosen once at `hyakume init` under Local key
+  storage. Refuse when neither is set up.
+- [ ] Add `hyakume unlock` and `hyakume lock`, and report the store and its
+  locked state in `hyakume status`. Read passphrases from the terminal without
+  echo, and bound every Secret Service call with a timeout.
 - [ ] Own service, IPC, filesystem, and transfer tasks under the Shutdown contract.
 - [ ] Qualify the shutdown overrun path with stalled blocking work and restart
   recovery. Verify that deadline expiry never reports successful cancellation
@@ -1078,6 +1130,11 @@ dependencies justify it.
   across restart and are released under the retention policy.
 - [ ] Unsupported publication destinations receive a typed refusal, and hostile
   peer text cannot inject terminal controls or forge a consent prompt.
+- [ ] Over SSH and on a headless machine, a device initializes with a
+  passphrase-encrypted key file, unlocks after a restart, and transfers. A
+  copied state directory reveals no key material without the passphrase.
+- [ ] A locked, unresponsive, or absent key store gives a typed refusal or a
+  `locked` status, never a hang and never an unprotected key on disk.
 - [ ] Packaged CLI artifacts pass a clean-host smoke test.
 
 ### Phase 3 - LAN discovery and permanent pairing
@@ -1891,6 +1948,8 @@ that time.
 - [UniFFI user guide](https://mozilla.github.io/uniffi-rs/latest/)
 - [SPAKE2, a balanced PAKE (RFC 9382)](https://www.rfc-editor.org/rfc/rfc9382.html)
 - [CPace balanced PAKE (IRTF CFRG draft)](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/)
+- [Freedesktop Secret Service API](https://specifications.freedesktop.org/secret-service-spec/latest/)
+- [age file encryption format](https://age-encryption.org/v1)
 - [Android Keystore](https://developer.android.com/privacy-and-security/keystore)
 - [Windows UI Automation providers](https://learn.microsoft.com/windows/win32/winauto/uiauto-providersoverview)
 - [Apple accessibility for custom views](https://developer.apple.com/documentation/appkit/nsaccessibilityprotocol) (post-v1)
