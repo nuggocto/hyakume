@@ -17,25 +17,24 @@ no rendezvous or relay that receives the keys needed to decrypt payloads.
 
 ## Start Here
 
-Hyakume is in planning. Begin with Phase 0 only. Do not create the production
-package, public protocol, hosted service, or production platform applications
-until the core feasibility checks in Phase 0 pass. Desktop presentation and mobile
-support have separate gates; their unfinished checks do not block the Linux CLI.
+Hyakume is in planning. Begin with Phase 1. Do not create the public protocol,
+hosted service, or production platform applications before the phase that owns
+them. Desktop presentation and mobile support have separate gates; their
+unfinished checks do not block the Linux CLI.
 
 The first useful proof is two isolated Linux endpoints that introduce each
 other, verify the same identity, transfer one generated file, reject one offer,
-revoke trust, and leave no unsafe output. A disposable CLI and screen mockup may
-prove these flows before production architecture exists. Linux desktop and
-Linux-to-Windows work follow the CLI; Phase 8 runs the contract with Android.
-macOS and iOS implementation, feasibility probes, CI, packaging, signing, and
-distribution begin only after v1 publication and a recorded continuation
-decision. Their unfinished work never blocks v1.
+revoke trust, and leave no unsafe output. Linux desktop and Linux-to-Windows
+work follow the CLI; Phase 8 runs the contract with Android. macOS and iOS
+implementation, feasibility probes, CI, packaging, signing, and distribution
+begin only after v1 publication and a recorded continuation decision. Their
+unfinished work never blocks v1.
 
 GPUI is the fixed desktop toolkit, and Iroh is the confirmed P2P transport.
-Neither is a replacement candidate. Phase 0 pins the accepted Iroh configuration,
-PAKE, and identity design for the core. Phase 5 pins and qualifies GPUI on Linux
-before production GUI work; Phase 7 qualifies Windows presentation. Phase 16
-qualifies macOS after v1.
+Neither is a replacement candidate. Phase 1 selects the PAKE and identity design
+for the core. Phase 3 pins the accepted Iroh version and configuration. Phase 5
+pins and qualifies GPUI on Linux before production GUI work; Phase 7 qualifies
+Windows presentation. Phase 16 qualifies macOS after v1.
 Each feasibility decision states its evidence, remaining risk, and required work.
 Open dependency choices also record rejected material alternatives and a `go`,
 `replace`, `descope`, or `stop` verdict. GPUI and Iroh decisions record passing or
@@ -70,7 +69,7 @@ The first supported release is a Linux CLI that works over an isolated LAN. Two
 Linux devices permanently pair, verify each other, reconnect, transfer files and
 text, approve or reject offers, revoke trust, and publish received files safely.
 It requires no account, hosted service, GUI, project website, mobile
-application, packaging channel, or finished brand. Phases 0 through 4 build and
+application, packaging channel, or finished brand. Phases 1 through 4 build and
 qualify this release; completing an earlier internal phase does not require
 publishing it.
 
@@ -192,7 +191,7 @@ Traditional Chinese.
 The first cohort is Linux users who already move content between two owned Linux
 devices; record their current workaround and one recurring transfer problem.
 Linux-to-Windows is the next benefit hypothesis, with Linux-to-Android following
-the desktop work. Neither is proved by the Linux protocol demo. At Phase 0,
+the desktop work. Neither is proved by the Linux protocol demo. At Phase 3,
 declare a pairing/verifier confusion threshold and a success measure before
 trials. At Phase 4, observe repeated real workflow use and record whether the CLI
 earns desktop GUI and Windows work. Phase 7 records whether the desktop product
@@ -295,7 +294,7 @@ Closing the GUI does not cancel accepted work owned by the desktop service.
   peer. Accountless v1 has no global remote-revocation authority.
 
 The exact PAKE, transport identity, session construction, KDF, and content
-encryption are selected in Phase 0 after platform and dependency review.
+encryption are selected in Phase 1 after platform and dependency review.
 
 Native invitations use the `hyakume` URI scheme, with a versioned invitation
 token in the fragment, for example `hyakume://invite#<token>`. The token carries
@@ -501,9 +500,9 @@ unknown length use the same preparation contract or are refused before offer.
 
 ## Domain Model
 
-The product relationships are decided. Phase 0 chooses the cryptographic and
-transport representation beneath them. Later phases decide persistence and wire
-fields when real consumers exist.
+The product relationships are decided. Phase 1 chooses the cryptographic
+representation beneath them, and Phase 3 the transport configuration. Later
+phases decide persistence and wire fields when real consumers exist.
 
 ```text
 LocalIdentity
@@ -542,7 +541,7 @@ A temporary session has no transition to permanent trust. It must end as
   borrow from network frames, database rows, or UI state.
 - Private key material is never a plain field copied through domain structs.
   `LocalIdentity` holds an opaque key handle or protected secret wrapper chosen
-  in Phase 0.
+  in Phase 1.
 - Secure storage protects persisted transport secrets; it does not automatically
   make an Iroh signing key hardware-non-exportable. Qualify the selected key
   loading/signing API, required in-process secret lifetime, and OS storage path.
@@ -566,7 +565,7 @@ the stable part.
 
 | Type or type group | Responsibility | Decide in | Why then |
 | --- | --- | --- | --- |
-| `DeviceId`, `LocalIdentity`, `RemoteDeviceIdentity`, `KeyHandle` | Represent long-term endpoint identity without spreading private key bytes | Phase 0 and Phase 1 | Identity derivation depends on the accepted transport, secure store, and rotation design |
+| `DeviceId`, `LocalIdentity`, `RemoteDeviceIdentity`, `KeyHandle` | Represent long-term endpoint identity without spreading private key bytes | Phase 1 | Identity derivation depends on the accepted transport, secure store, and rotation design |
 | `DeviceName`, `LocalAlias` | Keep peer-declared presentation separate from private local naming | Phase 3 | LAN discovery and pairing provide the first real naming and spoofing cases |
 | `TrustState`, `TrustRecord` | Record trusted or revoked identity, verification, and local policy | Phase 1, persisted in Phase 2 | The state machine must exist before storage shape is chosen |
 | `InvitationId`, `InvitationSecret`, `InvitationKind`, `InvitationState` | Model permanent and temporary introductions, expiry, claims, use, and failure | Phase 1, extended in Phase 3 and Phase 10 | Loopback defines the core; human codes and native temporary sessions add boundary-specific fields later |
@@ -586,7 +585,7 @@ the stable part.
 | Android bridge DTOs | Validate intents, content URIs, permissions, and lifecycle events | Phase 8 and Phase 9 | Native Android behavior determines the smallest safe bridge |
 | iOS bridge DTOs | Validate share-extension input, security-scoped URLs, Keychain access, notifications, and lifecycle events | Post-v1 Phases 17 and 18 | Native iOS behavior determines the smallest safe bridge |
 
-Do not create public repository, transport, or key-store traits in Phase 0.
+Do not create public repository, transport, or key-store traits up front.
 Start with concrete accepted implementations. Extract a small consumer-owned
 trait when a second implementation or a focused test boundary proves its use.
 
@@ -737,7 +736,7 @@ must not introduce different lifecycle rules.
 
 ## Initial Resource Budget
 
-Phase 0 records the first estimates and Phase 4 measures real memory before
+Phase 1 records the first estimates and Phase 4 measures real memory before
 these laptop values are accepted or revised. A mobile host may lower any value;
 neither configuration nor a peer may raise a compiled maximum.
 
@@ -791,7 +790,7 @@ the application buffer budget across sending, receiving, verification, and any
 additional copies; acquire capacity before allocation and apply backpressure.
 The other 128 MiB of the desktop service budget must cover transport buffers,
 retransmissions, frame decoding, metadata, task stacks, storage caches, and the
-runtime. Phase 0 estimates and Phase 4 measurements must account for those costs
+runtime. Phase 1 estimates and Phase 4 measurements must account for those costs
 and lower concurrency or buffer windows when necessary.
 
 Paused work releases active transfer, active-item, and buffer capacity but
@@ -897,8 +896,8 @@ or interrupted work as complete.
 | --- | --- |
 | Language | Rust 1.99.0 initially, edition 2024, one package until a real workspace boundary exists |
 | Async | Tokio with required features only |
-| P2P transport | Iroh, confirmed; Phase 0 pins a supported version and validates its configuration and integration |
-| Human-code pairing | maintained PAKE selected in Phase 0 |
+| P2P transport | Iroh, confirmed; Phase 3 pins a supported version and validates its configuration and integration |
+| Human-code pairing | maintained PAKE selected in Phase 1 |
 | Content consistency | BLAKE3 digest bound to authenticated transfer metadata; the accepted session or AEAD design supplies security integrity |
 | CLI | clap |
 | Desktop GUI | GPUI for Linux and Windows in v1; macOS follows after v1 |
@@ -955,11 +954,11 @@ dependencies justify it.
   Support is earned one platform at a time.
 - Phases 6, 7, 9, 11, 16, and 18 end with a written continuation decision before
   the next large platform commitment. The decision may continue or hold for
-  redesign. A Phase 0 gate may replace the selected PAKE. GPUI and Iroh remain
-  fixed; a missing mandatory capability requires integration or upstream work
-  within the affected dependency and a passing recheck. Removing a required v1
-  platform requires a recorded decision and roadmap amendment.
-- Record Phase 0 decisions using the format and fixed-dependency rules in
+  redesign. The Phase 1 design review may replace the selected PAKE. GPUI and
+  Iroh remain fixed; a missing mandatory capability requires integration or
+  upstream work within the affected dependency and a passing recheck. Removing a
+  required v1 platform requires a recorded decision and roadmap amendment.
+- Record feasibility decisions using the format and fixed-dependency rules in
   Start Here.
 - Tag internal milestones only when useful. Completing a phase does not require
   publishing a release.
@@ -971,7 +970,6 @@ dependencies justify it.
 
 #### V1
 
-- [ ] **Phase 0** - Feasibility, one package, and CI
 - [ ] **Phase 1** - Deterministic core and loopback protocol
 - [ ] **Phase 2** - CLI, local service, IPC, and safe file pipeline
 - [ ] **Phase 3** - LAN discovery and permanent pairing
@@ -994,75 +992,6 @@ dependencies justify it.
 - [ ] **Phase 17** - iOS alpha
 - [ ] **Phase 18** - iOS lifecycle beta and release qualification
 
-### Phase 0 - Feasibility, one package, and CI
-
-Complete the disposable core feasibility checks before creating the production
-package or accepting core dependencies. Optional early GPUI risk probes for
-Linux and Windows may inform the later gates, but their unfinished capabilities
-do not block Phase 1. Apple platform probes are post-v1 work.
-Full applications, platform packaging, and production FFI remain in their named
-phases. Log deferred risks with an owner and gate rather than declaring them passed.
-
-#### Build now
-
-- [ ] Run a disposable CLI and screen-mockup trial with representative users.
-  Verify permanent and temporary trust, visual verification, receive consent,
-  route labels, revocation, and failure states. Record confusion and stop or
-  redesign conditions rather than explaining around them.
-- [ ] Record the first Linux cohort, recurring problem, current workaround,
-  pairing/verifier success and confusion thresholds before the trial. Test
-  explicit approval on personal trusted devices without explaining away confusion.
-- [ ] Spike Iroh between two Linux endpoints on loopback or an isolated LAN,
-  then exercise direct and relayed paths. Pin the supported Iroh version and
-  configuration. Record metadata exposure and how production builds avoid
-  unintended public relay or discovery infrastructure. Use the disposable
-  endpoint contract described at the start of this plan. Capture ambient discovery
-  traffic and prove that it exposes neither raw hostnames nor a stable device
-  identity. Do not accept standard
-  mDNS publication of a durable endpoint ID as private discovery. Prove the
-  rotating or pair-specific discovery design before accepting the identity and
-  Iroh integration; Phase 3 implements and qualifies the accepted design.
-- [ ] Evaluate maintained balanced PAKE choices (SPAKE2, CPace), identity
-  design, session construction, attempt limiting, maintenance, and licenses.
-  Record how the authenticated exchange binds long-term identity and visual
-  verification, including the verifier that identifies an individual temporary
-  claim.
-- [ ] Record whether a bounded early Linux/Windows GPUI risk probe is useful now
-  or deferred to its required platform gate. If run, record evidence and limits
-  without freezing production integration, claiming support, or gating the
-  Linux CLI on that work.
-
-- [ ] Create one edition 2024 `hyakume` package with `src/lib.rs`, `src/main.rs`,
-  and no workspace. Cargo resolver 3 follows from edition 2024; declare it
-  explicitly only if later workspace extraction requires a virtual workspace.
-- [ ] Add `LICENSE` with the Apache-2.0 text, define the third-party notice
-  policy, commit `Cargo.lock`, and add a small lint policy.
-- [x] Add `rust-toolchain.toml` with Rust 1.99.0, minimal profile, and required
-  components.
-- [x] Document concise Cargo commands for format, lint, check, test, and build.
-  Graph-resolving CI and release commands use `--locked`.
-- [x] Add one Linux CI job using the documented Cargo commands. Add Windows,
-  Android, and web jobs in their own v1 phases; Apple jobs are post-v1 work.
-- [ ] Implement `hyakume --version` and concise help.
-- [ ] Add bounded redacted logging and prove secrets and payloads are absent.
-- [ ] Record the current threat model and accepted Phase 0 choices.
-
-#### Done when
-
-- [ ] The selected core builds and runs between two isolated Linux endpoints.
-- [ ] The accepted discovery and identity design passes the ambient disclosure
-  check, including the actual transport-secret loading/storage contract.
-- [ ] Representative users complete the disposable trust and transfer flow, or
-  the roadmap records `replace`, `descope`, or `stop` and the required change.
-- [ ] No custom cryptographic primitive is proposed.
-- [ ] Every core feasibility choice has a verdict, with no unaccepted core
-  release blocker entering Phase 1. Deferred GUI/mobile risks name their owning
-  gate and do not masquerade as supported capabilities.
-- [ ] A clean checkout builds and tests with the documented Cargo commands.
-- [ ] The active Rust compiler matches `rust-toolchain.toml`.
-- [ ] The CLI prints help and version without starting network services.
-- [ ] The initial dependency graph contains only code used by this phase.
-
 ### Phase 1 - Deterministic core and loopback protocol
 
 #### Build now
@@ -1074,6 +1003,11 @@ phases. Log deferred risks with an owner and gate rather than declaring them pas
 - [ ] Define bounded safe peer-text projections and consent fields. Test terminal
   escapes, forged multiline prompts, bidi controls, and oversized previews.
 - [ ] Define bounded versioned control DTOs and error codes.
+- [ ] Evaluate maintained balanced PAKE choices (SPAKE2, CPace), identity
+  design, session construction, attempt limiting, maintenance, and licenses.
+  Record how the authenticated exchange binds long-term identity and visual
+  verification, including the verifier that identifies an individual temporary
+  claim.
 - [ ] Implement the accepted pairing and session primitives through maintained
   libraries.
 - [ ] Transfer text and a small generated file between two loopback endpoints.
@@ -1086,6 +1020,7 @@ phases. Log deferred risks with an owner and gate rather than declaring them pas
 - [ ] Add narrow fuzz targets for invitation and frame decoding.
 - [ ] Obtain an external design review of identity, pairing, key separation,
   invitation consumption, protocol states, and the published test vectors.
+- [ ] Record the current threat model and accepted core choices.
 
 #### Done when
 
@@ -1098,7 +1033,9 @@ phases. Log deferred risks with an owner and gate rather than declaring them pas
   before revocation remain published and cannot revive cancelled work.
 - [ ] Hostile peer text cannot alter terminal state or impersonate approval UI.
 - [ ] No test depends on sleeps, ambient time, or shared mutable fixtures.
-- [ ] No unaccepted design-review finding enters persistence or LAN pairing work.
+- [ ] No custom cryptographic primitive is proposed.
+- [ ] Every core choice has a verdict. No unaccepted design-review finding or
+  core release blocker enters persistence or LAN pairing work.
 
 ### Phase 2 - CLI, local service, IPC, and safe file pipeline
 
@@ -1158,16 +1095,30 @@ phases. Log deferred risks with an owner and gate rather than declaring them pas
   unavailable, intercepted, and cancelled invitations.
 - [ ] Save declared names and private aliases separately.
 - [ ] Add reconnect, disconnect, remove, revoke, and fresh re-pair behavior.
+- [ ] Pin the supported Iroh version and configuration. Record metadata
+  exposure and how production builds avoid unintended public relay or discovery
+  infrastructure. Do not accept standard mDNS publication of a durable endpoint
+  ID as private discovery.
 - [ ] Test spoofed discovery, duplicate names, invitation guessing/racing,
   replay, ambient identity correlation, stale trust, and revoked peers on an
-  isolated LAN.
+  isolated LAN. Capture ambient discovery traffic and prove that it exposes
+  neither raw hostnames nor a stable device identity.
+- [ ] Record the first Linux cohort, recurring problem, current workaround,
+  pairing/verifier success and confusion thresholds before the trial.
+- [ ] Run a trial with representative users. Verify permanent trust, visual
+  verification, receive consent, revocation, and failure states. Test explicit
+  approval on personal trusted devices. Record confusion and stop or redesign
+  conditions rather than explaining around them.
 
 #### Done when
 
 - [ ] Two desktop devices pair and reconnect on a LAN without hosted services.
 - [ ] Names never grant trust and consumed invitations cannot be reused.
 - [ ] An untrusted LAN observer cannot derive a stable Hyakume device identity
-  from ambient discovery.
+  from ambient discovery, including through the actual transport-secret
+  loading and storage contract.
+- [ ] Representative users complete the trust and transfer flow, or the roadmap
+  records `replace`, `descope`, or `stop` and the required change.
 - [ ] Removal blocks future authentication, invalidates active authorization,
   and cancels outstanding work under the publication ordering. Fresh pairing
   does not revive old offers or resumable transfers.
@@ -1864,7 +1815,7 @@ when a real platform requirement cannot fit clearly in those two.
 
 ## Documentation Policy
 
-Do not create an empty mature `docs/` tree during Phase 0.
+Do not create an empty mature `docs/` tree up front.
 
 Keep behavioral definitions in their owning contract sections. Required
 Invariants summarize them, the Fault Model applies them, and phase checklists
@@ -1880,7 +1831,7 @@ Start with:
   not in the README or other documents;
 - `SECURITY.md` when the project is public;
 - `LICENSE` with the Apache-2.0 text and the third-party notice policy;
-- a concise threat model and the accepted Phase 0 choices.
+- a concise threat model and the accepted core choices.
 
 Add documents when their subject exists:
 
@@ -1958,10 +1909,10 @@ constraints.
 
 The largest risks are short-code security, protocol compatibility, safe file
 publication, background lifecycle, website and download integrity, relay
-metadata and cost, and the number of supported platforms. Phase 0 tests the core
-and private discovery before production core work. GPUI and mobile capabilities
-pass their own gates before the affected application/support work; optional early
-probes expose risk without delaying the first Linux CLI release.
+metadata and cost, and the number of supported platforms. Phase 1 tests the core
+and Phase 3 proves private discovery before LAN pairing ships. GPUI and mobile
+capabilities pass their own gates before the affected application/support work;
+optional early probes expose risk without delaying the first Linux CLI release.
 
 Iroh, GPUI, native Kotlin with Jetpack Compose, and the separate static Astro
 website using pnpm and Cloudflare Pages are committed v1 implementation choices.
