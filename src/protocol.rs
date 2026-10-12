@@ -715,6 +715,10 @@ mod tests {
         let mut trailing = frame[4..].to_vec();
         trailing.push(0);
         assert_eq!(decode_payload(&trailing), Err(ProtocolError::Trailing));
+        // A fixed-size field followed by one byte too many.
+        let mut commit = vec![tag::PAIR_COMMIT];
+        commit.extend([0; 33]);
+        assert_eq!(decode_payload(&commit), Err(ProtocolError::Trailing));
         assert_eq!(
             decode_payload(&[200]),
             Err(ProtocolError::UnknownMessage(200))

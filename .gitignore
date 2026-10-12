@@ -2,7 +2,9 @@
 /target/
 /fuzz/target/
 
-# Fuzzing crash reports and coverage
+# Fuzzing inputs, crash reports, and coverage. The corpus grows with every
+# run; a crash worth keeping becomes a named unit test instead.
+/fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
 

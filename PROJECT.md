@@ -1079,7 +1079,9 @@ dependencies justify it.
 - [x] Revocation prevents later authorization and publication; items committed
   before revocation remain published and cannot revive cancelled work.
 - [x] Hostile peer text cannot alter terminal state or impersonate approval UI.
-- [x] No test depends on sleeps, ambient time, or shared mutable fixtures.
+- [x] No test sleeps to wait for state or shares mutable fixtures. State
+  machines read time only from an injected clock; tests about network
+  deadlines let real time pass, with wide margins.
 - [x] No custom cryptographic primitive is proposed.
 - [ ] Every core choice has a verdict. No unaccepted design-review finding or
   core release blocker enters persistence or LAN pairing work.

@@ -393,3 +393,41 @@ Three tests cover this:
 The slow-client test and the late-answer test sleep on purpose, because
 letting a deadline pass is the behavior under test. The busy test ticks
 every 100 ms instead.
+
+## 8. Generated test files leave the repository
+
+Two folders held files that tools write on their own:
+
+```diff
+ fuzz/
+-├── corpus/frame/            229 inputs libFuzzer saved
+-├── corpus/invitation_token/  70 inputs libFuzzer saved
+ ├── fuzz_targets/
+ └── Cargo.toml
+-proptest-regressions/
+-└── properties.txt           3 seeds proptest saved after failures
+```
+
+The fuzz corpus grew with every `mise run fuzz`, so each run left the tree
+dirty. It also gave no head start: both targets decode small inputs, and an
+empty corpus reached 153 inputs in 6 seconds. `/fuzz/corpus/` is now
+ignored, and `mise run fuzz` lets cargo-fuzz create it.
+
+Proptest replays its saved seeds before each run, but nobody reading the
+tests could see what they checked. Each seed is now a named unit test:
+
+- `one_column_never_holds_part_of_an_escape` covers two seeds. A no-break
+  space, then a run of control characters, are projected into one column.
+  No escape is ever cut in half.
+- `truncated_trailing_and_unknown_messages_are_refused` gains the third. A
+  pairing commit with one byte past its 32-byte field is refused as
+  trailing.
+
+`failure_persistence: None` stops proptest from writing new seed files. A
+failure still prints the shrunk input, and that input should become a named
+test the same way.
+
+The plan's rule about time in tests now says what the tests actually do.
+None sleeps to wait for state. State machines read time only from the
+injected clock. Tests about network deadlines let real time pass on
+purpose, with wide margins.

@@ -312,6 +312,16 @@ mod tests {
     }
 
     #[test]
+    fn one_column_never_holds_part_of_an_escape() {
+        let space = SafeLine::project("\u{a0}".as_bytes(), 1);
+        assert_eq!(space.as_str(), "");
+        assert!(space.is_shortened());
+        let controls = SafeLine::project(b" \x7f\x00\x0b", 1);
+        assert_eq!(controls.as_str(), " ");
+        assert!(controls.is_shortened());
+    }
+
+    #[test]
     fn previews_stop_at_their_line_and_byte_limits() {
         let text = "one\ntwo\x1b[31m\nthree\nfour";
         let block = SafeBlock::project(text.as_bytes(), 4096, 3, 80);

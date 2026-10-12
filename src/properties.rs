@@ -25,6 +25,9 @@ fn config() -> ProptestConfig {
     ProptestConfig {
         cases: 256,
         max_shrink_iters: 2048,
+        // A failure prints its shrunk input; it becomes a named unit test
+        // instead of a seed file in the tree.
+        failure_persistence: None,
         ..ProptestConfig::default()
     }
 }
