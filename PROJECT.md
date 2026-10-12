@@ -110,8 +110,8 @@ V1 includes:
 - direct verified artifacts plus Scoop, AUR `hyakume-bin`, and a qualified
   Android distribution channel;
 - versioned protocol, state, config, invitation, and CLI JSON contracts;
-- checksums, SBOM, provenance, upgrade notes, threat model, privacy notes, and
-  exact-artifact native QA.
+- checksums, SBOM, provenance, upgrade notes, privacy notes, and exact-artifact
+  native QA.
 
 Linux, Windows, and Android are required for v1. Development begins with
 Linux-to-Linux, then the Linux desktop and Linux-to-Windows, then Android.
@@ -1008,9 +1008,8 @@ dependencies justify it.
   Start Here.
 - Tag internal milestones only when useful. Completing a phase does not require
   publishing a release.
-- Keep the current work by name, exact commands, blockers, and next three tasks
-  in the repository README once implementation starts. Phase numbers and progress
-  checkboxes stay in `PROJECT.md`.
+- Track progress only in `PROJECT.md`. The README explains the project simply
+  and does not track progress.
 
 ### Progress Board
 
@@ -1042,46 +1041,46 @@ dependencies justify it.
 
 #### Build now
 
-- [ ] Model device identity, trust, invitation, offer, per-item and batch
+- [x] Model device identity, trust, invitation, offer, per-item and batch
   transfer outcomes, cancellation, and revocation as explicit Rust states.
-- [ ] Model revocation across active sessions, queued offers, paused work, and
+- [x] Model revocation across active sessions, queued offers, paused work, and
   resume authority, including its ordering against final publication.
-- [ ] Define bounded safe peer-text projections and consent fields. Test terminal
+- [x] Define bounded safe peer-text projections and consent fields. Test terminal
   escapes, forged multiline prompts, bidi controls, and oversized previews.
-- [ ] Define bounded versioned control DTOs and error codes.
-- [ ] Evaluate maintained balanced PAKE choices (SPAKE2, CPace), identity
+- [x] Define bounded versioned control DTOs and error codes.
+- [x] Evaluate maintained balanced PAKE choices (SPAKE2, CPace), identity
   design, session construction, attempt limiting, maintenance, and licenses.
   Record how the authenticated exchange binds long-term identity and visual
   verification, including the verifier that identifies an individual temporary
   claim.
   Record the exact Iroh version and API evidence the identity design relies on,
   so the design is not proved against an assumed transport capability.
-- [ ] Implement the accepted pairing and session primitives through maintained
+- [x] Implement the accepted pairing and session primitives through maintained
   libraries.
-- [ ] Transfer text and a small generated file between two loopback endpoints.
-- [ ] Publish non-secret protocol and cryptographic test vectors.
-- [ ] Add unit and property tests for legal transitions, batch aggregation,
+- [x] Transfer text and a small generated file between two loopback endpoints.
+- [x] Publish non-secret protocol and cryptographic test vectors.
+- [x] Add unit and property tests for legal transitions, batch aggregation,
   replay, expiry, limits, version negotiation, key separation, and binding of
   content digests to authenticated transfer metadata.
-- [ ] Exercise aggregate admission and buffer limits, checked arithmetic at
+- [x] Exercise aggregate admission and buffer limits, checked arithmetic at
   boundary values, and the fatal worker-invariant policy.
-- [ ] Add narrow fuzz targets for invitation and frame decoding.
+- [x] Add narrow fuzz targets for invitation and frame decoding.
 - [ ] Obtain an external design review of identity, pairing, key separation,
   invitation consumption, protocol states, and the published test vectors.
-- [ ] Record the current threat model and accepted core choices.
+- [x] Record the accepted core choices.
 
 #### Done when
 
-- [ ] Two isolated endpoints pair, authenticate, transfer, verify, and revoke on
+- [x] Two isolated endpoints pair, authenticate, transfer, verify, and revoke on
   loopback.
-- [ ] Duplicate, reordered, replayed, oversized, truncated, and unknown-version
+- [x] Duplicate, reordered, replayed, oversized, truncated, and unknown-version
   messages fail with defined outcomes.
-- [ ] No item-state combination can produce a false `Completed` batch outcome.
-- [ ] Revocation prevents later authorization and publication; items committed
+- [x] No item-state combination can produce a false `Completed` batch outcome.
+- [x] Revocation prevents later authorization and publication; items committed
   before revocation remain published and cannot revive cancelled work.
-- [ ] Hostile peer text cannot alter terminal state or impersonate approval UI.
-- [ ] No test depends on sleeps, ambient time, or shared mutable fixtures.
-- [ ] No custom cryptographic primitive is proposed.
+- [x] Hostile peer text cannot alter terminal state or impersonate approval UI.
+- [x] No test depends on sleeps, ambient time, or shared mutable fixtures.
+- [x] No custom cryptographic primitive is proposed.
 - [ ] Every core choice has a verdict. No unaccepted design-review finding or
   core release blocker enters persistence or LAN pairing work.
 
@@ -1747,8 +1746,7 @@ ordinary tests.
 
 ## Security Review
 
-Update the threat model when a phase adds or changes a trust boundary. For each
-meaningful risk, record:
+When a phase adds or changes a trust boundary, check each meaningful risk for:
 
 - asset and attacker;
 - reachable path and impact;
@@ -1883,14 +1881,14 @@ different retention, aggregation, authorization, or shutdown rules.
 
 Start with:
 
-- `README.md` for what exists now, the current work by name, exact tool setup, one
-  build command, one test command, the first runnable behavior, current
-  blockers, and the next three tasks;
+- `README.md` with a short explanation of the project, the tool setup, and the
+  command that checks and builds it;
 - this plan as `PROJECT.md`; keep phase numbers and progress checkboxes here,
   not in the README or other documents;
 - `SECURITY.md` when the project is public;
 - `LICENSE` with the Apache-2.0 text and the third-party notice policy;
-- a concise threat model and the accepted core choices.
+- `docs/book.md`, which explains what was built, how it works, and why;
+- short decision records in `docs/` for the accepted core choices.
 
 Add documents when their subject exists:
 

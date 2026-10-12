@@ -8,9 +8,22 @@ repository = "https://github.com/nuggocto/hyakume"
 publish = false
 
 [dependencies]
+blake3 = "1.8"
 clap = { version = "4.6", features = ["derive"] }
+data-encoding = "2.11"
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+spake2 = "=0.4.0"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+unicode-width = "0.2"
+zeroize = "1.9"
+
+[dev-dependencies]
+proptest = "1.12"
+rand_chacha = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"

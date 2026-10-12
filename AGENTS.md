@@ -11,12 +11,17 @@
   supported platforms, the frontend, or a release candidate.
 - Use the `show-me` skill when ownership, data flow, control flow, state
   transitions, or dependencies are easier to understand as a graph.
+- Use the `explaining-code` skill when explaining how code works or what a
+  change does.
 
 ## Project rules
 
 - Never mention phase numbers anywhere outside `PROJECT.md`, including source
   code, comments, tests, command output, filenames, and other documentation.
   Track progress only by marking completed checkboxes in `PROJECT.md`.
+- After each step of work, add to `docs/book.md` what got built, how it works,
+  and why it was built that way. Write each entry with the `show-me` and
+  `explaining-code` skills. Keep decision records next to it in `docs/`.
 - Treat `shrek` as the permanent default branch. Do not rename or replace it.
 - Write each commit with a simple, well-written subject line and an explanatory
   body. The body must explain why the change was needed instead of restating the

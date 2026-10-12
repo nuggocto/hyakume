@@ -3,11 +3,18 @@ idiomatic_version_file_enable_tools = ["rust"]
 
 [tasks.fmt]
 description = "Format Rust code"
-run = "cargo fmt --all"
+# The fuzz targets are a separate package, so cargo fmt does not reach them.
+run = [
+  "cargo fmt --all",
+  "rustfmt --edition 2024 fuzz/fuzz_targets/*.rs",
+]
 
 [tasks.fmt-check]
 description = "Check Rust formatting"
-run = "cargo fmt --all -- --check"
+run = [
+  "cargo fmt --all -- --check",
+  "rustfmt --check --edition 2024 fuzz/fuzz_targets/*.rs",
+]
 
 [tasks.lint]
 description = "Run Clippy with warnings treated as errors"
@@ -32,4 +39,15 @@ run = [
   "mise run lint",
   "mise run test",
   "mise run build",
+]
+
+[tasks.deny]
+description = "Check dependency licenses, sources, and advisories (needs cargo-deny)"
+run = "cargo deny check"
+
+[tasks.fuzz]
+description = "Run each fuzz target for 120 seconds (needs cargo-fuzz and nightly-2026-09-04)"
+run = [
+  "cargo +nightly-2026-09-04 fuzz run frame fuzz/corpus/frame -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
+  "cargo +nightly-2026-09-04 fuzz run invitation_token fuzz/corpus/invitation_token -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
 ]

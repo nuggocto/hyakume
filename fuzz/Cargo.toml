@@ -1,0 +1,30 @@
+[package]
+name = "hyakume-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hyakume = { path = ".." }
+libfuzzer-sys = "=0.4.13"
+
+# This package is its own workspace so the main package never builds it.
+[workspace]
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invitation_token"
+path = "fuzz_targets/invitation_token.rs"
+test = false
+doc = false
+bench = false
