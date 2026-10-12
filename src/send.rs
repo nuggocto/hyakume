@@ -228,6 +228,9 @@ impl Sender {
                         ItemResult::Unauthorized => t
                             .apply(item, ItemEvent::Cancel(CancelCause::Revoked))
                             .map(|_| ()),
+                        ItemResult::ContentMismatch => t
+                            .apply(item, ItemEvent::Fail(FailCause::Content))
+                            .map(|_| ()),
                     };
                 }
                 if item + 1 < self.payload.len() && result != ItemResult::Unauthorized {
@@ -464,6 +467,31 @@ mod tests {
         );
         drop(sender);
         assert_eq!(budget.usage(), Usage::default());
+    }
+
+    #[test]
+    fn the_receivers_reason_for_a_failed_item_is_kept() {
+        for (result, cause) in [
+            (ItemResult::DigestMismatch, FailCause::Digest),
+            (ItemResult::LengthMismatch, FailCause::Length),
+            (ItemResult::ContentMismatch, FailCause::Content),
+        ] {
+            let (mut state, _, mut sender, _) = setup(&[b"abc"]);
+            accept(&mut sender, &mut state);
+            drain(&mut sender, &mut state);
+            sender.on_message(
+                Message::ItemResult {
+                    transfer: ID,
+                    item: 0,
+                    result,
+                },
+                &mut state,
+            );
+            assert_eq!(
+                state.transfer(&ID).unwrap().items(),
+                [ItemState::Failed(cause)]
+            );
+        }
     }
 
     #[test]

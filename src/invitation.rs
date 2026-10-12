@@ -110,6 +110,8 @@ pub enum InvitationError {
     Cancelled,
     #[error("the invitation has too many claims")]
     TooManyClaims,
+    #[error("every attempt left is already in use by a claim in progress")]
+    AttemptsInUse,
     #[error("that claim was already made")]
     DuplicateClaim,
     #[error("that claim does not exist")]
@@ -250,6 +252,17 @@ impl Invitation {
         }
         if self.claims.len() >= MAX_CLAIMANTS {
             return Err(InvitationError::TooManyClaims);
+        }
+        // A claim in progress may be a guess that has not failed yet, so it
+        // holds one of the attempts left. Otherwise claims made at once
+        // could guess more often than the attempt limit allows.
+        let in_progress = self
+            .claims
+            .iter()
+            .filter(|c| c.state == ClaimState::Exchanging)
+            .count();
+        if in_progress >= usize::from(self.attempts_left) {
+            return Err(InvitationError::AttemptsInUse);
         }
         self.claims.push(Claim {
             id: claim,
@@ -735,12 +748,31 @@ mod tests {
     fn claims_past_the_claimant_limit_are_refused() {
         let mut inv = invitation(InvitationKind::Temporary);
         for n in 0..MAX_CLAIMANTS as u8 {
-            inv.open_claim(at(1), claim(n)).unwrap();
+            verified(&mut inv, n);
         }
         assert_eq!(
             inv.open_claim(at(1), claim(200)),
             Err(InvitationError::TooManyClaims)
         );
+    }
+
+    #[test]
+    fn claims_made_at_once_never_get_more_guesses_than_attempts_left() {
+        let mut inv = invitation(InvitationKind::Permanent);
+        inv.open_claim(at(1), claim(0)).unwrap();
+        inv.claim_unverified(at(1), claim(0)).unwrap();
+        // Four attempts left: four claims may be in progress, not five.
+        for n in 1..MAX_ATTEMPTS {
+            inv.open_claim(at(1), claim(n)).unwrap();
+        }
+        assert_eq!(
+            inv.open_claim(at(1), claim(100)),
+            Err(InvitationError::AttemptsInUse)
+        );
+        // A claim that proves the secret gives its place back.
+        inv.claim_verified(at(1), claim(1), Verifier::from_bytes([1; 4]))
+            .unwrap();
+        inv.open_claim(at(1), claim(101)).unwrap();
     }
 
     fn token() -> InvitationToken {

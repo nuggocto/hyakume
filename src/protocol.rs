@@ -111,6 +111,9 @@ pub enum ItemResult {
     LengthMismatch,
     Cancelled,
     Unauthorized,
+    /// The bytes match the digest but not the offered kind: text that is
+    /// not UTF-8, or that differs from its preview.
+    ContentMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -395,6 +398,7 @@ pub fn encode_payload(msg: &Message) -> Vec<u8> {
                 ItemResult::LengthMismatch => 3,
                 ItemResult::Cancelled => 4,
                 ItemResult::Unauthorized => 5,
+                ItemResult::ContentMismatch => 6,
             });
         }
         Message::Cancel { transfer, reason } => {
@@ -547,6 +551,7 @@ pub fn decode_payload(payload: &[u8]) -> Result<Message, ProtocolError> {
                 3 => ItemResult::LengthMismatch,
                 4 => ItemResult::Cancelled,
                 5 => ItemResult::Unauthorized,
+                6 => ItemResult::ContentMismatch,
                 _ => return Err(ProtocolError::Malformed),
             },
         },

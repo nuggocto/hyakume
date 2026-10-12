@@ -29,7 +29,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, timeout, timeout_at};
 use zeroize::Zeroizing;
 
-use crate::clock::MonotonicClock;
+use crate::clock::{Moment, MonotonicClock};
 use crate::consent::ConsentView;
 use crate::display::PeerText;
 use crate::identity::{DeviceId, DeviceKey};
@@ -51,7 +51,7 @@ use crate::session::{self, SessionBinding, SessionError, Side};
 use crate::state::{PendingInvitation, Received, State, StateError};
 use crate::tasks;
 use crate::transfer::{BatchOutcome, CancelCause, FailCause, ItemState};
-use crate::trust::{LocalAlias, TrustError};
+use crate::trust::{LocalAlias, TrustError, VerifiedPeer};
 
 /// The QUIC application protocol name.
 pub const ALPN: &[u8] = b"hyakume/1";
@@ -884,18 +884,31 @@ async fn invite_exchange(
         }
     };
     let now = shared.clock.now();
-    shared.change(|s| {
-        let pending = s
-            .invitations
-            .get_mut(&invitation)
-            .ok_or(NodeError::Invitation)?;
-        pending
-            .invitation
-            .confirm_permanent(now, claim)
-            .map_err(|_| NodeError::Invitation)?;
-        s.trust.trust(peer, alias)?;
-        Ok(())
-    })
+    shared.change(|s| save_pairing(s, now, invitation, claim, peer, alias))
+}
+
+/// Uses the invitation and trusts the peer. Whether trust can be saved is
+/// checked before the invitation is used, so a failure changes nothing:
+/// the invitation is not used up by a pairing that saved no trust.
+fn save_pairing(
+    s: &mut State,
+    now: Moment,
+    invitation: InvitationId,
+    claim: ClaimId,
+    peer: VerifiedPeer,
+    alias: LocalAlias,
+) -> Result<(), NodeError> {
+    s.trust.can_trust(peer.device(), &alias)?;
+    let pending = s
+        .invitations
+        .get_mut(&invitation)
+        .ok_or(NodeError::Invitation)?;
+    pending
+        .invitation
+        .confirm_permanent(now, claim)
+        .map_err(|_| NodeError::Invitation)?;
+    s.trust.trust(peer, alias)?;
+    Ok(())
 }
 
 async fn inviter_steps(
@@ -1594,6 +1607,55 @@ mod tests {
             prompts,
             read_gate: None,
         }
+    }
+
+    #[test]
+    fn a_pairing_that_cannot_be_saved_leaves_the_invitation_usable() {
+        let mut s = State::new();
+        let now = Moment::from_millis(0);
+        let (invitation, claim) = (
+            InvitationId::from_bytes([1; 16]),
+            ClaimId::from_bytes([2; 16]),
+        );
+        let mut open = Invitation::new(
+            invitation,
+            InvitationKind::Permanent,
+            InvitationSecret::from_bytes([3; 32]),
+            now,
+            INVITATION_LIFETIME,
+        );
+        open.open_claim(now, claim).unwrap();
+        open.claim_verified(now, claim, Verifier::from_bytes([4; 4]))
+            .unwrap();
+        let alias = LocalAlias::new("phone").unwrap();
+        s.add_invitation(
+            now,
+            PendingInvitation {
+                invitation: open,
+                alias: alias.clone(),
+            },
+        )
+        .unwrap();
+        // Another device took the alias after this side answered yes.
+        let device = |seed| DeviceKey::from_seed(&Zeroizing::new([seed; 32])).id();
+        s.trust
+            .trust(
+                VerifiedPeer::new(device(5), PeerText::default()),
+                alias.clone(),
+            )
+            .unwrap();
+
+        let peer = VerifiedPeer::new(device(6), PeerText::default());
+        let saved = save_pairing(&mut s, now, invitation, claim, peer, alias);
+
+        assert_eq!(saved, Err(NodeError::Trust(TrustError::AliasInUse)));
+        let pending = s.invitations.get_mut(&invitation).unwrap();
+        assert_eq!(pending.invitation.state(now), InvitationState::Open);
+        assert!(matches!(
+            pending.invitation.claim_state(claim),
+            Some(ClaimState::Verified(_))
+        ));
+        assert!(s.trust.authorize(&device(6)).is_err());
     }
 
     #[test]

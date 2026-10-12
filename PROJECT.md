@@ -1015,7 +1015,7 @@ dependencies justify it.
 
 #### V1
 
-- [ ] **Phase 1** - Deterministic core and loopback protocol
+- [x] **Phase 1** - Deterministic core and loopback protocol
 - [ ] **Phase 2** - CLI, local service, IPC, and safe file pipeline
 - [ ] **Phase 3** - LAN discovery and permanent pairing
 - [ ] **Phase 4** - Reliable LAN transfer and clipboard
@@ -1065,7 +1065,7 @@ dependencies justify it.
 - [x] Exercise aggregate admission and buffer limits, checked arithmetic at
   boundary values, and the fatal worker-invariant policy.
 - [x] Add narrow fuzz targets for invitation and frame decoding.
-- [ ] Obtain an external design review of identity, pairing, key separation,
+- [x] Obtain an external design review of identity, pairing, key separation,
   invitation consumption, protocol states, and the published test vectors.
 - [x] Record the accepted core choices.
 
@@ -1083,7 +1083,7 @@ dependencies justify it.
   machines read time only from an injected clock; tests about network
   deadlines let real time pass, with wide margins.
 - [x] No custom cryptographic primitive is proposed.
-- [ ] Every core choice has a verdict. No unaccepted design-review finding or
+- [x] Every core choice has a verdict. No unaccepted design-review finding or
   core release blocker enters persistence or LAN pairing work.
 
 ### Phase 2 - CLI, local service, IPC, and safe file pipeline

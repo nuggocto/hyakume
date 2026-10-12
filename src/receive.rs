@@ -433,7 +433,11 @@ impl Receiver {
                 if let Some(t) = state.transfer_mut(&id) {
                     let _ = t.apply(index, ItemEvent::Fail(cause));
                 }
-                ItemResult::DigestMismatch
+                if cause == FailCause::Content {
+                    ItemResult::ContentMismatch
+                } else {
+                    ItemResult::DigestMismatch
+                }
             }
             None => match state.publish(Received {
                 transfer: id,
@@ -800,7 +804,16 @@ mod tests {
         f.rx.on_message(Message::Offer(fields), &mut f.state);
         f.rx.on_answer(id(1), true, &mut f.state);
         f.rx.on_message(chunk(1, 0, 0, real), &mut f.state);
-        f.rx.on_message(end(1, 0), &mut f.state);
+        let out = f.rx.on_message(end(1, 0), &mut f.state);
+        // The sender learns the real reason, not a digest mismatch.
+        assert_eq!(
+            out,
+            [Output::Send(Message::ItemResult {
+                transfer: id(1),
+                item: 0,
+                result: ItemResult::ContentMismatch
+            })]
+        );
         assert_eq!(items(&f, 1), [ItemState::Failed(FailCause::Content)]);
         assert!(f.state.received().is_empty());
     }

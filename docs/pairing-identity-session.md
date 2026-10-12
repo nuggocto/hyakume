@@ -1,7 +1,8 @@
 # Pairing, identity, sessions, and the wire protocol
 
-Status: implemented and tested on loopback. External design review not yet
-done; the verdicts below are provisional until it is. Recorded 2026-10-12.
+Status: implemented and tested on loopback. Two independent design reviews
+were done on 2026-10-13; every finding and its outcome is under "External
+review". Recorded 2026-10-12, updated 2026-10-13.
 
 Hyakume composes existing primitives through maintained libraries. It
 defines no new primitive.
@@ -29,7 +30,19 @@ CPace stays a candidate if a maintained crate exposes share generation on
 its own. Asymmetric PAKEs such as OPAQUE do not fit two devices that hold the
 same secret.
 
-Move to `spake2` 0.5 when it is stable, or record why not.
+What goes on the wire is SPAKE2 as implemented by `spake2` 0.4.0, not
+RFC 9382. The crate hashes the password to a scalar with HKDF-SHA256 (empty
+salt, info `SPAKE2 pw`, 48 bytes, reduced mod l) and outputs
+`k = SHA-256(SHA-256(pw) ‖ SHA-256(idA) ‖ SHA-256(idB) ‖ X ‖ Y ‖ K)`. No
+document or interoperability plan should cite the RFC as the wire format.
+
+The crate accepts any curve point as the peer's share. Hyakume refuses a
+share outside the prime-order group before calling `finish`
+(`a_share_with_a_small_order_part_is_refused`), because a small-order part
+could leak a few bits of this side's scalar.
+
+Move to `spake2` 0.5 when it is stable, or record why not. Before moving,
+check whether 0.5 wipes the password and scalars from memory; 0.4.0 does not.
 
 ## 2. Identity and Iroh
 
@@ -134,7 +147,10 @@ one purpose is valid for another.
   a repeated one is refused.
 - Every claim that ends without proving the secret uses one of 5 attempts,
   whether it failed, timed out, or disconnected, because each could be one
-  online guess. An invitation takes at most 8 claims and lives 15 minutes;
+  online guess. A claim still in progress holds one of the attempts left,
+  so claims made at once never get more guesses than that
+  (`claims_made_at_once_never_get_more_guesses_than_attempts_left`). An
+  invitation takes at most 8 claims and lives 15 minutes;
   expiry counts only forward clock movement.
 - Invitation tokens carry 256-bit secrets. Short human codes come with LAN
   pairing and use the same exchange.
@@ -190,7 +206,9 @@ A session runs in this order:
    OfferReject.
 4. For each item in order, chunks with consecutive offsets, then ItemEnd. The
    receiver checks the exact length and digest, publishes only through the
-   trust and cancel check, and answers ItemResult.
+   trust and cancel check, and answers ItemResult. Text that matches its
+   digest but is not valid UTF-8, or differs from its preview, is answered
+   with `ContentMismatch`.
 5. Either side may send Cancel at any time. Revocation sends
    `Cancel(Revoked)`.
 6. The dialer finishes its stream. The listener finishes after it and waits
@@ -208,38 +226,72 @@ fails its unfinished items as a lost connection.
 ## Acceptance criteria
 
 1. Every property in the table above has a test that was seen failing when
-   the behaviour was broken.
-2. `vectors/protocol-v1.txt` reproduces from public inputs.
+   the behaviour was broken. Met.
+2. `vectors/protocol-v1.txt` reproduces from public inputs, and gives a
+   second implementation the SPAKE2 scalars, `k`, the transcript, and the
+   word list, each checked by `tests/vectors.rs` against the messages. Met.
 3. An external reviewer has read this record and the vectors, and every
-   finding has a disposition.
+   finding has an outcome. Met on 2026-10-13; see below.
 
-## External review package
+## External review
 
-Give the reviewer this record, `docs/resource-estimate.md`,
-`vectors/protocol-v1.txt`, `src/protocol.rs`, `src/pairing.rs`,
-`src/session.rs`, `src/invitation.rs`, `src/trust.rs`, `src/transfer.rs`,
-`src/receive.rs`, `src/send.rs`, and the known limitations below. **Reviewer: not yet
-identified.**
+Two reviewers, working separately, read this record, the vectors, the
+listed source, and the pinned `spake2` 0.4.0 and iroh 1.3.0 sources at
+commit `a5b2e37`. Both reran the vectors and the test suite. Neither found
+a way for an impostor to become trusted, and both gave every choice below
+"go". Findings from the first review are F-1 to F-8, from the second C-01
+to C-08; the same problem found by both is listed once.
+
+| Finding | Severity | Outcome |
+| --- | --- | --- |
+| F-1, C-05: the inviter used up the invitation before saving trust, so a failed save left it used up with no trust saved | should fix | **Fixed.** `save_pairing` checks that trust can be saved before using the invitation; `a_pairing_that_cannot_be_saved_leaves_the_invitation_usable` |
+| F-2, C-03: the vectors could not check the pairing key schedule without porting `spake2`'s scalar step | should fix | **Fixed.** The vectors list the identities, blinding points, password and ephemeral scalars, `k`, the transcript, and the word list |
+| C-01: `spake2` 0.4.0 takes shares with a small-order part | note | **Fixed.** Such shares are refused before `finish` |
+| F-6: text that failed its content check was reported to the sender as a digest mismatch | note | **Fixed.** New wire result `ContentMismatch` (code 6) |
+| F-4: the record could be read as claiming RFC 9382 | note | **Fixed.** Section 1 names the construction as `spake2` 0.4.0's |
+| Found while weighing C-04: up to 8 claims at once could each make a guess, against a limit of 5 | should fix | **Fixed.** A claim in progress holds an attempt |
+| C-04, F-5: attempt limits are not tied to the strength of short human codes | before short codes | **Accepted as a condition** for LAN pairing; see below |
+| F-3, C-02: `spake2` 0.4.0 does not wipe the password or scalars from memory | note | **Accepted.** Only the single-use invitation secret of one exchange is exposed, never the device key. Check 0.5 before upgrading |
+| F-8, C-06: revocation stays final only if the epoch counter is saved with the trust store | note | **Accepted as a condition** for persistence; see below |
+| F-7: shutdown leaves claims in progress until the invitation expires | note | **Accepted as a condition** for the local service; see below |
+| C-07: silent connections can hold the 8 places without a session | note | **Accepted.** Bounded by one 30 s deadline per connection, listed in `docs/resource-estimate.md` |
+| C-08: a connection lost after verification closes the invitation | note | **Kept as is.** Each invitation allows one comparison of verifier words, which is what makes 32 bits enough. A retry would give someone holding the secret another try |
+| C-04 (optional): a 40-bit verifier | note | **Not adopted.** One comparison per invitation keeps 32 bits enough; revisit only if short codes change that |
+
+Assumptions the reviewers stated, kept here so later work checks them:
+
+- Clients never send TLS 0-RTT data: `Node::dial` waits for the full
+  handshake. Check again whenever the iroh TLS setup changes.
+- Content protection relies on relays never terminating TLS. Restate this
+  when relay work begins.
+
+## Conditions for later work
+
+- **Short human codes (LAN pairing).** The chance that a guesser finds the
+  code within one invitation must stay at or below 2^-20: attempts (5)
+  divided by the number of possible codes. Codes therefore need at least
+  23 bits, such as 7 random decimal digits. Keep the same attempt
+  accounting and the 120 s code lifetime.
+- **Persistence.** Save `TrustStore`'s next epoch in the same write as the
+  trust records, and never load a lower one.
+- **Local service.** When the service stops, settle each claim in progress
+  as failed, so an invitation never keeps claims that no exchange owns.
 
 ## Remaining risks
 
-- No independent audit of `spake2`, and no external review of this
-  composition yet.
-- The SPAKE2 vectors depend on how `spake2` 0.4.0 turns random bytes into a
-  scalar; another implementation would need the scalars, not only the seed.
-- Each side answers yes only after checking that it can still save the trust
-  (invitation open, alias free, room in the trust store), so a conflict that
-  appears during the exchange makes both sides decline
-  (`pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither`). Two
-  windows remain where one side can save trust and the other not: the
-  connection dropping between the two decisions, and the inviting side's
-  state changing between its answer and its commit. Recovery is to remove
-  the device and pair again.
+- No independent audit of the `spake2` crate itself.
+- One window remains where one side saves trust and the other does not:
+  the connection dropping between the two decisions. Recovery is to remove
+  the device and pair again. It never trusts an impostor. Before an answer,
+  each side checks it can still save the trust, so a conflict during the
+  exchange makes both sides decline
+  (`pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither`).
 
 ## Verdicts
 
-- **SPAKE2 (`spake2` 0.4.0, A/B roles): go, provisional** on external review.
+- **SPAKE2 (`spake2` 0.4.0, A/B roles): go** for 256-bit invitation tokens.
+  Short human codes need the condition above first.
 - **Separate device key with a per-process transport key: go.**
 - **Exporter-bound exchange with committed verifier and per-claim binding:
-  go, provisional** on external review.
+  go.**
 - **Authenticated QUIC without extra content encryption: go.**

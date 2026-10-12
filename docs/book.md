@@ -431,3 +431,77 @@ The plan's rule about time in tests now says what the tests actually do.
 None sleeps to wait for state. State machines read time only from the
 injected clock. Tests about network deadlines let real time pass on
 purpose, with wide margins.
+
+## 9. The external design review and what it changed
+
+Two reviewers read the pairing and session design separately. Neither
+found a way for an impostor to become trusted, and both gave all four core
+choices "go". `docs/pairing-identity-session.md` lists every finding with
+its outcome. Six of them changed code.
+
+**Claims made at once could guess more often than allowed.** An invitation
+allows 5 failed attempts, but an attempt was only used once a claim
+failed. Eight claims opened together could each reach the inviter's
+confirmation, and each of those is one online guess:
+
+```diagram
+Before                                  After
+
+attempts left: 5                        attempts left: 5
+claims in progress: 8 ━▶ 8 guesses      claims in progress: 5
+                                        a 6th claim ━▶ ● AttemptsInUse
+                                        a claim that proves the secret
+                                        gives its place back
+```
+
+`Invitation::open_claim` now refuses a claim while the claims still in
+progress already match the attempts left. This made no difference for
+256-bit tokens, but short human codes will need it.
+
+**A failed save used up the invitation anyway.** The inviter used the
+invitation, then tried to save trust. If another pairing had taken the
+alias meanwhile, the save failed and the invitation stayed used up.
+`save_pairing` now checks that trust can be saved first. Saving itself can
+then no longer fail, so a conflict changes nothing.
+
+**Shares outside the prime-order group are refused.** `spake2` 0.4.0
+accepts any curve point as the other side's share. A share with a
+small-order part could leak a few bits of this side's secret scalar.
+`finish_pake` checks the point with `curve25519-dalek`, the version spake2
+already uses, so no new crate is built.
+
+**The vectors are now enough for a second implementation.** Before, they
+gave the random seed and the messages. Reproducing them needed spake2
+0.4.0's own way of turning random bytes into a scalar. They now also list
+the identities, the blinding points, the password and ephemeral scalars,
+the SPAKE2 output `k`, the transcript `T`, and the word list. The test
+does not just print these values; it proves them:
+
+```text
+x·B + w·M  == joiner's share          (scalars and password scalar)
+y·B + w·N  == inviter's share
+spake2(x, inviter's share) == k
+keyed_hash(derive("confirm inviter", k‖T), T) == the inviter's MAC
+```
+
+**Text that fails its content check says so.** The receiver used to answer
+`DigestMismatch` for text that matched its digest but was not UTF-8 or
+differed from its preview. The sender then showed the wrong reason. The
+new wire result `ContentMismatch` (code 6) carries the real one.
+
+**The record names the real construction.** The wire uses SPAKE2 as
+`spake2` 0.4.0 implements it, not RFC 9382. Section 1 now says so and
+gives the crate's formulas.
+
+The rest were accepted as they are, or as conditions for later work. The
+conditions are written into the design record so the later work sees them:
+
+- Short human codes need at least 23 bits, keeping a guesser's chance per
+  invitation at or below 2^-20.
+- Persistence must save the trust epoch counter together with the trust
+  records.
+- The local service must settle open claims when it stops.
+
+One suggestion was turned down on purpose. A connection lost after
+verification still closes the invitation. Each invitation allows one
+comparison of the verifier words, and that is why 32 bits are enough.

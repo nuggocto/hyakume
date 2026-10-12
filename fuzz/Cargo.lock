@@ -1027,6 +1027,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "curve25519-dalek 4.1.3",
  "data-encoding",
  "iroh",
  "rand_core 0.6.4",

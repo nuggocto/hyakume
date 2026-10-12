@@ -3,8 +3,11 @@
 # Regenerate: HYAKUME_WRITE_VECTORS=1 cargo test --locked --test vectors
 # Implementations: spake2 0.4.0 (Ed25519 group), blake3 1.8.7, Ed25519 from iroh-base 1.3.0.
 # Random values come from one ChaCha20 stream (rand_chacha 0.3) seeded with
-# the u64 below, drawn in protocol order. SPAKE2 scalars depend on how
-# spake2 0.4.0 turns random bytes into a scalar.
+# the u64 below, drawn in protocol order. The SPAKE2 scalars, the
+# SPAKE2 output k, and the transcript are listed too, so a second
+# implementation can check its key schedule without spake2 0.4.0's
+# random-to-scalar step. Scalars are 32 bytes, little-endian. The
+# verifier shows byte n as word n of the word list.
 rng.seed = 0x6879616b756d6531
 
 [frames]
@@ -19,6 +22,7 @@ offer.reject = 000000120c1111111111111111111111111111111101
 chunk = 000000240d11111111111111111111111111111111000000000000000000000000000568656c6c6f
 item.end = 000000130e111111111111111111111111111111110000
 item.result.published = 000000140f11111111111111111111111111111111000001
+item.result.content_mismatch = 000000140f11111111111111111111111111111111000006
 cancel.revoked = 00000012101111111111111111111111111111111103
 error.not_trusted = 00000003110005
 
@@ -50,6 +54,18 @@ verifier.words = sugar arrow globe wizard
 msg.8.decision_inviter_yes = 0000002208010d6e76b78619663566af4befd8876168d5155d04ceeb893da71225567f3b9e4b
 msg.8.decision_joiner_yes = 00000022080127cfd1980d54c5392a260852aa89ebb0bef565a26ad42bf11975aae912a10504
 msg.8.decision_joiner_no = 000000220800a1c680cf9ff65e2cf6d0fbb4be61e3b10a10235094dd65fbd039e4a319339637
+spake2.id_a = hyakume v1 pairing joiner
+spake2.id_b = hyakume v1 pairing inviter
+spake2.m = 15cfd18e385952982b6a8f8c7854963b58e34388c8e6dae891db756481a02312
+spake2.n = f04f2e7eb734b2a8f8b472eaf9c3c632576ac64aea650b496a8a20ff00e583c3
+spake2.password_scalar = 5431e1028c4a91504fe36e6df4f283cb11fefc2b54f0f654dc1486cf181d2304
+spake2.joiner_scalar = 8117581970e950d2c1d3e1218efe14fc14019412b7bba51f8f3d42f7748d2f01
+spake2.inviter_scalar = ae5eb284262955d070ac05e1224c49cba2394ddad1b54ef73ff4164530e12d01
+pairing.k = f056de6947e660991929f9c4ef8a92f099bc35ec0b9f07fbc0474ff4a00a72fd
+pairing.transcript = fc33eacc3fbc1591e10b2ed5280a263f48f568f7bf0baaa769b1384f61e09425
+
+[words]
+verifier.word_list = acorn amber anchor apple apron arrow aspen atlas autumn badge bamboo banjo barley basil beacon bean berry birch biscuit bison blossom bonfire branch breeze brick bridge brook bubble bucket button cabin cactus camel canary candle canoe canyon carrot castle cedar cello chalk cherry chess cider citrus clay cliff clock cloud clover cobalt coconut comet compass copper coral cotton cradle crane crayon cricket crystal cupcake dahlia daisy dawn delta denim desert dolphin domino dragon drum dune eagle echo ember emerald engine falcon feather fennel fern ferret fiddle fig flame flint forest fossil fountain fox garden garnet gecko ginger glacier globe goose granite grape gravel guitar hammer harbor harp hazel heron hickory hill honey horizon hornet husky igloo indigo iris island ivory jade jaguar jasmine jelly jungle kayak kettle kiwi koala ladder lagoon lantern lava lemon lily lime linen lizard llama lobster lotus magnet mango maple marble meadow melon meteor mint mitten moose moss mountain nectar nest nickel noodle nutmeg oak oasis ocean olive onyx orbit orchid otter owl paddle panda pansy paper parsley peach pearl pebble pelican pepper piano pine planet plum pocket pony poppy prism pumpkin quail quartz quill rabbit radish rainbow raven reef rhubarb ribbon river robin rocket rose ruby saddle saffron sage salmon sandal sapphire satin seal sesame shell sierra silver sketch sparrow spruce squash star stone storm sugar summit sunset swan tablet tango teapot thistle thunder tiger timber toast topaz tulip tundra turnip turtle umbrella valley velvet violet volcano walnut walrus wasabi whale willow window winter wizard wren yarrow yogurt zebra zephyr zinc
 
 [session]
 input.exporter = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

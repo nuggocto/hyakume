@@ -32,6 +32,7 @@
 //!   the inviter sends its share before it sees the joiner's, so neither can
 //!   search for values that make two verifiers match.
 
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use rand_core::{CryptoRng, RngCore};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use zeroize::Zeroizing;
@@ -362,6 +363,17 @@ fn finish_pake(
     state: Spake2<Ed25519Group>,
     peer_share: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, PairingError> {
+    // spake2 0.4.0 takes any curve point. A point with a small-order part
+    // could leak a few bits of this side's secret scalar to the sender, so
+    // only points in the prime-order group are taken.
+    let in_group = peer_share
+        .get(1..)
+        .and_then(|point| <[u8; 32]>::try_from(point).ok())
+        .and_then(|point| CompressedEdwardsY(point).decompress())
+        .is_some_and(|point| point.is_torsion_free());
+    if !in_group {
+        return Err(PairingError::BadShare);
+    }
     state
         .finish(peer_share)
         .map(Zeroizing::new)
@@ -745,6 +757,38 @@ mod tests {
             joiner: Ok(joined),
             inviter_identity_sent: true,
         }
+    }
+
+    #[test]
+    fn a_share_with_a_small_order_part_is_refused() {
+        let secret = InvitationSecret::from_bytes([5; 32]);
+        let (joiner, inviter) = spake_ids();
+        let start = |seed| {
+            Spake2::<Ed25519Group>::start_a_with_rng(
+                &spake_password(&secret),
+                &joiner,
+                &inviter,
+                &mut rng(seed),
+            )
+        };
+        let (_, honest) = Spake2::<Ed25519Group>::start_b_with_rng(
+            &spake_password(&secret),
+            &joiner,
+            &inviter,
+            &mut rng(2),
+        );
+        let point = CompressedEdwardsY(honest[1..].try_into().unwrap())
+            .decompress()
+            .unwrap();
+        let tainted = point + curve25519_dalek::constants::EIGHT_TORSION[1];
+        let mut bad = honest.clone();
+        bad[1..].copy_from_slice(tainted.compress().as_bytes());
+
+        assert!(finish_pake(start(1).0, &honest).is_ok());
+        assert!(matches!(
+            finish_pake(start(1).0, &bad),
+            Err(PairingError::BadShare)
+        ));
     }
 
     #[test]
