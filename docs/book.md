@@ -590,5 +590,11 @@ columns, so the projection still ends at its limit with the shortened
 marker.
 
 Two unused items, `SessionId` and `Moment::saturating_add`, are gone.
-Diagnostics now call the same hidden-format check as the projections; their
+The plan's table of principal types now names what does the session work:
+`SessionBinding` and `SessionProof` authenticate a connection, and
+`SessionSlot` holds its place and its internal `u64` key. That key becomes
+`SessionId` once something outside the node has to point at one session,
+such as resume or route changes. The old `Route` entry is gone from that row,
+because the `Route` in the code is the inviter's address inside an invitation
+token, not a session's path. Diagnostics now call the same hidden-format check as the projections; their
 own copy missed soft hyphens, variation selectors, and tag characters.
