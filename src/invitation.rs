@@ -5,7 +5,7 @@
 //! used at most once:
 //!
 //! ```text
-//! Open ──permanent claim confirmed by both people──▶ Consumed
+//! Open ──this device's person accepts a permanent claim──▶ Consumed
 //!   │ ──temporary claim approved by the sender───────▶ Consumed (other claims refused)
 //!   │ ──verifier declined or mismatched──────────────▶ Declined
 //!   │ ──too many claims that did not verify──────────▶ Exhausted
@@ -18,6 +18,10 @@
 //!
 //! A temporary claim never becomes trust. [`Invitation::approve`] returns a
 //! [`TemporaryGrant`], which has no path into the trust store.
+//!
+//! Each invitation allows one comparison of verifier words. Once a claim
+//! has verified, it can only use the invitation or close it; no exit lets
+//! another claim compare words again.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -342,7 +346,10 @@ impl Invitation {
         Ok(())
     }
 
-    /// Uses a permanent invitation once both people confirmed the verifier.
+    /// Uses a permanent invitation when this device's person accepts the
+    /// verifier. The invitation stays used if the other device then
+    /// declines or disconnects, so the decision cannot be cut short by
+    /// expiry while the other device's person still decides.
     pub fn confirm_permanent(
         &mut self,
         now: Moment,

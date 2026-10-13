@@ -760,6 +760,75 @@ async fn pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither() {
 }
 
 #[tokio::test]
+async fn an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken() {
+    let (mut a, mut b, mut c) = (peer("alpha").await, peer("beta").await, peer("gamma").await);
+    let for_b = a.node.invite("phone").unwrap();
+    let for_c = a.node.invite("phone").unwrap();
+    let (b_device, c_device) = (b.node.device(), c.node.device());
+    let b_join = b.node.join(&for_b, "a");
+    let drive = async {
+        // a's person says yes to b; b's person has not answered yet.
+        let (peer, _) = answer_verify(&mut a.prompts, true).await;
+        assert_eq!(peer, b_device);
+        let held = match timeout(DEADLINE, b.prompts.recv()).await.unwrap().unwrap() {
+            Prompt::Verify { answer, .. } => answer,
+            Prompt::Offer { .. } => panic!("expected a verifier prompt"),
+        };
+        // Meanwhile c wants the same alias. Both people say yes, but a
+        // already promised "phone" to b.
+        let c_join = c.node.join(&for_c, "a");
+        let (joined, (peer, _), _) = tokio::join!(
+            c_join,
+            answer_verify(&mut a.prompts, true),
+            answer_verify(&mut c.prompts, true)
+        );
+        assert_eq!(peer, c_device);
+        assert_eq!(
+            joined.err(),
+            Some(NodeError::Pairing(PairingError::Declined))
+        );
+        held.send(true).unwrap();
+    };
+    let (b_result, ()) = timeout(DEADLINE, async { tokio::join!(b_join, drive) })
+        .await
+        .unwrap();
+    assert_eq!(b_result.unwrap(), a.node.device());
+    a.node
+        .wait_until(DEADLINE, |s| s.trust().authorize(&b_device).is_ok())
+        .await
+        .unwrap();
+    assert_eq!(a.node.trusted(), [b_device]);
+    assert!(c.node.trusted().is_empty());
+}
+
+#[tokio::test]
+async fn abandoning_a_pairing_after_the_verifier_is_shown_closes_the_invitation() {
+    let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
+    let token = a.node.invite("b").unwrap();
+    let join = b.node.join(&token, "a");
+    let shown = async {
+        let on_a = timeout(DEADLINE, a.prompts.recv()).await.unwrap().unwrap();
+        let on_b = timeout(DEADLINE, b.prompts.recv()).await.unwrap().unwrap();
+        (on_a, on_b)
+    };
+    // Both screens show the words, nobody answers, and b gives up: the
+    // join is dropped, which closes its connection.
+    let unanswered = tokio::select! {
+        _ = join => panic!("the join ended before anyone answered"),
+        prompts = shown => prompts,
+    };
+    a.node.wait_idle(DEADLINE).await.unwrap();
+    drop(unanswered);
+
+    let again = timeout(DEADLINE, b.node.join(&token, "a")).await.unwrap();
+    assert_eq!(
+        again.err(),
+        Some(NodeError::Peer(ErrorCode::InvitationUnavailable))
+    );
+    assert!(a.node.trusted().is_empty());
+}
+
+#[tokio::test]
 async fn a_sender_that_disappears_mid_transfer_leaves_nothing_unfinished() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
     pair(&mut a, &mut b).await;

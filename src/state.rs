@@ -5,7 +5,7 @@
 //! publication both happen through `&mut State`, so whichever reaches the
 //! lock first decides the outcome.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::clock::Moment;
 use crate::display::PeerText;
@@ -19,6 +19,9 @@ use crate::trust::{LocalAlias, TrustError, TrustStore};
 
 /// Finished transfers kept for status before the oldest are dropped.
 pub const MAX_KEPT_TRANSFERS: usize = 256;
+/// Offered transfer IDs a receiver remembers to refuse a repeat, whatever
+/// the status history has dropped.
+pub const MAX_REMEMBERED_OFFERS: usize = 4096;
 
 /// An item the model publisher committed. The qualified file pipeline
 /// replaces this with a file under its final name.
@@ -95,6 +98,8 @@ pub struct State {
     /// Finished transfers in the order they finished.
     finished: Vec<TransferId>,
     received: Vec<Received>,
+    /// The last offered transfer IDs, oldest first.
+    offered: VecDeque<TransferId>,
     /// Room reserved for accepted items plus room held by received items.
     held: Room,
     cancels: BTreeSet<TransferId>,
@@ -156,6 +161,22 @@ impl State {
         }
         self.transfers.insert(transfer.id(), transfer);
         Ok(())
+    }
+
+    /// Records an offered transfer ID. Returns false when the ID is not new:
+    /// it names a transfer still kept, or one of the last
+    /// [`MAX_REMEMBERED_OFFERS`] offers. Older IDs are forgotten. Only the
+    /// authenticated peer can send an old offer again, and it gets a new
+    /// consent question, the same as any new offer would.
+    pub(crate) fn first_offer(&mut self, id: TransferId) -> bool {
+        if self.transfers.contains_key(&id) || self.offered.contains(&id) {
+            return false;
+        }
+        if self.offered.len() == MAX_REMEMBERED_OFFERS {
+            self.offered.pop_front();
+        }
+        self.offered.push_back(id);
+        true
     }
 
     /// Records that a transfer reached a terminal state, so it may be

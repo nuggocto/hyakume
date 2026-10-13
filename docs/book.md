@@ -505,3 +505,90 @@ conditions are written into the design record so the later work sees them:
 One suggestion was turned down on purpose. A connection lost after
 verification still closes the invitation. Each invitation allows one
 comparison of the verifier words, and that is why 32 bits are enough.
+
+## 10. Fixes after the code review of the core
+
+A reviewer read the whole core at `27a5a5f` and reproduced four defects.
+Three were in pairing and replay handling, which persistence will build on,
+so they had to be fixed first. The design record lists them as R-1 to R-4.
+
+**Every pairing exchange now has one owner.** The inviting side settled its
+claim by hand on each error path, and one path was missing. If the joining
+device vanished while the verifier words were on screen, writing the
+inviter's decision failed, `?` returned early, and the claim stayed
+verified. The invitation stayed open, so the same token could reach a
+second comparison of words. One comparison per invitation is what makes a
+32-bit verifier enough.
+
+`PairingOwner` replaces the hand-written calls. It is created when the
+claim opens and settles the claim when it is dropped, so an early return,
+a lost connection, and an aborted task all reach the same code:
+
+```diagram
+Before                                   After
+
+verifier shown                           verifier shown
+      │                                        │
+connection lost                          connection lost
+      │                                        │
+write decision fails                     write decision fails
+      │                                        │
+return Err ━▶ claim stays Verified       return Err ━▶ PairingOwner dropped
+              invitation stays Open                    │
+              ● second comparison                claim Verified ━▶ decline
+                                                 invitation closed
+```
+
+What the owner does depends only on the claim's state when it is dropped:
+in progress uses an attempt, verified closes the invitation, used needs
+nothing. A service that shuts down mid-exchange now settles its claims the
+same way, which closes an earlier finding (F-7).
+
+**A yes holds what it promised.** Each side used to check that it could
+save the trust, answer yes, and wait for the other side. Nothing stopped a
+second pairing from taking the same alias during that wait:
+
+```diagram
+a invites b and c, both as "phone"
+
+a ── yes to b ──────────────────────────── b's yes arrives ── save b ✗ AliasInUse
+          c pairs fully, takes "phone"
+b ─────────────── holds its answer ── yes ── save a ✓
+
+result: b trusts a, a trusts c only
+```
+
+`TrustStore::reserve` now holds the alias and one trusted place at the
+moment the person says yes. Other pairings see the reservation in
+`check_alias` and `can_trust`, so c's pairing answers no and both of its
+sides decline. When b's yes arrives, `trust_reserved` saves trust under the
+held alias. The owner releases the reservation if the exchange ends without
+trust.
+
+The inviting side also uses the invitation at its yes, instead of after the
+other side answers. Otherwise an invitation that expired while the other
+person decided would fail the save in the same one-sided way. If the other
+side then declines, the invitation stays used. That costs nothing, because
+a verified claim closes the invitation anyway.
+
+**Repeated transfer IDs have their own memory.** The receiver detected a
+repeated offer by looking for its ID in the transfer map. That map is also
+the status history, which drops the oldest finished transfer past 256.
+Rejecting one offer, receiving 256 more, and sending the first again
+brought a fresh consent question. `State::first_offer` now keeps the last
+4,096 offered IDs in a queue of its own, 64 KiB at most. The policy is
+written down: IDs older than that are forgotten. Only the trusted peer
+itself can send an old offer again, over an authenticated session, and the
+person is asked again as for any offer.
+
+**Combining marks cannot grow a line.** `SafeLine` stops at a column limit,
+but a combining accent has width zero. "a" followed by 100,000 accents
+projected into one column produced 200,001 bytes. Each visible character
+now keeps at most four zero-width characters, enough for stacked accents in
+real writing. Further ones become escapes such as `\u{301}`, which take
+columns, so the projection still ends at its limit with the shortened
+marker.
+
+Two unused items, `SessionId` and `Moment::saturating_add`, are gone.
+Diagnostics now call the same hidden-format check as the projections; their
+own copy missed soft hyphens, variation selectors, and tag characters.

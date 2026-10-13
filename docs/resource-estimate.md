@@ -20,6 +20,8 @@ Recorded 2026-10-12.
 | Questions for the person | 8 waiting at once; another offer is refused as busy at once, so no connection waits for room | `Shared::ask` |
 | Model publisher store | received items stay in memory until taken: at most 64 MiB and 1,024 items together with accepted ones, so empty files count too | `src/state.rs` `Room` |
 | Decoded peer text | names 1 KiB, previews 4 KiB, offers 64 KiB, 256 items | `src/limits.rs`, `src/protocol.rs` |
+| Remembered offer IDs | the last 4,096 offered transfer IDs, 64 KiB, separate from the 256 transfers kept for status | `State::first_offer` |
+| Projected peer text | at most 4 zero-width characters after each visible one, so output grows with the column limit only | `SafeLine::project` |
 
 ## Worst case for the future desktop service
 

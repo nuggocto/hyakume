@@ -4,7 +4,7 @@
 //! reading a clock, so tests choose exactly when things happen. Runtime code
 //! reads [`MonotonicClock`].
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Milliseconds since an arbitrary starting point on one endpoint's clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,13 +17,6 @@ impl Moment {
 
     pub const fn as_millis(self) -> u64 {
         self.0
-    }
-
-    /// The moment `duration` later, stopping at the largest representable
-    /// moment instead of wrapping.
-    pub fn saturating_add(self, duration: Duration) -> Self {
-        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-        Self(self.0.saturating_add(millis))
     }
 }
 

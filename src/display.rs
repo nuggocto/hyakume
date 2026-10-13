@@ -11,8 +11,11 @@
 //! - [`SafeBlock`] for multi-line previews. Each line is a [`SafeLine`], and
 //!   the block stops at a byte and line limit.
 //!
-//! Both read their input lazily and stop at their limit, so the work and
-//! memory depend on the limit, not on the input size.
+//! Zero-width characters, such as combining accents, take no column. Each
+//! visible character keeps at most [`MAX_MARKS`] of them; further ones show
+//! as escapes, which do take columns. Both projections read their input
+//! lazily and stop at their limit, so the work and memory depend on the
+//! limit, not on the input size.
 
 use std::fmt;
 
@@ -20,6 +23,10 @@ use unicode_width::UnicodeWidthChar;
 
 /// Marker written after a projection that was cut at its limit.
 pub const SHORTENED: &str = " [shortened]";
+
+/// Zero-width characters, such as combining accents, kept after each
+/// visible character. Further ones show as escapes.
+pub const MAX_MARKS: usize = 4;
 
 /// Columns used when a [`PeerText`] is formatted with `{:?}`, such as in
 /// diagnostics.
@@ -86,10 +93,22 @@ impl SafeLine {
     pub fn project(raw: &[u8], columns: usize) -> Self {
         let mut text = String::new();
         let mut used = 0usize;
+        // Zero-width characters since the last visible one.
+        let mut marks = 0usize;
         let mut shortened = false;
         'outer: for chunk in raw.utf8_chunks() {
             for c in chunk.valid().chars() {
-                let piece = Escaped::of(c);
+                let mut piece = Escaped::of(c);
+                match &piece {
+                    Escaped::Plain(_) if piece.width() == 0 => {
+                        marks += 1;
+                        if marks > MAX_MARKS {
+                            piece = Escaped::code(c);
+                        }
+                    }
+                    Escaped::Plain(_) => marks = 0,
+                    Escaped::Text(_) => {}
+                }
                 let width = piece.width();
                 if used + width > columns {
                     shortened = true;
@@ -196,14 +215,19 @@ impl Escaped {
             '\t' => Self::Text("\\t".into()),
             // Spaces other than U+0020 look like a space but are not one.
             c if c.is_control() || is_hidden_format(c) || (c.is_whitespace() && c != ' ') => {
-                let code = u32::from(c);
-                if code <= 0xff {
-                    Self::Text(format!("\\x{code:02x}"))
-                } else {
-                    Self::Text(format!("\\u{{{code:x}}}"))
-                }
+                Self::code(c)
             }
             c => Self::Plain(c),
+        }
+    }
+
+    /// The character as a code escape.
+    fn code(c: char) -> Self {
+        let code = u32::from(c);
+        if code <= 0xff {
+            Self::Text(format!("\\x{code:02x}"))
+        } else {
+            Self::Text(format!("\\u{{{code:x}}}"))
         }
     }
 
@@ -227,7 +251,7 @@ impl Escaped {
 /// Characters that reorder, hide, or join text without being control
 /// characters: bidirectional controls, zero-width characters, separators,
 /// fillers, variation selectors, and tags.
-fn is_hidden_format(c: char) -> bool {
+pub(crate) fn is_hidden_format(c: char) -> bool {
     matches!(
         c,
         '\u{00ad}'
@@ -319,6 +343,19 @@ mod tests {
         let controls = SafeLine::project(b" \x7f\x00\x0b", 1);
         assert_eq!(controls.as_str(), " ");
         assert!(controls.is_shortened());
+    }
+
+    #[test]
+    fn combining_marks_cannot_grow_a_projection_past_its_limit() {
+        let accent = "\u{301}";
+        let hostile = format!("a{}", accent.repeat(100_000));
+        let projected = SafeLine::project(hostile.as_bytes(), 1);
+        assert!(projected.is_shortened());
+        assert_eq!(projected.as_str(), format!("a{}", accent.repeat(MAX_MARKS)));
+
+        // Ordinary accented text is kept as it is.
+        let words = "re\u{301}sume\u{301} Vie\u{323}\u{302}t";
+        assert_eq!(SafeLine::project(words.as_bytes(), 80).as_str(), words);
     }
 
     #[test]

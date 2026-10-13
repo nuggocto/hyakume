@@ -11,7 +11,9 @@
 //!   value never reaches a buffer.
 //! - Every event passes through [`BoundedLines`], which writes one line per
 //!   event, escapes control characters so logged text cannot move the
-//!   cursor or forge extra lines, and cuts lines at [`MAX_LINE_BYTES`].
+//!   cursor or forge extra lines, escapes the same hidden formatting
+//!   characters as peer-text projections, and cuts lines at
+//!   [`MAX_LINE_BYTES`].
 //!
 //! Formatting is bounded too. The subscriber stops keeping an event's text,
 //! and a span's fields, once they reach [`MAX_LINE_BYTES`], so a huge field
@@ -27,6 +29,8 @@ use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::fmt::format::{DefaultFields, Format, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
 use tracing_subscriber::registry::LookupSpan;
+
+use crate::display::is_hidden_format;
 
 /// Longest diagnostic line, including the shortened marker.
 pub const MAX_LINE_BYTES: usize = 4 * 1024;
@@ -267,14 +271,6 @@ fn bounded_line(raw: &[u8]) -> Vec<u8> {
     }
     out.push(b'\n');
     out
-}
-
-/// Characters that reorder or hide text without being control characters.
-fn is_hidden_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
-    )
 }
 
 #[cfg(test)]

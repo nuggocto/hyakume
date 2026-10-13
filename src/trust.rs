@@ -12,6 +12,11 @@
 //! [`TrustStore::check`] instead of trusting a saved flag. The store is the
 //! single owner of this order: whichever of revocation and publication
 //! reaches it first decides the outcome.
+//!
+//! A pairing answers yes only while holding a [`Reservation`] for the alias
+//! and one trusted place. Another pairing cannot take either before the
+//! other device answers, so saving the trust afterwards cannot fail on a
+//! conflict that appeared in between.
 
 use std::collections::BTreeMap;
 
@@ -98,6 +103,15 @@ impl VerifiedPeer {
     }
 }
 
+/// An alias and one trusted place held for a device while its pairing
+/// waits for the other side's answer. Only [`TrustStore::reserve`] makes
+/// one; [`TrustStore::trust_reserved`] or [`TrustStore::release`] ends it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reservation {
+    id: u64,
+    alias: LocalAlias,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
     #[error("that device is not trusted")]
@@ -118,6 +132,9 @@ pub enum TrustError {
 pub struct TrustStore {
     records: BTreeMap<DeviceId, TrustRecord>,
     next_epoch: u64,
+    /// Held aliases and places, by reservation.
+    reserved: BTreeMap<u64, (DeviceId, LocalAlias)>,
+    next_reservation: u64,
 }
 
 impl TrustStore {
@@ -125,50 +142,95 @@ impl TrustStore {
         Self::default()
     }
 
-    /// Checks that `alias` is free for `device` before an exchange starts,
-    /// so a conflict cannot appear after both people have confirmed.
+    /// Checks that `alias` is free for `device`: no other trusted device has
+    /// it and no pairing holds it. Checking before an exchange starts saves
+    /// people from comparing words for a pairing that cannot be saved.
     pub fn check_alias(
         &self,
         alias: &LocalAlias,
         device: Option<DeviceId>,
     ) -> Result<(), TrustError> {
-        let taken = self.records.values().any(|r| {
+        let trusted = self.records.values().any(|r| {
             matches!(r.state, TrustState::Trusted { .. })
                 && r.alias == *alias
                 && Some(r.device) != device
         });
-        if taken {
+        let held = self.reserved.values().any(|(_, a)| a == alias);
+        if trusted || held {
             return Err(TrustError::AliasInUse);
         }
         Ok(())
     }
 
-    /// Checks, without changing anything, that [`TrustStore::trust`] would
-    /// succeed for `device` under `alias`. Pairing asks this before a side
-    /// answers yes, so it never agrees to trust it cannot save.
+    /// Checks, without changing anything, that `device` could be trusted
+    /// under `alias`, counting what other pairings hold.
     pub fn can_trust(&self, device: DeviceId, alias: &LocalAlias) -> Result<(), TrustError> {
         self.check_alias(alias, Some(device))?;
-        let known = self.records.contains_key(&device);
-        if !known && self.records.len() >= MAX_TRUST_RECORDS {
+        let is_trusted = |d: &DeviceId| {
+            matches!(
+                self.records.get(d).map(|r| r.state),
+                Some(TrustState::Trusted { .. })
+            )
+        };
+        let held = self.reserved.values().map(|(d, _)| d);
+        let held_new = held.clone().filter(|d| !self.records.contains_key(d));
+        if !self.records.contains_key(&device)
+            && self.records.len() + held_new.count() >= MAX_TRUST_RECORDS
+        {
             return Err(TrustError::Full);
         }
-        let already_trusted = matches!(
-            self.records.get(&device).map(|r| r.state),
-            Some(TrustState::Trusted { .. })
-        );
-        if !already_trusted && self.trusted().count() >= MAX_TRUSTED_DEVICES {
+        let held_untrusted = held.filter(|d| !is_trusted(d));
+        if !is_trusted(&device)
+            && self.trusted().count() + held_untrusted.count() >= MAX_TRUSTED_DEVICES
+        {
             return Err(TrustError::Full);
         }
         Ok(())
     }
 
-    /// Saves trust in a verified peer. A revoked device becomes trusted again
-    /// under a new epoch; nothing authorized before carries over.
+    /// Holds `alias` and one trusted place for `device`. Pairing calls this
+    /// when its person answers yes, so it never agrees to trust it could not
+    /// save once the other side agrees too.
+    pub fn reserve(
+        &mut self,
+        device: DeviceId,
+        alias: LocalAlias,
+    ) -> Result<Reservation, TrustError> {
+        self.can_trust(device, &alias)?;
+        let id = self.next_reservation;
+        // Reservations end, so 2^64 of them cannot be held; treat the
+        // impossible as full.
+        self.next_reservation = id.checked_add(1).ok_or(TrustError::Full)?;
+        self.reserved.insert(id, (device, alias.clone()));
+        Ok(Reservation { id, alias })
+    }
+
+    /// Gives back what a pairing held when it ends without trust.
+    pub fn release(&mut self, reservation: Reservation) {
+        self.reserved.remove(&reservation.id);
+    }
+
+    /// Saves trust in a verified peer without holding anything first.
     pub fn trust(
         &mut self,
         peer: VerifiedPeer,
         alias: LocalAlias,
     ) -> Result<Authority, TrustError> {
+        let reservation = self.reserve(peer.device, alias)?;
+        self.trust_reserved(peer, reservation)
+    }
+
+    /// Saves trust in a verified peer under the alias it reserved. A revoked
+    /// device becomes trusted again under a new epoch; nothing authorized
+    /// before carries over.
+    pub fn trust_reserved(
+        &mut self,
+        peer: VerifiedPeer,
+        reservation: Reservation,
+    ) -> Result<Authority, TrustError> {
+        self.reserved.remove(&reservation.id);
+        let alias = reservation.alias;
+        // Cannot fail for the device the reservation was made for.
         self.can_trust(peer.device, &alias)?;
         let epoch = Epoch(self.next_epoch);
         // 2^64 grants of trust cannot happen; treat the impossible as full.
@@ -316,6 +378,45 @@ mod tests {
         store.revoke(&device(1)).unwrap();
         assert!(store.trust(verified(2, "b"), alias("laptop")).is_ok());
         assert_eq!(store.by_alias("laptop"), Some(device(2)));
+    }
+
+    #[test]
+    fn a_reserved_alias_and_place_cannot_be_taken_until_released() {
+        let mut store = TrustStore::new();
+        let held = store.reserve(device(1), alias("phone")).unwrap();
+        assert_eq!(
+            store.trust(verified(2, "b"), alias("phone")),
+            Err(TrustError::AliasInUse)
+        );
+        store.release(held);
+        assert!(store.trust(verified(2, "b"), alias("phone")).is_ok());
+
+        let held = store.reserve(device(3), alias("tablet")).unwrap();
+        assert!(store.trust(verified(4, "d"), alias("other")).is_ok());
+        let authority = store.trust_reserved(verified(3, "c"), held).unwrap();
+        assert_eq!(store.check(&authority), Ok(()));
+        assert_eq!(store.by_alias("tablet"), Some(device(3)));
+    }
+
+    #[test]
+    fn reservations_count_against_the_trusted_device_limit() {
+        let mut store = TrustStore::new();
+        for n in 0..MAX_TRUSTED_DEVICES - 1 {
+            let peer = VerifiedPeer::new(device_n(n), PeerText::default());
+            store.trust(peer, alias(&format!("d{n}"))).unwrap();
+        }
+        let last = store.reserve(device(1), alias("last")).unwrap();
+        assert_eq!(
+            store.reserve(device(2), alias("over")),
+            Err(TrustError::Full)
+        );
+        assert!(store.trust_reserved(verified(1, "a"), last).is_ok());
+    }
+
+    fn device_n(n: usize) -> DeviceId {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&(n as u64 + 1000).to_be_bytes());
+        DeviceKey::from_seed(&Zeroizing::new(seed)).id()
     }
 
     #[test]

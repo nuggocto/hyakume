@@ -315,7 +315,7 @@ impl Receiver {
             }
         };
         // A transfer ID seen before is a replayed or duplicated offer.
-        if state.transfer(&id).is_some() {
+        if !state.first_offer(id) {
             return self.close(ErrorCode::UnexpectedMessage);
         }
         let transfer = match Transfer::offered(id, self.authority, offer.items().len()) {
@@ -717,6 +717,23 @@ mod tests {
         let out = f.rx.on_message(file_offer(1, b"data"), &mut f.state);
         assert_eq!(out, [Output::Abort(ErrorCode::UnexpectedMessage)]);
         assert!(f.rx.is_closed());
+    }
+
+    #[test]
+    fn a_replayed_offer_identifier_is_refused_after_its_transfer_leaves_the_history() {
+        let mut f = fixture();
+        let first = file_offer(0, b"data");
+        f.rx.on_message(first.clone(), &mut f.state);
+        f.rx.on_answer(id(0), false, &mut f.state);
+        for n in 1..=crate::state::MAX_KEPT_TRANSFERS {
+            let later = TransferId::from_bytes((n as u128).to_be_bytes());
+            let offer = Offer::for_files(later, &[("f", b"x")]).unwrap().fields();
+            f.rx.on_message(Message::Offer(offer), &mut f.state);
+            f.rx.on_answer(later, false, &mut f.state);
+        }
+        assert!(f.state.transfer(&id(0)).is_none(), "still in the history");
+        let out = f.rx.on_message(first, &mut f.state);
+        assert_eq!(out, [Output::Abort(ErrorCode::UnexpectedMessage)]);
     }
 
     #[test]

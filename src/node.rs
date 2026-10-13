@@ -35,8 +35,7 @@ use crate::display::PeerText;
 use crate::identity::{DeviceId, DeviceKey};
 use crate::ids::{ClaimId, InvitationId, TransferId};
 use crate::invitation::{
-    ClaimState, Invitation, InvitationKind, InvitationSecret, InvitationState, InvitationToken,
-    Route, TokenError,
+    ClaimState, Invitation, InvitationKind, InvitationSecret, InvitationToken, Route, TokenError,
 };
 use crate::limits::{
     Budget, BufferLease, ConnectionSlot, INVITATION_LIFETIME, Limits, MAX_CHUNK_BYTES,
@@ -51,7 +50,7 @@ use crate::session::{self, SessionBinding, SessionError, Side};
 use crate::state::{PendingInvitation, Received, State, StateError};
 use crate::tasks;
 use crate::transfer::{BatchOutcome, CancelCause, FailCause, ItemState};
-use crate::trust::{LocalAlias, TrustError, VerifiedPeer};
+use crate::trust::{LocalAlias, Reservation, TrustError, VerifiedPeer};
 
 /// The QUIC application protocol name.
 pub const ALPN: &[u8] = b"hyakume/1";
@@ -811,16 +810,14 @@ async fn invite_exchange(
     let Some((secret, alias)) = opened else {
         return Err(NodeError::Invitation);
     };
-    let exporter = match exporter(conn, pairing::EXPORTER_LABEL) {
-        Ok(e) => e,
-        Err(e) => {
-            settle_claim(shared, invitation, claim, ClaimEnd::Unverified);
-            return Err(e);
-        }
+    let mut owner = PairingOwner {
+        shared,
+        claim: Some((invitation, claim)),
+        reservation: None,
     };
     let cx = ExchangeContext {
         binding: ChannelBinding {
-            exporter,
+            exporter: exporter(conn, pairing::EXPORTER_LABEL)?,
             inviter_endpoint: *endpoint.id().as_bytes(),
             joiner_endpoint: *conn.remote_id().as_bytes(),
             negotiation,
@@ -829,13 +826,7 @@ async fn invite_exchange(
         invitation,
         claim,
     };
-    let verified = match inviter_steps(shared, wire, &secret, cx).await {
-        Ok(v) => v,
-        Err(e) => {
-            settle_claim(shared, invitation, claim, ClaimEnd::Unverified);
-            return Err(e);
-        }
-    };
+    let verified = inviter_steps(shared, wire, &secret, cx).await?;
     // The person's answer has its own, longer deadline.
     wire.end_handshake();
     let recorded = shared.change(|s| {
@@ -848,67 +839,91 @@ async fn invite_exchange(
         return Err(NodeError::Invitation);
     }
     let person = ask_verifier(shared, conn, &verified).await;
-    // Answer yes only if this side can still use the invitation and save
-    // the trust; otherwise the other side would trust a device that does
-    // not trust it back.
-    let answer = person
-        && shared.change(|s| {
-            let now = shared.clock.now();
-            let usable = s.invitations.get_mut(&invitation).is_some_and(|p| {
-                p.invitation.state(now) == InvitationState::Open
-                    && matches!(
-                        p.invitation.claim_state(claim),
-                        Some(ClaimState::Verified(_))
-                    )
-            });
-            usable && s.trust.can_trust(verified.peer(), &alias).is_ok()
-        });
+    let answer =
+        person && shared.change(|s| owner.accept(s, shared.clock.now(), verified.peer(), alias));
     wire.write(&Message::PairDecision(verified.decide(answer)))
         .await?;
-    let theirs = match wire.message(shared.limits().idle_timeout).await {
-        Ok(Message::PairDecision(d)) => d,
-        Ok(_) => {
-            settle_claim(shared, invitation, claim, ClaimEnd::Declined);
-            return Err(NodeError::Unexpected);
-        }
-        Err(e) => {
-            settle_claim(shared, invitation, claim, ClaimEnd::Declined);
-            return Err(e);
-        }
+    let theirs = match wire.message(shared.limits().idle_timeout).await? {
+        Message::PairDecision(d) => d,
+        _ => return Err(NodeError::Unexpected),
     };
-    let peer = match verified.conclude_permanent(answer, &theirs) {
-        Ok(peer) => peer,
-        Err(e) => {
-            settle_claim(shared, invitation, claim, ClaimEnd::Declined);
-            return Err(e.into());
-        }
-    };
-    let now = shared.clock.now();
-    shared.change(|s| save_pairing(s, now, invitation, claim, peer, alias))
+    let peer = verified.conclude_permanent(answer, &theirs)?;
+    shared.change(|s| owner.trust(s, peer))
 }
 
-/// Uses the invitation and trusts the peer. Whether trust can be saved is
-/// checked before the invitation is used, so a failure changes nothing:
-/// the invitation is not used up by a pairing that saved no trust.
-fn save_pairing(
-    s: &mut State,
-    now: Moment,
-    invitation: InvitationId,
-    claim: ClaimId,
-    peer: VerifiedPeer,
-    alias: LocalAlias,
-) -> Result<(), NodeError> {
-    s.trust.can_trust(peer.device(), &alias)?;
-    let pending = s
-        .invitations
-        .get_mut(&invitation)
-        .ok_or(NodeError::Invitation)?;
-    pending
-        .invitation
-        .confirm_permanent(now, claim)
-        .map_err(|_| NodeError::Invitation)?;
-    s.trust.trust(peer, alias)?;
-    Ok(())
+/// Owns one pairing exchange's claim on an invitation and what its yes
+/// answer reserved in the trust store. Dropping it settles both, however
+/// the exchange ends: an error, a lost connection, or an aborted task.
+///
+/// ```text
+/// claim when dropped   what happens
+/// Exchanging           the claim failed to verify; it uses an attempt
+/// Verified             nobody here said yes; the invitation closes
+/// Used                 this side said yes; the invitation stays used
+/// ```
+///
+/// A verified claim never leaves the invitation open, because each
+/// invitation allows one comparison of verifier words.
+struct PairingOwner<'a> {
+    shared: &'a Shared,
+    /// The inviting side's claim. The joining side has none.
+    claim: Option<(InvitationId, ClaimId)>,
+    reservation: Option<Reservation>,
+}
+
+impl PairingOwner<'_> {
+    /// This side's person said yes. Holds the alias and a trusted place for
+    /// `peer`, and on the inviting side uses the invitation. Returns false,
+    /// changing nothing, when either is no longer possible; this side then
+    /// answers no.
+    fn accept(&mut self, s: &mut State, now: Moment, peer: DeviceId, alias: LocalAlias) -> bool {
+        let Ok(reservation) = s.trust.reserve(peer, alias) else {
+            return false;
+        };
+        if let Some((invitation, claim)) = self.claim {
+            let used = s
+                .invitations
+                .get_mut(&invitation)
+                .is_some_and(|p| p.invitation.confirm_permanent(now, claim).is_ok());
+            if !used {
+                s.trust.release(reservation);
+                return false;
+            }
+        }
+        self.reservation = Some(reservation);
+        true
+    }
+
+    /// Both people said yes: saves the trust this side reserved.
+    fn trust(&mut self, s: &mut State, peer: VerifiedPeer) -> Result<(), NodeError> {
+        // A peer only concludes as trusted after this side said yes, and
+        // saying yes took a reservation.
+        let reservation = self.reservation.take().ok_or(NodeError::Invitation)?;
+        s.trust.trust_reserved(peer, reservation)?;
+        Ok(())
+    }
+}
+
+impl Drop for PairingOwner<'_> {
+    fn drop(&mut self) {
+        let now = self.shared.clock.now();
+        let (claim, reservation) = (self.claim, self.reservation.take());
+        self.shared.change(|s| {
+            if let Some(reservation) = reservation {
+                s.trust.release(reservation);
+            }
+            let Some((invitation, claim)) = claim else {
+                return;
+            };
+            if let Some(p) = s.invitations.get_mut(&invitation) {
+                let _ = match p.invitation.claim_state(claim) {
+                    Some(ClaimState::Exchanging) => p.invitation.claim_unverified(now, claim),
+                    Some(ClaimState::Verified(_)) => p.invitation.decline(now, claim),
+                    Some(ClaimState::Used | ClaimState::Refused(_)) | None => Ok(()),
+                };
+            }
+        });
+    }
 }
 
 async fn inviter_steps(
@@ -942,24 +957,6 @@ async fn inviter_steps(
         _ => return Err(NodeError::Unexpected),
     };
     Ok(await_identity.on_identity(&proof)?)
-}
-
-#[derive(Clone, Copy)]
-enum ClaimEnd {
-    Unverified,
-    Declined,
-}
-
-fn settle_claim(shared: &Shared, invitation: InvitationId, claim: ClaimId, end: ClaimEnd) {
-    let now = shared.clock.now();
-    shared.change(|s| {
-        if let Some(p) = s.invitations.get_mut(&invitation) {
-            let _ = match end {
-                ClaimEnd::Unverified => p.invitation.claim_unverified(now, claim),
-                ClaimEnd::Declined => p.invitation.decline(now, claim),
-            };
-        }
-    });
 }
 
 /// Asks the person to compare the verifier. No answer, a full prompt
@@ -1030,14 +1027,14 @@ async fn join_exchange(
     let (verified, proof) = await_identity.on_identity(&proof, &shared.key)?;
     wire.write(&Message::PairIdentity(proof)).await?;
     wire.end_handshake();
+    let mut owner = PairingOwner {
+        shared,
+        claim: None,
+        reservation: None,
+    };
     let person = ask_verifier(shared, conn, &verified).await;
-    // As on the inviting side: never agree to trust that cannot be saved.
-    let answer = person
-        && shared
-            .lock()
-            .trust
-            .can_trust(verified.peer(), &alias)
-            .is_ok();
+    let answer =
+        person && shared.change(|s| owner.accept(s, shared.clock.now(), verified.peer(), alias));
     wire.write(&Message::PairDecision(verified.decide(answer)))
         .await?;
     let theirs = match wire.message(shared.limits().idle_timeout).await? {
@@ -1046,7 +1043,7 @@ async fn join_exchange(
     };
     let peer = verified.conclude_permanent(answer, &theirs)?;
     let device = peer.device();
-    shared.change(|s| s.trust.trust(peer, alias))?;
+    shared.change(|s| owner.trust(s, peer))?;
     Ok(device)
 }
 
@@ -1594,6 +1591,7 @@ async fn read_frame(recv: &mut RecvStream, budget: &Budget) -> Result<Frame, Nod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::invitation::{ClaimRefusal, InvitationState};
 
     fn shared() -> Shared {
         let (prompts, _) = mpsc::channel(1);
@@ -1609,53 +1607,109 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_pairing_that_cannot_be_saved_leaves_the_invitation_usable() {
-        let mut s = State::new();
-        let now = Moment::from_millis(0);
+    /// Adds an invitation for `alias` with one claim in progress.
+    fn claimed(shared: &Shared, alias: &str, n: u8) -> (InvitationId, ClaimId) {
+        let now = shared.clock.now();
         let (invitation, claim) = (
-            InvitationId::from_bytes([1; 16]),
-            ClaimId::from_bytes([2; 16]),
+            InvitationId::from_bytes([n; 16]),
+            ClaimId::from_bytes([n; 16]),
         );
         let mut open = Invitation::new(
             invitation,
             InvitationKind::Permanent,
-            InvitationSecret::from_bytes([3; 32]),
+            InvitationSecret::from_bytes([n; 32]),
             now,
             INVITATION_LIFETIME,
         );
         open.open_claim(now, claim).unwrap();
-        open.claim_verified(now, claim, Verifier::from_bytes([4; 4]))
+        let alias = LocalAlias::new(alias).unwrap();
+        shared
+            .change(|s| {
+                s.add_invitation(
+                    now,
+                    PendingInvitation {
+                        invitation: open,
+                        alias,
+                    },
+                )
+            })
             .unwrap();
-        let alias = LocalAlias::new("phone").unwrap();
-        s.add_invitation(
-            now,
-            PendingInvitation {
-                invitation: open,
-                alias: alias.clone(),
-            },
-        )
-        .unwrap();
-        // Another device took the alias after this side answered yes.
+        (invitation, claim)
+    }
+
+    fn verify(shared: &Shared, (invitation, claim): (InvitationId, ClaimId)) {
+        let now = shared.clock.now();
+        let mut s = shared.lock();
+        let p = s.invitations.get_mut(&invitation).unwrap();
+        p.invitation
+            .claim_verified(now, claim, Verifier::from_bytes([4; 4]))
+            .unwrap();
+    }
+
+    fn owner(shared: &Shared, claim: (InvitationId, ClaimId)) -> PairingOwner<'_> {
+        PairingOwner {
+            shared,
+            claim: Some(claim),
+            reservation: None,
+        }
+    }
+
+    fn invitation_state(shared: &Shared, invitation: InvitationId) -> InvitationState {
+        let now = shared.clock.now();
+        let mut s = shared.lock();
+        s.invitations
+            .get_mut(&invitation)
+            .unwrap()
+            .invitation
+            .state(now)
+    }
+
+    #[test]
+    fn an_exchange_that_ends_unverified_uses_an_attempt() {
+        let shared = shared();
+        let (invitation, claim) = claimed(&shared, "phone", 1);
+        drop(owner(&shared, (invitation, claim)));
+        let mut s = shared.lock();
+        let p = s.invitations.get_mut(&invitation).unwrap();
+        assert_eq!(
+            p.invitation.claim_state(claim),
+            Some(ClaimState::Refused(ClaimRefusal::NotVerified))
+        );
+    }
+
+    #[test]
+    fn an_exchange_that_ends_after_verification_never_leaves_the_invitation_open() {
+        let shared = shared();
         let device = |seed| DeviceKey::from_seed(&Zeroizing::new([seed; 32])).id();
-        s.trust
-            .trust(
-                VerifiedPeer::new(device(5), PeerText::default()),
-                alias.clone(),
-            )
-            .unwrap();
 
-        let peer = VerifiedPeer::new(device(6), PeerText::default());
-        let saved = save_pairing(&mut s, now, invitation, claim, peer, alias);
+        // Nobody answered.
+        let unanswered = claimed(&shared, "phone", 1);
+        verify(&shared, unanswered);
+        drop(owner(&shared, unanswered));
+        assert_eq!(
+            invitation_state(&shared, unanswered.0),
+            InvitationState::Declined
+        );
 
-        assert_eq!(saved, Err(NodeError::Trust(TrustError::AliasInUse)));
-        let pending = s.invitations.get_mut(&invitation).unwrap();
-        assert_eq!(pending.invitation.state(now), InvitationState::Open);
-        assert!(matches!(
-            pending.invitation.claim_state(claim),
-            Some(ClaimState::Verified(_))
-        ));
-        assert!(s.trust.authorize(&device(6)).is_err());
+        // This side said yes; the other side never answered.
+        let accepted = claimed(&shared, "tablet", 2);
+        verify(&shared, accepted);
+        let mut owner = owner(&shared, accepted);
+        let now = shared.clock.now();
+        let alias = LocalAlias::new("tablet").unwrap();
+        assert!(shared.change(|s| owner.accept(s, now, device(6), alias.clone())));
+        // While it waits, no other pairing can take the alias.
+        assert_eq!(
+            shared.lock().trust.can_trust(device(7), &alias),
+            Err(TrustError::AliasInUse)
+        );
+        drop(owner);
+        assert_eq!(
+            invitation_state(&shared, accepted.0),
+            InvitationState::Consumed
+        );
+        assert_eq!(shared.lock().trust.can_trust(device(7), &alias), Ok(()));
+        assert!(shared.lock().trust.authorize(&device(6)).is_err());
     }
 
     #[test]

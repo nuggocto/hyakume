@@ -2,7 +2,8 @@
 
 Status: implemented and tested on loopback. Two independent design reviews
 were done on 2026-10-13; every finding and its outcome is under "External
-review". Recorded 2026-10-12, updated 2026-10-13.
+review". A code review of the whole core followed the same day; see "Code
+review of the core". Recorded 2026-10-12, updated 2026-10-13.
 
 Hyakume composes existing primitives through maintained libraries. It
 defines no new primitive.
@@ -143,8 +144,13 @@ one purpose is valid for another.
 ### Replay protection and attempt limits
 
 - Exporter values make every proof and MAC specific to one TLS connection.
-- Claim IDs are unique per invitation, and transfer IDs unique per receiver;
-  a repeated one is refused.
+- Claim IDs are unique per invitation; a repeated one is refused.
+- A receiver refuses an offer whose transfer ID names a transfer it still
+  keeps or one of the last 4,096 offers it received, even after the status
+  history has dropped that transfer (`State::first_offer`). Older IDs are
+  forgotten, so memory stays bounded. Only the authenticated, trusted peer
+  can send an old offer again, and it then gets a new consent question,
+  as any new offer would.
 - Every claim that ends without proving the secret uses one of 5 attempts,
   whether it failed, timed out, or disconnected, because each could be one
   online guess. A claim still in progress holds one of the attempts left,
@@ -190,7 +196,9 @@ the code does not spell out in one place.
   `N` above, so a changed Hello fails the exchange. Version 1 defines no
   capabilities and ignores unknown bits.
 - **Pairing.** Any message out of the order in section 3, or an `Error`, ends
-  the exchange. A claim that has not verified uses an attempt.
+  the exchange. A claim that has not verified uses an attempt. A claim that
+  has verified closes the invitation however the exchange ends, and a yes
+  from the inviting side's person uses it.
 
 A session runs in this order:
 
@@ -244,7 +252,7 @@ to C-08; the same problem found by both is listed once.
 
 | Finding | Severity | Outcome |
 | --- | --- | --- |
-| F-1, C-05: the inviter used up the invitation before saving trust, so a failed save left it used up with no trust saved | should fix | **Fixed.** `save_pairing` checks that trust can be saved before using the invitation; `a_pairing_that_cannot_be_saved_leaves_the_invitation_usable` |
+| F-1, C-05: the inviter used up the invitation before saving trust, so a failed save left it used up with no trust saved | should fix | **Fixed, then replaced.** The save was first checked before use. After the code review, a yes now reserves the alias and a trusted place, so the save cannot fail on a conflict; see R-2 |
 | F-2, C-03: the vectors could not check the pairing key schedule without porting `spake2`'s scalar step | should fix | **Fixed.** The vectors list the identities, blinding points, password and ephemeral scalars, `k`, the transcript, and the word list |
 | C-01: `spake2` 0.4.0 takes shares with a small-order part | note | **Fixed.** Such shares are refused before `finish` |
 | F-6: text that failed its content check was reported to the sender as a digest mismatch | note | **Fixed.** New wire result `ContentMismatch` (code 6) |
@@ -253,9 +261,9 @@ to C-08; the same problem found by both is listed once.
 | C-04, F-5: attempt limits are not tied to the strength of short human codes | before short codes | **Accepted as a condition** for LAN pairing; see below |
 | F-3, C-02: `spake2` 0.4.0 does not wipe the password or scalars from memory | note | **Accepted.** Only the single-use invitation secret of one exchange is exposed, never the device key. Check 0.5 before upgrading |
 | F-8, C-06: revocation stays final only if the epoch counter is saved with the trust store | note | **Accepted as a condition** for persistence; see below |
-| F-7: shutdown leaves claims in progress until the invitation expires | note | **Accepted as a condition** for the local service; see below |
+| F-7: shutdown leaves claims in progress until the invitation expires | note | **Fixed** with R-1: an exchange stopped by shutdown settles its claim when its task is dropped |
 | C-07: silent connections can hold the 8 places without a session | note | **Accepted.** Bounded by one 30 s deadline per connection, listed in `docs/resource-estimate.md` |
-| C-08: a connection lost after verification closes the invitation | note | **Kept as is.** Each invitation allows one comparison of verifier words, which is what makes 32 bits enough. A retry would give someone holding the secret another try |
+| C-08: a connection lost after verification closes the invitation | note | **Kept as is.** Each invitation allows one comparison of verifier words, which is what makes 32 bits enough. A retry would give someone holding the secret another try. R-1 found one path that broke this; it is fixed |
 | C-04 (optional): a 40-bit verifier | note | **Not adopted.** One comparison per invitation keeps 32 bits enough; revisit only if short codes change that |
 
 Assumptions the reviewers stated, kept here so later work checks them:
@@ -264,6 +272,24 @@ Assumptions the reviewers stated, kept here so later work checks them:
   handshake. Check again whenever the iroh TLS setup changes.
 - Content protection relies on relays never terminating TLS. Restate this
   when relay work begins.
+
+## Code review of the core
+
+A reviewer read all source, tests, vectors, and records at commit
+`27a5a5f` and reproduced four defects. Each now has a test that failed
+before its fix.
+
+| Finding | Severity | Outcome |
+| --- | --- | --- |
+| R-1: a connection lost after the verifier was shown could make writing this side's decision fail; the exchange returned without settling its claim, and the invitation stayed open for another comparison | medium | **Fixed.** `PairingOwner` owns the claim and settles it when dropped, on every way out: an exchange that ends after verification closes the invitation. Loopback `abandoning_a_pairing_after_the_verifier_is_shown_closes_the_invitation`; unit `an_exchange_that_ends_after_verification_never_leaves_the_invitation_open` |
+| R-2: an alias checked before a yes could be taken by another pairing before the other side answered, leaving one side trusting a device that does not trust it back | medium | **Fixed.** A yes now takes a `Reservation` of the alias and one trusted place on both sides, held until the exchange ends. The inviting side also uses the invitation at its yes, so expiry while the other person decides cannot fail the save either. Loopback `an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken` |
+| R-3: repeated transfer IDs were detected through the status history, so dropping old history also forgot used IDs | medium | **Fixed.** A separate window of 4,096 offered IDs, with the policy under "Replay protection and attempt limits". `a_replayed_offer_identifier_is_refused_after_its_transfer_leaves_the_history` |
+| R-4: zero-width characters took no column, so a projection could grow with its input | low | **Fixed.** Each visible character keeps at most 4 zero-width characters; further ones show as escapes, which take columns. `combining_marks_cannot_grow_a_projection_past_its_limit` |
+
+The review also pointed out two unused items, `SessionId` and
+`Moment::saturating_add`; both are removed. Diagnostics now escape the same
+hidden formatting characters as peer-text projections instead of a smaller
+set.
 
 ## Conditions for later work
 
@@ -274,18 +300,24 @@ Assumptions the reviewers stated, kept here so later work checks them:
   accounting and the 120 s code lifetime.
 - **Persistence.** Save `TrustStore`'s next epoch in the same write as the
   trust records, and never load a lower one.
-- **Local service.** When the service stops, settle each claim in progress
-  as failed, so an invitation never keeps claims that no exchange owns.
+- **Persistence of invitations.** A claim saved while its exchange ran has
+  no owner after a restart. On load, settle each one as `PairingOwner`
+  would: in progress uses an attempt, verified closes the invitation.
+  Reservations belong to running exchanges and are never saved.
+- **Resume.** The offered-ID window refuses repeated offers. Resuming a
+  transfer must use its own authenticated path, never a second offer under
+  the same transfer ID.
 
 ## Remaining risks
 
 - No independent audit of the `spake2` crate itself.
 - One window remains where one side saves trust and the other does not:
   the connection dropping between the two decisions. Recovery is to remove
-  the device and pair again. It never trusts an impostor. Before an answer,
-  each side checks it can still save the trust, so a conflict during the
-  exchange makes both sides decline
-  (`pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither`).
+  the device and pair again. It never trusts an impostor. A side answers
+  yes only after reserving the alias and a trusted place, so a conflict
+  with another pairing makes that side answer no and both sides decline
+  (`pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither`,
+  `an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken`).
 
 ## Verdicts
 

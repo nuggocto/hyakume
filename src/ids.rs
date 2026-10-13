@@ -1,5 +1,4 @@
-//! Random 128-bit identifiers for invitations, claims, transfers, and
-//! sessions.
+//! Random 128-bit identifiers for invitations, claims, and transfers.
 //!
 //! Identifiers are not secrets. They come from the caller's random source so
 //! tests can make them reproducible.
@@ -51,8 +50,4 @@ id_type!(
 id_type!(
     /// Names one offer and the transfer that follows it, on both devices.
     TransferId
-);
-id_type!(
-    /// Names one authenticated connection on the local device.
-    SessionId
 );
