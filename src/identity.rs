@@ -1,11 +1,7 @@
-//! Long-term device identity.
-//!
-//! A device is identified by an Ed25519 public key, its [`DeviceId`]. The
-//! private half lives only inside [`DeviceKey`], which cannot be cloned,
-//! printed, or serialized, and is wiped from memory when dropped. The device
-//! key is separate from the per-process Iroh transport key, so the long-term
-//! identity never appears in discovery or in the QUIC handshake; it is shown
-//! only inside authenticated, encrypted streams.
+//! Long-term device identity: an Ed25519 key. [`DeviceKey`] cannot be
+//! cloned, printed, or serialized, and is wiped on drop. It is separate from
+//! the per-run transport key, so it shows only inside authenticated,
+//! encrypted streams, never in a handshake.
 
 use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroizing;

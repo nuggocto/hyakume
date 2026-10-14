@@ -50,4 +50,5 @@ description = "Run each fuzz target for 120 seconds (needs cargo-fuzz and nightl
 run = [
   "cargo +nightly-2026-09-04 fuzz run frame -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
   "cargo +nightly-2026-09-04 fuzz run invitation_token -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
+  "cargo +nightly-2026-09-04 fuzz run stored_values -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
 ]

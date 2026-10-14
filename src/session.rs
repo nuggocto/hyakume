@@ -1,15 +1,8 @@
-//! Authentication of a connection between trusted devices.
-//!
-//! After the QUIC handshake both sides read the TLS exporter value. Each
-//! signs a transcript of that value, both transport endpoint IDs, and the
-//! version negotiation with its long-term device key, under a domain for its
-//! role. The dialer proves first. The listener checks that the dialer is
-//! trusted before it reveals its own identity.
-//!
-//! A proof is bound to one connection by the exporter value and to one role
-//! by its domain, so it cannot be replayed on another connection or
-//! reflected back to its sender. QUIC with TLS 1.3 then protects everything
-//! on the connection; there is no second layer of content encryption.
+//! Authentication of a connection between trusted devices. Each side signs
+//! the TLS exporter value, both endpoint IDs, and the negotiation under a
+//! domain for its role, so a proof cannot be replayed on another connection
+//! or reflected back. The listener checks the dialer before revealing its
+//! own identity.
 
 use crate::identity::{DeviceId, DeviceKey};
 

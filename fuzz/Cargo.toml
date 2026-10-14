@@ -28,3 +28,10 @@ path = "fuzz_targets/invitation_token.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stored_values"
+path = "fuzz_targets/stored_values.rs"
+test = false
+doc = false
+bench = false

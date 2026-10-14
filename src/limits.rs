@@ -1,13 +1,8 @@
-//! Compiled limits and the admission budget.
-//!
-//! Every attacker-influenced count and size has a compiled maximum here.
-//! Configuration may lower a limit for one endpoint ([`Limits::clamped`]),
-//! but nothing can raise one. The buffer budget also has a floor,
-//! [`MIN_BUFFER_BYTES`].
-//!
-//! Capacity is handed out as permits. A permit returns its capacity when it
-//! is dropped, so capacity cannot be released twice, and it is released
-//! exactly when its owner gives up the work it stood for.
+//! Compiled limits and the admission budget. Every count and size a peer
+//! can influence has a compiled maximum; configuration may lower one
+//! ([`Limits::clamped`]) but never raise it. Capacity comes as permits that
+//! give it back when dropped, so it is released exactly once. The reason
+//! for each number is in `docs/resource-estimate.md`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -61,17 +56,15 @@ pub const CHUNK_OVERHEAD: usize = 64;
 pub const MAX_CHUNK_BYTES: usize = MAX_FRAME_BYTES - CHUNK_OVERHEAD;
 pub const MAX_IN_FLIGHT_CHUNKS: usize = 8;
 
-/// Buffer that held and sending leases together always leave free: the
-/// reader's lease for one largest frame, raw and decoded. With it free, a
-/// connection can always read its next frame.
+/// Buffer that sending leases always leave free: the reader's lease for one
+/// largest frame, raw and decoded. With it free, a connection can always
+/// read its next frame, so two nodes sending to each other cannot wait on
+/// each other.
 pub const FRAME_HEADROOM: u64 = 2 * MAX_FRAME_BYTES as u64;
-/// Buffer that held leases also leave free for sending: the cost of one
-/// largest chunk. With it free, an accepted transfer never stops this node
-/// from sending, so two nodes sending to each other cannot wait on each
-/// other's staging.
+/// The cost of sending one largest chunk.
 pub const CHUNK_HEADROOM: u64 = chunk_cost(MAX_CHUNK_BYTES);
 /// The smallest buffer budget: one frame read and one chunk sent at once.
-/// A budget configured below it is raised to it. Staging needs room on top.
+/// A budget configured below it is raised to it.
 pub const MIN_BUFFER_BYTES: u64 = FRAME_HEADROOM + CHUNK_HEADROOM;
 
 /// Buffer one chunk of `len` payload bytes takes while it is sent: the
@@ -80,12 +73,21 @@ pub const fn chunk_cost(len: usize) -> u64 {
     3 * (len as u64 + CHUNK_OVERHEAD as u64)
 }
 
-/// Payload bytes the loopback proof keeps in receiver-owned staging. The
-/// qualified file pipeline replaces this with private partial files.
-pub const MAX_STAGED_BYTES: u64 = 64 * MIB;
-/// Items accepted or received and not yet taken, empty ones included. Each
-/// keeps its name and identifiers in memory even when it has no bytes.
-pub const MAX_HELD_ITEMS: usize = 4 * MAX_BATCH_ITEMS;
+/// How long paused work stays resumable.
+pub const RESUME_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// How long deleting a file Hyakume no longer needs is retried before it is
+/// reported as retained.
+pub const CLEANUP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// One standard-input spool.
+pub const MAX_SPOOL_BYTES: u64 = 2 * GIB;
+/// All sender spools together.
+pub const MAX_SPOOL_TOTAL: u64 = 8 * GIB;
+/// All private receive partials together, paused work and pending cleanup
+/// included.
+pub const MAX_PARTIAL_TOTAL: u64 = 32 * GIB;
+/// Free space a write leaves on its filesystem, so filling a disk with
+/// payload never leaves the state database unable to record the outcome.
+pub const MIN_FREE_BYTES: u64 = 64 * MIB;
 
 const _: () = {
     // One resident copy of every in-flight chunk must fit the buffer budget.
@@ -93,8 +95,9 @@ const _: () = {
     assert!(chunks <= 128 * MIB);
     assert!(MAX_TRUSTED_DEVICES <= MAX_TRUST_RECORDS);
     assert!(MAX_CLAIMANTS >= MAX_ATTEMPTS as usize);
-    assert!(MAX_TEXT_BYTES as usize <= MAX_STAGED_BYTES as usize);
-    assert!(MAX_HELD_ITEMS >= MAX_BATCH_ITEMS);
+    assert!(MAX_SPOOL_BYTES <= MAX_SPOOL_TOTAL);
+    assert!(MAX_BATCH_BYTES <= MAX_PARTIAL_TOTAL);
+    assert!(MAX_TEXT_BYTES <= MAX_SPOOL_BYTES);
     assert!(CHUNK_OVERHEAD >= 1 + 16 + 2 + 8 + 4);
     assert!(CHUNK_HEADROOM == 3 * MAX_FRAME_BYTES as u64);
 };
@@ -109,6 +112,8 @@ pub struct Limits {
     pub buffer_bytes: u64,
     pub handshake_deadline: Duration,
     pub idle_timeout: Duration,
+    /// How long a graceful stop waits for tasks and blocking work.
+    pub drain_deadline: Duration,
 }
 
 impl Limits {
@@ -121,6 +126,7 @@ impl Limits {
         buffer_bytes: 128 * MIB,
         handshake_deadline: Duration::from_secs(30),
         idle_timeout: Duration::from_secs(10 * 60),
+        drain_deadline: Duration::from_secs(20),
     };
 
     /// Each limit, capped at its compiled maximum. The buffer budget is
@@ -137,6 +143,7 @@ impl Limits {
             buffer_bytes: self.buffer_bytes.clamp(MIN_BUFFER_BYTES, c.buffer_bytes),
             handshake_deadline: self.handshake_deadline.min(c.handshake_deadline),
             idle_timeout: self.idle_timeout.min(c.idle_timeout),
+            drain_deadline: self.drain_deadline.min(c.drain_deadline),
         }
     }
 }
@@ -177,8 +184,6 @@ pub struct Usage {
 #[derive(Default)]
 struct Counts {
     usage: Usage,
-    /// Bytes of `usage.buffer_bytes` taken by held leases.
-    held_bytes: u64,
     /// Bytes of `usage.buffer_bytes` taken by chunks being sent.
     sending_bytes: u64,
     /// Open connections that hold no session.
@@ -279,18 +284,6 @@ impl Budget {
         self.try_lease(Kind::Read, bytes)
     }
 
-    /// The most that held leases may take together.
-    pub fn held_capacity(&self) -> u64 {
-        self.ceiling(Kind::Held)
-    }
-
-    /// Reserves `bytes` that stay held until a transfer ends, such as its
-    /// staged payload. Held leases always leave [`MIN_BUFFER_BYTES`] free,
-    /// so they never stop this node from reading or sending.
-    pub fn lease_held(&self, bytes: u64) -> Result<BufferLease, Refusal> {
-        self.try_lease(Kind::Held, bytes)
-    }
-
     /// Reserves `bytes` of buffer for a frame being read, waiting for other
     /// leases to be released when the budget is full. This is the
     /// backpressure point: a reader that waits here stops pulling from the
@@ -300,8 +293,8 @@ impl Budget {
     }
 
     /// Reserves `bytes` for a chunk being sent, waiting like
-    /// [`Budget::lease_wait`]. Held and sending leases together leave
-    /// [`FRAME_HEADROOM`] free, so sending never stops this node reading.
+    /// [`Budget::lease_wait`]. Sending leases leave [`FRAME_HEADROOM`]
+    /// free, so sending never stops this node reading.
     pub async fn lease_send_wait(&self, bytes: u64) -> Result<BufferLease, Refusal> {
         self.wait(Kind::Send, bytes).await
     }
@@ -312,31 +305,25 @@ impl Budget {
         match kind {
             Kind::Read => all,
             Kind::Send => all.saturating_sub(FRAME_HEADROOM),
-            Kind::Held => all.saturating_sub(MIN_BUFFER_BYTES),
         }
     }
 
     fn try_lease(&self, kind: Kind, bytes: u64) -> Result<BufferLease, Refusal> {
         let mut c = self.lock();
-        let (mut held, mut sending) = (c.held_bytes, c.sending_bytes);
-        match kind {
-            Kind::Read => {}
-            Kind::Send => sending = sending.checked_add(bytes).ok_or(Refusal::Buffer)?,
-            Kind::Held => held = held.checked_add(bytes).ok_or(Refusal::Buffer)?,
+        let mut sending = c.sending_bytes;
+        if kind == Kind::Send {
+            sending = sending.checked_add(bytes).ok_or(Refusal::Buffer)?;
         }
         let total = c
             .usage
             .buffer_bytes
             .checked_add(bytes)
             .ok_or(Refusal::Buffer)?;
-        let fits = total <= self.ceiling(Kind::Read)
-            && held.saturating_add(sending) <= self.ceiling(Kind::Send)
-            && held <= self.ceiling(Kind::Held);
+        let fits = total <= self.ceiling(Kind::Read) && sending <= self.ceiling(Kind::Send);
         if !fits {
             return Err(Refusal::Buffer);
         }
         c.usage.buffer_bytes = total;
-        c.held_bytes = held;
         c.sending_bytes = sending;
         Ok(BufferLease {
             budget: self.clone(),
@@ -405,8 +392,6 @@ enum Kind {
     Read,
     /// A chunk being sent.
     Send,
-    /// Bytes held until a transfer ends.
-    Held,
 }
 
 /// One open connection, counted until it is dropped.
@@ -499,10 +484,8 @@ impl Drop for BufferLease {
     fn drop(&mut self) {
         let mut c = self.budget.lock();
         c.usage.buffer_bytes -= self.bytes;
-        match self.kind {
-            Kind::Read => {}
-            Kind::Send => c.sending_bytes -= self.bytes,
-            Kind::Held => c.held_bytes -= self.bytes,
+        if self.kind == Kind::Send {
+            c.sending_bytes -= self.bytes;
         }
         drop(c);
         self.budget.0.released.notify_waiters();
@@ -525,20 +508,15 @@ mod tests {
     }
 
     #[test]
-    fn held_bytes_leave_room_to_send_one_chunk_and_read_one_frame_at_once() {
+    fn sending_leaves_room_to_read_one_frame() {
         let budget = Budget::new(Limits {
-            buffer_bytes: MIN_BUFFER_BYTES + 100,
+            buffer_bytes: MIN_BUFFER_BYTES,
             ..Limits::COMPILED
         });
-        assert_eq!(budget.lease_held(101).err(), Some(Refusal::Buffer));
-        let staged = budget.lease_held(100).unwrap();
-        assert_eq!(budget.lease_held(1).err(), Some(Refusal::Buffer));
-        // The largest chunk still fits next to everything held, and the
-        // largest frame next to both.
         let chunk = budget.try_lease(Kind::Send, CHUNK_HEADROOM).unwrap();
         assert_eq!(budget.try_lease(Kind::Send, 1).err(), Some(Refusal::Buffer));
         let frame = budget.lease(FRAME_HEADROOM).unwrap();
-        drop((staged, chunk, frame));
+        drop((chunk, frame));
         assert_eq!(budget.usage(), Usage::default());
     }
 

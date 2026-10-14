@@ -1,22 +1,7 @@
-//! Offer and item transfer states, and the batch outcome derived from them.
-//!
-//! ```text
-//! offer:  Offered ──accept──▶ Accepted (items start Queued)
-//!            └──reject / revoke──▶ Rejected
-//!
-//! item:   Queued ──Start──▶ Transferring ──BytesComplete──▶ Verifying ──publish──▶ Published
-//!                              │   ▲                           │
-//!                            Pause │ Resumed                Fail(Digest)
-//!                              ▼   │
-//!                            Paused ──Resume──▶ Resuming
-//!         any nonterminal state ──Cancel / Fail──▶ Cancelled / Failed
-//!         Queued or Paused ──Expire──▶ Expired
-//! ```
-//!
-//! [`Transfer::outcome`] derives the batch result from the item states every
-//! time; there is no completion flag to fall out of step with them.
-//! `Published` is reachable only through [`Transfer::publish`], which checks
-//! the peer's current authority in the trust store first.
+//! Offer and item states, and the batch outcome derived from them.
+//! [`Transfer::outcome`] is computed from the items each time, so there is no
+//! completion flag to drift out of step. `Published` comes only through
+//! [`Transfer::publish`], which checks the peer's authority first.
 
 use crate::identity::DeviceId;
 use crate::ids::TransferId;
@@ -76,6 +61,14 @@ pub enum FailCause {
     Exists,
     /// This device had no buffer room left to continue.
     Busy,
+    /// Reading or writing local storage failed, such as a full disk.
+    Storage,
+    /// The sender's file changed after it was prepared, so its bytes no
+    /// longer match the offer.
+    SourceChanged,
+    /// After a restart, the data kept for this item was missing or had
+    /// changed, so what happened to it cannot be established.
+    Lost,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +95,116 @@ pub enum RejectCause {
     Revoked,
     /// The sender withdrew the offer before the receiver answered.
     Withdrawn,
+    /// The offer ended before it was answered: the connection failed or a
+    /// device stopped.
+    Interrupted,
+    /// The offer broke a rule of this device, such as an item name that
+    /// cannot be used as a file name here.
+    Invalid,
+}
+
+/// Stable names for states and causes, used in storage and in output.
+macro_rules! names {
+    ($ty:ident { $($variant:ident => $name:literal),* $(,)? }) => {
+        impl $ty {
+            pub fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name),* }
+            }
+
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name { $($name => Some(Self::$variant),)* _ => None }
+            }
+        }
+    };
+}
+
+names!(CancelCause {
+    Sender => "sender",
+    Receiver => "receiver",
+    Revoked => "revoked",
+    Shutdown => "shutdown",
+});
+
+names!(FailCause {
+    Digest => "digest",
+    Length => "length",
+    Connection => "connection",
+    Protocol => "protocol",
+    Content => "content",
+    Exists => "exists",
+    Busy => "busy",
+    Storage => "storage",
+    SourceChanged => "source-changed",
+    Lost => "lost",
+});
+
+names!(RejectCause {
+    Receiver => "declined",
+    TooLarge => "too-large",
+    Busy => "busy",
+    Revoked => "revoked",
+    Withdrawn => "withdrawn",
+    Interrupted => "interrupted",
+    Invalid => "invalid",
+});
+
+impl ItemState {
+    /// A stable name such as `published` or `failed:digest`.
+    pub fn name(self) -> String {
+        match self {
+            Self::Queued => "queued".into(),
+            Self::Transferring => "transferring".into(),
+            Self::Verifying => "verifying".into(),
+            Self::Paused => "paused".into(),
+            Self::Resuming => "resuming".into(),
+            Self::Published => "published".into(),
+            Self::Rejected => "rejected".into(),
+            Self::Cancelled(c) => format!("cancelled:{}", c.name()),
+            Self::Failed(c) => format!("failed:{}", c.name()),
+            Self::Expired => "expired".into(),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name.split_once(':') {
+            Some(("cancelled", c)) => Self::Cancelled(CancelCause::from_name(c)?),
+            Some(("failed", c)) => Self::Failed(FailCause::from_name(c)?),
+            Some(_) => return None,
+            None => match name {
+                "queued" => Self::Queued,
+                "transferring" => Self::Transferring,
+                "verifying" => Self::Verifying,
+                "paused" => Self::Paused,
+                "resuming" => Self::Resuming,
+                "published" => Self::Published,
+                "rejected" => Self::Rejected,
+                "expired" => Self::Expired,
+                _ => return None,
+            },
+        })
+    }
+}
+
+impl OfferState {
+    pub fn name(self) -> String {
+        match self {
+            Self::Offered => "offered".into(),
+            Self::Accepted => "accepted".into(),
+            Self::Rejected(c) => format!("rejected:{}", c.name()),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.split_once(':') {
+            Some(("rejected", c)) => RejectCause::from_name(c).map(Self::Rejected),
+            Some(_) => None,
+            None => match name {
+                "offered" => Some(Self::Offered),
+                "accepted" => Some(Self::Accepted),
+                _ => None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +232,8 @@ pub enum TransferError {
     Empty,
     #[error("an offer may contain at most {MAX_BATCH_ITEMS} items")]
     TooManyItems,
+    #[error("the item states do not fit the offer state")]
+    Inconsistent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -141,6 +246,9 @@ pub enum PublishError {
     /// Someone asked to cancel the transfer first.
     #[error("not published: the transfer is being cancelled")]
     Cancelled,
+    /// The decision could not be saved, so it was not made.
+    #[error("not done: the state database failed")]
+    Store,
 }
 
 /// How many items ended each unsuccessful way.
@@ -201,6 +309,28 @@ impl Transfer {
             offer_state: OfferState::Offered,
             items: vec![ItemState::Queued; items],
         })
+    }
+
+    /// Rebuilds a transfer saved earlier. The same limits apply as to a
+    /// new one, and an offer that was never accepted has no item progress.
+    pub fn restore(
+        id: TransferId,
+        authority: Authority,
+        offer_state: OfferState,
+        items: Vec<ItemState>,
+    ) -> Result<Self, TransferError> {
+        let mut transfer = Self::offered(id, authority, items.len())?;
+        let consistent = match offer_state {
+            OfferState::Offered => items.iter().all(|s| *s == ItemState::Queued),
+            OfferState::Rejected(_) => items.iter().all(|s| *s == ItemState::Rejected),
+            OfferState::Accepted => !items.contains(&ItemState::Rejected),
+        };
+        if !consistent {
+            return Err(TransferError::Inconsistent);
+        }
+        transfer.offer_state = offer_state;
+        transfer.items = items;
+        Ok(transfer)
     }
 
     pub fn id(&self) -> TransferId {
@@ -323,7 +453,7 @@ impl Transfer {
     /// breaks the exchange.
     pub fn fail_rest(&mut self, cause: FailCause) {
         match self.offer_state {
-            OfferState::Offered => self.reject(RejectCause::Withdrawn),
+            OfferState::Offered => self.reject(RejectCause::Interrupted),
             OfferState::Accepted => {
                 for state in &mut self.items {
                     if !state.is_terminal() {
@@ -344,6 +474,59 @@ impl Transfer {
                 for state in &mut self.items {
                     if !state.is_terminal() {
                         *state = ItemState::Cancelled(CancelCause::Revoked);
+                    }
+                }
+            }
+            OfferState::Rejected(_) => {}
+        }
+    }
+
+    /// Records an item found committed under its final name after a
+    /// restart, when the record of its publication was not saved. Only
+    /// startup recovery calls this, with the file's identity as evidence.
+    pub fn recovered_published(&mut self, item: usize) -> Result<(), TransitionError> {
+        if self.offer_state != OfferState::Accepted {
+            return Err(TransitionError::WrongOfferState(self.offer_state));
+        }
+        let from = *self
+            .items
+            .get(item)
+            .ok_or(TransitionError::NoSuchItem { item })?;
+        if from.is_terminal() {
+            return Err(TransitionError::NotAllowed {
+                from,
+                event: ItemEvent::BytesComplete,
+            });
+        }
+        self.items[item] = ItemState::Published;
+        Ok(())
+    }
+
+    /// Pauses every unfinished item of an accepted offer, for when this
+    /// device stops while work is under way. An unanswered offer ends as
+    /// interrupted, since the question cannot be answered later.
+    pub fn pause_all(&mut self) {
+        match self.offer_state {
+            OfferState::Offered => self.reject(RejectCause::Interrupted),
+            OfferState::Accepted => {
+                for state in &mut self.items {
+                    if !state.is_terminal() {
+                        *state = ItemState::Paused;
+                    }
+                }
+            }
+            OfferState::Rejected(_) => {}
+        }
+    }
+
+    /// Expires every unfinished item: the time to resume has passed.
+    pub fn expire_all(&mut self) {
+        match self.offer_state {
+            OfferState::Offered => self.reject(RejectCause::Interrupted),
+            OfferState::Accepted => {
+                for state in &mut self.items {
+                    if !state.is_terminal() {
+                        *state = ItemState::Expired;
                     }
                 }
             }
@@ -431,7 +614,8 @@ fn next(from: ItemState, event: ItemEvent) -> Option<ItemState> {
     Some(match (from, event) {
         (S::Queued, E::Start) => S::Transferring,
         (S::Transferring, E::BytesComplete) => S::Verifying,
-        (S::Transferring | S::Resuming, E::Pause) => S::Paused,
+        // A verified item pauses when its publication cannot be confirmed.
+        (S::Transferring | S::Resuming | S::Verifying, E::Pause) => S::Paused,
         (S::Paused, E::Resume) => S::Resuming,
         (S::Resuming, E::Resumed) => S::Transferring,
         (S::Queued | S::Paused, E::Expire) => S::Expired,
@@ -479,7 +663,7 @@ mod tests {
             (S::Queued, E::Pause, None),
             (S::Transferring, E::BytesComplete, Some(S::Verifying)),
             (S::Transferring, E::Resume, None),
-            (S::Verifying, E::Pause, None),
+            (S::Verifying, E::Pause, Some(S::Paused)),
             (
                 S::Verifying,
                 E::Fail(FailCause::Digest),

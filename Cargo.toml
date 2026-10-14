@@ -15,6 +15,9 @@ curve25519-dalek = { version = "4.1", default-features = false }
 data-encoding = "2.11"
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+serde = { version = "1.0", features = ["derive"] }
 spake2 = "=0.4.0"
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["macros", "rt", "sync", "time"] }

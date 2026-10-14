@@ -1,11 +1,7 @@
-//! Published protocol and cryptographic test vectors.
-//!
-//! The vectors in `vectors/protocol-v1.txt` come from fixed, public test
-//! inputs. This test rebuilds them and fails if the current code produces
-//! anything different, so a wire or key-schedule change cannot pass
-//! unnoticed. After an intended change, regenerate the file with
-//! `HYAKUME_WRITE_VECTORS=1 cargo test --locked --test vectors` and review
-//! the diff.
+//! Published protocol and cryptographic test vectors, rebuilt from fixed
+//! inputs so a wire or key-schedule change cannot pass unnoticed. After an
+//! intended change, run `HYAKUME_WRITE_VECTORS=1 cargo test --locked --test
+//! vectors` and review the diff.
 
 // Test helpers may stop the test on unexpected failures.
 #![allow(clippy::unwrap_used, clippy::expect_used)]

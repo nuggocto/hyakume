@@ -1,21 +1,8 @@
-//! Safe projections of peer-controlled text.
-//!
-//! A peer chooses device names, file names, and text previews. Hyakume keeps
-//! those original bytes in [`PeerText`] and never prints them directly.
-//! Output goes through a projection:
-//!
-//! - [`SafeLine`] for single-line fields. Control characters, line breaks,
-//!   bidirectional and invisible formatting characters, quotes, and
-//!   backslashes become visible escapes, and the result stops at a column
-//!   limit with a visible marker.
-//! - [`SafeBlock`] for multi-line previews. Each line is a [`SafeLine`], and
-//!   the block stops at a byte and line limit.
-//!
-//! Zero-width characters, such as combining accents, take no column. Each
-//! visible character keeps at most [`MAX_MARKS`] of them; further ones show
-//! as escapes, which do take columns. Both projections read their input
-//! lazily and stop at their limit, so the work and memory depend on the
-//! limit, not on the input size.
+//! Safe projections of text a peer chose: device names, file names, and
+//! previews. The original bytes stay in [`PeerText`]; output goes through
+//! [`SafeLine`] or [`SafeBlock`], which show control, bidirectional, and
+//! invisible characters as escapes and stop at a limit. Both read lazily, so
+//! their cost follows the limit, not the input.
 
 use std::fmt;
 
@@ -93,7 +80,7 @@ impl SafeLine {
     pub fn project(raw: &[u8], columns: usize) -> Self {
         let mut text = String::new();
         let mut used = 0usize;
-        // Zero-width characters since the last visible one.
+        // Marks since the last visible character, capped at MAX_MARKS.
         let mut marks = 0usize;
         let mut shortened = false;
         'outer: for chunk in raw.utf8_chunks() {

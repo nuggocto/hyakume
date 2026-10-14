@@ -1,9 +1,7 @@
-//! The consent screen for an incoming offer.
-//!
-//! Every value the sender controls appears inside a labelled, quoted, or
-//! indented field produced by [`crate::display`]. Only this presenter writes
-//! line breaks and the closing question, so a hostile name or preview can
-//! neither add lines of its own nor imitate the prompt.
+//! The consent screen for an incoming offer. Values the sender chose appear
+//! only inside fields made by [`crate::display`], and only this presenter
+//! writes line breaks and the question, so a name or preview cannot add
+//! lines or look like the prompt.
 
 use std::fmt::Write as _;
 

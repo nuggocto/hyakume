@@ -1,36 +1,8 @@
-//! The pairing exchange: SPAKE2 over an authenticated QUIC connection,
-//! bound to that connection, to the invitation and claim, and to both
-//! long-term identities, ending in a short verifier both people compare.
-//!
-//! This module performs no I/O. The caller moves messages and supplies the
-//! values in [`ExchangeContext`].
-//!
-//! ```text
-//! joiner (SPAKE2 A)                              inviter (SPAKE2 B)
-//!   Commit = H(share_j, idc_j, nonce_j, name_j) ->
-//!                       <- Share(share_i, idc_i, nonce_i, name_i)
-//!   Reveal(share_j, idc_j, nonce_j, name_j) ->      inviter checks Commit
-//!                       <- Confirm(MAC_i)
-//!   Confirm(MAC_j) ->                               joiner checked MAC_i
-//!                       <- Identity(id_i, salt_i, sig_i(T))
-//!   Identity(id_j, salt_j, sig_j(T)) ->             inviter checked MAC_j
-//!   both show the verifier; each person answers
-//!   Decision(yes/no, MAC) <-> Decision(yes/no, MAC)
-//! ```
-//!
-//! - `idc = H(id, salt)` commits to a device key without revealing it.
-//!   Device keys are sent only after both confirmation MACs check out, so
-//!   someone without the secret learns no long-term identity.
-//! - The transcript `T` hashes the exporter value, both transport endpoint
-//!   IDs, the negotiated version messages, the invitation kind and ID, the
-//!   claim ID, the commitment, and every field of both contributions. Each
-//!   key is `BLAKE3::derive_key(context, K || T)` with its own context.
-//! - A wrong secret changes `K`, so the confirmation MAC fails. A relay that
-//!   terminates two TLS sessions sees two exporter values, so the MACs fail
-//!   unless it knows the secret; if it does, the two sides get unrelated
-//!   verifiers. The joiner commits before it sees the inviter's share and
-//!   the inviter sends its share before it sees the joiner's, so neither can
-//!   search for values that make two verifiers match.
+//! The pairing exchange: SPAKE2 bound to the QUIC connection, the
+//! invitation, the claim, and both identities, ending in a short verifier
+//! both people compare. It does no I/O, so every step has a unit test. The
+//! joiner commits before it sees the inviter's share, so neither side can
+//! steer the verifier; `docs/pairing-identity-session.md` has the design.
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use rand_core::{CryptoRng, RngCore};

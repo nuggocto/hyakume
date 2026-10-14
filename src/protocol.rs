@@ -1,22 +1,7 @@
-//! Versioned control messages and their framing.
-//!
-//! A frame is a 4-byte big-endian payload length followed by the payload.
-//! A payload is a 1-byte message tag followed by the message fields in a
-//! fixed order:
-//!
-//! - fixed-size arrays are written as is;
-//! - integers are big-endian;
-//! - variable-length bytes are a 4-byte length followed by the bytes.
-//!
-//! Decoding is strict. The frame length is checked against
-//! [`MAX_FRAME_BYTES`] before anything is allocated. Every variable field
-//! and collection has its own limit, checked against the declared length
-//! before it is read. A payload with bytes left over, an unknown tag, or an
-//! unknown code is refused. Errors name the problem but never echo peer
-//! bytes.
-//!
-//! Decoding only checks shape. Domain types such as [`crate::offer::Offer`]
-//! validate meaning, and the session and pairing state machines decide
+//! Versioned control messages and their framing. Decoding is strict: every
+//! length is checked before anything is allocated, and leftover bytes or
+//! unknown tags are refused, so the reader never has to guess. It checks
+//! only shape; domain types validate meaning, and the state machines decide
 //! which message may come next.
 
 use crate::ids::{ClaimId, InvitationId, TransferId};
@@ -114,6 +99,11 @@ pub enum ItemResult {
     /// The bytes match the digest but not the offered kind: text that is
     /// not UTF-8, or that differs from its preview.
     ContentMismatch,
+    /// The receiver already has a file with that name; nothing was
+    /// overwritten.
+    Exists,
+    /// The receiver could not write the item to its storage.
+    StorageFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,6 +389,8 @@ pub fn encode_payload(msg: &Message) -> Vec<u8> {
                 ItemResult::Cancelled => 4,
                 ItemResult::Unauthorized => 5,
                 ItemResult::ContentMismatch => 6,
+                ItemResult::Exists => 7,
+                ItemResult::StorageFailed => 8,
             });
         }
         Message::Cancel { transfer, reason } => {
@@ -552,6 +544,8 @@ pub fn decode_payload(payload: &[u8]) -> Result<Message, ProtocolError> {
                 4 => ItemResult::Cancelled,
                 5 => ItemResult::Unauthorized,
                 6 => ItemResult::ContentMismatch,
+                7 => ItemResult::Exists,
+                8 => ItemResult::StorageFailed,
                 _ => return Err(ProtocolError::Malformed),
             },
         },

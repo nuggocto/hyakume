@@ -1,29 +1,32 @@
-//! The sending side of an authenticated session, as a state machine.
-//!
-//! ```text
-//! Offering ──OfferAccept (same offer digest)──▶ Sending item ──ItemEnd──▶ Awaiting result
-//!     │                                             ▲                         │
-//!     └─OfferReject──▶ Done                          └──────next item──────────┘
-//!                                                                     last item ▼
-//!                                                                             Done
-//! ```
-//!
-//! Before every chunk the sender checks that trust in the receiver is
-//! unchanged and that nobody asked to cancel. A message that does not fit
-//! the current step, or names another transfer, item, or offer, ends the
-//! session with an error and fails the unfinished items.
+//! The sending side of a session, as a state machine. It does no I/O; the
+//! runtime reads and hashes the bytes it names, so a source that changed
+//! fails its item instead of sending different bytes. Before every chunk it
+//! checks trust and cancellation, and a message that does not fit the step
+//! ends the session.
 
 use crate::ids::TransferId;
 use crate::limits::{ActiveSlot, Budget, MAX_CHUNK_BYTES, SessionSlot, TransferSlot};
 use crate::offer::Offer;
 use crate::protocol::{CancelReason, ErrorCode, ItemResult, Message, RejectReason};
-use crate::state::{State, StateError};
-use crate::transfer::{CancelCause, FailCause, ItemEvent, RejectCause, Transfer};
+use crate::state::{State, StateError, TransferInfo};
+use crate::transfer::{CancelCause, FailCause, ItemEvent, PublishError, RejectCause, Transfer};
 use crate::trust::Authority;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Output {
     Send(Message),
+    /// Read `len` bytes at `offset` of `item`'s source and send them in
+    /// [`Sender::chunk`].
+    Read {
+        item: usize,
+        offset: u64,
+        len: usize,
+    },
+    /// Every byte of `item` was read. Check that its source still matches
+    /// the offer, then call [`Sender::end_item`].
+    Check {
+        item: usize,
+    },
     Abort(ErrorCode),
     End,
 }
@@ -31,15 +34,15 @@ pub enum Output {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     Offering,
-    Sending { item: usize, offset: usize },
+    Sending { item: usize, offset: u64 },
+    Checking { item: usize },
     Awaiting { item: usize },
     Done,
 }
 
 pub struct Sender {
     offer: Offer,
-    payload: Vec<Vec<u8>>,
-    chunk: usize,
+    chunk: u64,
     authority: Authority,
     budget: Budget,
     session: SessionSlot,
@@ -48,44 +51,35 @@ pub struct Sender {
     step: Step,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum SendError {
-    #[error("the payload does not match the offer")]
-    PayloadMismatch,
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]
     Budget(#[from] crate::limits::Refusal),
+    #[error("the offer could not be recorded")]
+    Offer,
 }
 
 impl Sender {
-    /// Prepares a transfer of `payload`, one entry per offered item, and
-    /// records it in `state`. `chunk` is capped at the protocol maximum.
+    /// Prepares a transfer of `offer` and records it in `state`. `chunk` is
+    /// capped at the protocol maximum.
     pub fn new(
         offer: Offer,
-        payload: Vec<Vec<u8>>,
         chunk: usize,
         authority: Authority,
         budget: Budget,
         session: SessionSlot,
+        info: TransferInfo,
         state: &mut State,
     ) -> Result<Self, SendError> {
-        let sizes_match = payload.len() == offer.items().len()
-            && payload
-                .iter()
-                .zip(offer.items())
-                .all(|(p, i)| p.len() as u64 == i.size);
-        if !sizes_match {
-            return Err(SendError::PayloadMismatch);
-        }
         let slot = budget.admit_transfer()?;
         let transfer = Transfer::offered(offer.transfer(), authority, offer.items().len())
-            .map_err(|_| SendError::PayloadMismatch)?;
-        state.insert_transfer(transfer)?;
+            .map_err(|_| SendError::Offer)?;
+        state.insert_transfer(transfer, info)?;
         Ok(Self {
             offer,
-            payload,
-            chunk: chunk.clamp(1, MAX_CHUNK_BYTES),
+            chunk: chunk.clamp(1, MAX_CHUNK_BYTES) as u64,
             authority,
             budget,
             session,
@@ -104,6 +98,11 @@ impl Sender {
         Message::Offer(self.offer.fields())
     }
 
+    /// The digest the offer declares for `item`.
+    pub fn item_digest(&self, item: usize) -> Option<[u8; 32]> {
+        self.offer.items().get(item).map(|i| i.digest)
+    }
+
     pub fn is_done(&self) -> bool {
         self.step == Step::Done
     }
@@ -116,10 +115,11 @@ impl Sender {
     /// Payload bytes in the next frame: a chunk's length, or zero.
     pub fn next_chunk_len(&self) -> usize {
         match self.step {
-            Step::Sending { item, offset } => self.payload[item]
-                .len()
-                .saturating_sub(offset)
-                .min(self.chunk),
+            Step::Sending { item, offset } => {
+                let left = self.offer.items()[item].size.saturating_sub(offset);
+                // At most `chunk`, which fits in usize.
+                left.min(self.chunk) as usize
+            }
             _ => 0,
         }
     }
@@ -132,8 +132,8 @@ impl Sender {
                 || state.cancel_requested(&self.offer.transfer()))
     }
 
-    /// The next frame to send while sending, after checking trust and
-    /// cancellation.
+    /// What to do next while sending, after checking trust and
+    /// cancellation: read a chunk, or check the finished item.
     pub fn next_frame(&mut self, state: &mut State) -> Option<Output> {
         let Step::Sending { item, offset } = self.step else {
             return None;
@@ -142,31 +142,81 @@ impl Sender {
             return Some(stop);
         }
         let id = self.offer.transfer();
-        let bytes = &self.payload[item];
-        if offset == 0
-            && let Some(t) = state.transfer_mut(&id)
-            && t.apply(item, ItemEvent::Start).is_err()
-        {
-            return Some(self.abort(state, FailCause::Protocol, ErrorCode::Internal));
+        let size = self.offer.items()[item].size;
+        if offset == 0 {
+            let started = state.update_transfer(&id, |t| t.apply(item, ItemEvent::Start).is_ok());
+            if started != Some(true) {
+                return Some(self.abort(state, FailCause::Protocol, ErrorCode::Internal));
+            }
         }
-        if offset < bytes.len() {
-            let end = (offset + self.chunk).min(bytes.len());
-            self.step = Step::Sending { item, offset: end };
-            return Some(Output::Send(Message::Chunk {
-                transfer: id,
-                item: item as u16,
-                offset: offset as u64,
-                data: bytes[offset..end].to_vec(),
-            }));
+        if offset < size {
+            let len = self.next_chunk_len();
+            self.step = Step::Sending {
+                item,
+                offset: offset + len as u64,
+            };
+            return Some(Output::Read { item, offset, len });
         }
-        if let Some(t) = state.transfer_mut(&id) {
-            let _ = t.apply(item, ItemEvent::BytesComplete);
-        }
-        self.step = Step::Awaiting { item };
-        Some(Output::Send(Message::ItemEnd {
-            transfer: id,
+        state.update_transfer(&id, |t| t.apply(item, ItemEvent::BytesComplete));
+        self.step = Step::Checking { item };
+        Some(Output::Check { item })
+    }
+
+    /// The chunk message for bytes read at `offset` of `item`.
+    pub fn chunk(&self, item: usize, offset: u64, data: Vec<u8>) -> Message {
+        Message::Chunk {
+            transfer: self.offer.transfer(),
+            // Bounded by MAX_BATCH_ITEMS when the offer was validated.
             item: item as u16,
-        }))
+            offset,
+            data,
+        }
+    }
+
+    /// The runtime checked the item's source. If it still matches the
+    /// offer, the item ends; otherwise it fails with `failure` and the rest
+    /// of the transfer is cancelled, so different bytes never complete
+    /// under this transfer.
+    pub fn end_item(&mut self, failure: Option<FailCause>, state: &mut State) -> Vec<Output> {
+        let Step::Checking { item } = self.step else {
+            return Vec::new();
+        };
+        match failure {
+            None => {
+                self.step = Step::Awaiting { item };
+                vec![Output::Send(Message::ItemEnd {
+                    transfer: self.offer.transfer(),
+                    item: item as u16,
+                })]
+            }
+            Some(cause) => self.source_failed(item, cause, state),
+        }
+    }
+
+    /// Reading the current item's source failed.
+    pub fn on_read_failure(&mut self, cause: FailCause, state: &mut State) -> Vec<Output> {
+        match self.step {
+            Step::Sending { item, .. } | Step::Checking { item } => {
+                self.source_failed(item, cause, state)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn source_failed(&mut self, item: usize, cause: FailCause, state: &mut State) -> Vec<Output> {
+        let id = self.offer.transfer();
+        state.update_transfer(&id, |t| {
+            let _ = t.apply(item, ItemEvent::Fail(cause));
+            t.cancel(CancelCause::Sender);
+        });
+        self.done();
+        vec![
+            Output::Send(Message::Cancel {
+                transfer: id,
+                reason: CancelReason::Sender,
+            }),
+            Output::End,
+        ]
     }
 
     pub fn on_message(&mut self, msg: Message, state: &mut State) -> Vec<Output> {
@@ -183,8 +233,14 @@ impl Sender {
                 if offer_digest != self.offer.digest() {
                     return vec![self.abort(state, FailCause::Protocol, ErrorCode::Malformed)];
                 }
-                if state.accept(&id).is_err() {
-                    return self.finish_cancelled(state, CancelReason::Revoked);
+                match state.accept(&id, None) {
+                    Ok(()) => {}
+                    Err(PublishError::Unauthorized(_)) => {
+                        return self.finish_cancelled(state, CancelReason::Revoked);
+                    }
+                    Err(_) => {
+                        return vec![self.abort(state, FailCause::Storage, ErrorCode::Internal)];
+                    }
                 }
                 match self.budget.activate(&self.session, &self._slot) {
                     Ok(a) => self.active = Some(a),
@@ -194,15 +250,16 @@ impl Sender {
                 Vec::new()
             }
             (Step::Offering, Message::OfferReject { transfer, reason }) if transfer == id => {
-                if let Some(t) = state.transfer_mut(&id) {
+                state.update_transfer(&id, |t| {
                     t.reject(match reason {
                         RejectReason::Declined => RejectCause::Receiver,
-                        RejectReason::TooLarge | RejectReason::Malformed => RejectCause::TooLarge,
+                        RejectReason::TooLarge => RejectCause::TooLarge,
+                        RejectReason::Malformed => RejectCause::Invalid,
                         RejectReason::Busy => RejectCause::Busy,
                         RejectReason::NotTrusted => RejectCause::Revoked,
                     });
-                }
-                self.done(state);
+                });
+                self.done();
                 vec![Output::End]
             }
             (
@@ -213,53 +270,37 @@ impl Sender {
                     result,
                 },
             ) if transfer == id && usize::from(got) == item => {
-                if let Some(t) = state.transfer_mut(&id) {
+                state.update_transfer(&id, |t| {
                     let _ = match result {
                         ItemResult::Published => t.confirm_published(item).map(|_| ()),
-                        ItemResult::DigestMismatch => t
-                            .apply(item, ItemEvent::Fail(FailCause::Digest))
-                            .map(|_| ()),
-                        ItemResult::LengthMismatch => t
-                            .apply(item, ItemEvent::Fail(FailCause::Length))
-                            .map(|_| ()),
-                        ItemResult::Cancelled => t
-                            .apply(item, ItemEvent::Cancel(CancelCause::Receiver))
-                            .map(|_| ()),
-                        ItemResult::Unauthorized => t
-                            .apply(item, ItemEvent::Cancel(CancelCause::Revoked))
-                            .map(|_| ()),
-                        ItemResult::ContentMismatch => t
-                            .apply(item, ItemEvent::Fail(FailCause::Content))
-                            .map(|_| ()),
+                        other => t.apply(item, result_event(other)).map(|_| ()),
                     };
-                }
-                if item + 1 < self.payload.len() && result != ItemResult::Unauthorized {
+                    if result == ItemResult::Unauthorized {
+                        t.cancel(CancelCause::Revoked);
+                    }
+                });
+                if item + 1 < self.offer.items().len() && result != ItemResult::Unauthorized {
                     self.step = Step::Sending {
                         item: item + 1,
                         offset: 0,
                     };
                     return Vec::new();
                 }
-                if result == ItemResult::Unauthorized
-                    && let Some(t) = state.transfer_mut(&id)
-                {
-                    t.cancel(CancelCause::Revoked);
-                }
-                self.done(state);
+                self.done();
                 vec![Output::End]
             }
             (
                 Step::Sending { .. } | Step::Awaiting { .. } | Step::Offering,
                 Message::Cancel { transfer, reason },
             ) if transfer == id => {
-                if let Some(t) = state.transfer_mut(&id) {
+                state.update_transfer(&id, |t| {
                     t.cancel(match reason {
                         CancelReason::Revoked => CancelCause::Revoked,
                         CancelReason::Shutdown => CancelCause::Shutdown,
                         CancelReason::Receiver | CancelReason::Sender => CancelCause::Receiver,
                     });
-                }
-                self.done(state);
+                });
+                self.done();
                 vec![Output::End]
             }
             (_, Message::Error(_)) => {
@@ -276,7 +317,7 @@ impl Sender {
             Step::Offering | Step::Awaiting { .. } => {
                 self.stop_if_needed(state).into_iter().collect()
             }
-            Step::Sending { .. } | Step::Done => Vec::new(),
+            Step::Sending { .. } | Step::Checking { .. } | Step::Done => Vec::new(),
         }
     }
 
@@ -289,30 +330,28 @@ impl Sender {
         self.stop_if_needed(state).into_iter().collect()
     }
 
-    /// The connection ended. Unfinished items fail.
+    /// The connection ended. Unfinished items fail, or pause while the node
+    /// stops.
     pub fn on_disconnect(&mut self, state: &mut State) {
         if !self.is_done() {
-            self.fail(state, FailCause::Connection);
+            state.interrupt(&self.offer.transfer(), FailCause::Connection);
+            self.done();
         }
     }
 
     fn stop_if_needed(&mut self, state: &mut State) -> Option<Output> {
         let id = self.offer.transfer();
         if state.trust().check(&self.authority).is_err() {
-            if let Some(t) = state.transfer_mut(&id) {
-                t.revoke();
-            }
-            self.done(state);
+            state.update_transfer(&id, Transfer::revoke);
+            self.done();
             return Some(Output::Send(Message::Cancel {
                 transfer: id,
                 reason: CancelReason::Revoked,
             }));
         }
         if state.cancel_requested(&id) {
-            if let Some(t) = state.transfer_mut(&id) {
-                t.cancel(CancelCause::Sender);
-            }
-            self.done(state);
+            state.update_transfer(&id, |t| t.cancel(CancelCause::Sender));
+            self.done();
             return Some(Output::Send(Message::Cancel {
                 transfer: id,
                 reason: CancelReason::Sender,
@@ -322,10 +361,12 @@ impl Sender {
     }
 
     fn finish_cancelled(&mut self, state: &mut State, reason: CancelReason) -> Vec<Output> {
-        self.done(state);
+        let id = self.offer.transfer();
+        state.update_transfer(&id, |t| t.cancel(CancelCause::Revoked));
+        self.done();
         vec![
             Output::Send(Message::Cancel {
-                transfer: self.offer.transfer(),
+                transfer: id,
                 reason,
             }),
             Output::End,
@@ -338,16 +379,26 @@ impl Sender {
     }
 
     fn fail(&mut self, state: &mut State, cause: FailCause) {
-        if let Some(t) = state.transfer_mut(&self.offer.transfer()) {
-            t.fail_rest(cause);
-        }
-        self.done(state);
+        state.update_transfer(&self.offer.transfer(), |t| t.fail_rest(cause));
+        self.done();
     }
 
-    fn done(&mut self, state: &mut State) {
+    fn done(&mut self) {
         self.step = Step::Done;
         self.active = None;
-        state.mark_finished(self.offer.transfer());
+    }
+}
+
+/// The item event a receiver's unsuccessful result stands for.
+fn result_event(result: ItemResult) -> ItemEvent {
+    match result {
+        ItemResult::DigestMismatch => ItemEvent::Fail(FailCause::Digest),
+        ItemResult::LengthMismatch => ItemEvent::Fail(FailCause::Length),
+        ItemResult::ContentMismatch => ItemEvent::Fail(FailCause::Content),
+        ItemResult::Exists => ItemEvent::Fail(FailCause::Exists),
+        ItemResult::StorageFailed => ItemEvent::Fail(FailCause::Storage),
+        ItemResult::Cancelled => ItemEvent::Cancel(CancelCause::Receiver),
+        ItemResult::Unauthorized | ItemResult::Published => ItemEvent::Cancel(CancelCause::Revoked),
     }
 }
 
@@ -365,7 +416,7 @@ mod tests {
 
     fn setup(content: &[&[u8]]) -> (State, Budget, Sender, DeviceId) {
         let peer = DeviceKey::from_seed(&Zeroizing::new([9; 32])).id();
-        let mut state = State::new();
+        let mut state = State::in_memory().unwrap();
         let authority = state
             .trust
             .trust(
@@ -382,14 +433,14 @@ mod tests {
             .collect();
         let offer = Offer::for_files(ID, &files).unwrap();
         let session = budget.admit_session().unwrap();
-        let payload = content.iter().map(|c| c.to_vec()).collect();
+        let info = TransferInfo::new(true, offer.clone(), 0);
         let sender = Sender::new(
             offer,
-            payload,
             2,
             authority,
             budget.clone(),
             session,
+            info,
             &mut state,
         )
         .unwrap();
@@ -411,55 +462,43 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
     }
 
-    fn drain(sender: &mut Sender, state: &mut State) -> Vec<Message> {
-        let mut sent = Vec::new();
-        while let Some(Output::Send(m)) = sender.next_frame(state) {
-            let last = matches!(m, Message::ItemEnd { .. });
-            sent.push(m);
-            if last {
-                break;
+    /// Plays the runtime through one item with an unchanged source, and
+    /// returns the reads it was asked for.
+    fn drain(sender: &mut Sender, state: &mut State) -> Vec<(u64, usize)> {
+        let mut reads = Vec::new();
+        loop {
+            match sender.next_frame(state) {
+                Some(Output::Read { offset, len, .. }) => reads.push((offset, len)),
+                Some(Output::Check { .. }) => {
+                    let out = sender.end_item(None, state);
+                    assert!(matches!(
+                        out.as_slice(),
+                        [Output::Send(Message::ItemEnd { .. })]
+                    ));
+                    return reads;
+                }
+                other => panic!("unexpected {other:?}"),
             }
         }
-        sent
+    }
+
+    fn item_result(item: u16, result: ItemResult) -> Message {
+        Message::ItemResult {
+            transfer: ID,
+            item,
+            result,
+        }
     }
 
     #[test]
-    fn the_sender_streams_each_item_in_order_and_records_the_receivers_results() {
+    fn the_sender_reads_each_item_in_order_and_records_the_receivers_results() {
         let (mut state, budget, mut sender, _) = setup(&[b"abcde", b""]);
         accept(&mut sender, &mut state);
-        let first = drain(&mut sender, &mut state);
-        let offsets: Vec<u64> = first
-            .iter()
-            .filter_map(|m| match m {
-                Message::Chunk { offset, .. } => Some(*offset),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(offsets, [0, 2, 4]);
-        sender.on_message(
-            Message::ItemResult {
-                transfer: ID,
-                item: 0,
-                result: ItemResult::Published,
-            },
-            &mut state,
-        );
+        assert_eq!(drain(&mut sender, &mut state), [(0, 2), (2, 2), (4, 1)]);
+        sender.on_message(item_result(0, ItemResult::Published), &mut state);
         // The empty item has no chunks, only its end.
-        assert_eq!(
-            drain(&mut sender, &mut state),
-            [Message::ItemEnd {
-                transfer: ID,
-                item: 1
-            }]
-        );
-        let out = sender.on_message(
-            Message::ItemResult {
-                transfer: ID,
-                item: 1,
-                result: ItemResult::Published,
-            },
-            &mut state,
-        );
+        assert!(drain(&mut sender, &mut state).is_empty());
+        let out = sender.on_message(item_result(1, ItemResult::Published), &mut state);
         assert_eq!(out, [Output::End]);
         assert_eq!(
             state.transfer(&ID).unwrap().outcome(),
@@ -470,23 +509,58 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_changed_fails_its_item_and_cancels_the_rest() {
+        let (mut state, _, mut sender, _) = setup(&[b"abc", b"de"]);
+        accept(&mut sender, &mut state);
+        assert!(matches!(
+            sender.next_frame(&mut state),
+            Some(Output::Read { .. })
+        ));
+        assert_eq!(
+            sender.next_frame(&mut state),
+            Some(Output::Read {
+                item: 0,
+                offset: 2,
+                len: 1
+            })
+        );
+        assert_eq!(
+            sender.next_frame(&mut state),
+            Some(Output::Check { item: 0 })
+        );
+        let out = sender.end_item(Some(FailCause::SourceChanged), &mut state);
+        assert_eq!(
+            out,
+            [
+                Output::Send(Message::Cancel {
+                    transfer: ID,
+                    reason: CancelReason::Sender
+                }),
+                Output::End
+            ]
+        );
+        assert_eq!(
+            state.transfer(&ID).unwrap().items(),
+            [
+                ItemState::Failed(FailCause::SourceChanged),
+                ItemState::Cancelled(CancelCause::Sender)
+            ]
+        );
+    }
+
+    #[test]
     fn the_receivers_reason_for_a_failed_item_is_kept() {
         for (result, cause) in [
             (ItemResult::DigestMismatch, FailCause::Digest),
             (ItemResult::LengthMismatch, FailCause::Length),
             (ItemResult::ContentMismatch, FailCause::Content),
+            (ItemResult::Exists, FailCause::Exists),
+            (ItemResult::StorageFailed, FailCause::Storage),
         ] {
             let (mut state, _, mut sender, _) = setup(&[b"abc"]);
             accept(&mut sender, &mut state);
             drain(&mut sender, &mut state);
-            sender.on_message(
-                Message::ItemResult {
-                    transfer: ID,
-                    item: 0,
-                    result,
-                },
-                &mut state,
-            );
+            sender.on_message(item_result(0, result), &mut state);
             assert_eq!(
                 state.transfer(&ID).unwrap().items(),
                 [ItemState::Failed(cause)]
@@ -512,14 +586,7 @@ mod tests {
     #[test]
     fn a_result_for_the_wrong_item_or_out_of_turn_is_refused() {
         let (mut state, _, mut sender, _) = setup(&[b"abc", b"de"]);
-        let early = sender.on_message(
-            Message::ItemResult {
-                transfer: ID,
-                item: 0,
-                result: ItemResult::Published,
-            },
-            &mut state,
-        );
+        let early = sender.on_message(item_result(0, ItemResult::Published), &mut state);
         assert_eq!(early, [Output::Abort(ErrorCode::UnexpectedMessage)]);
         assert_eq!(
             state.transfer(&ID).unwrap().items(),
@@ -529,14 +596,7 @@ mod tests {
         let (mut state, _, mut sender, _) = setup(&[b"abc", b"de"]);
         accept(&mut sender, &mut state);
         drain(&mut sender, &mut state);
-        let wrong = sender.on_message(
-            Message::ItemResult {
-                transfer: ID,
-                item: 1,
-                result: ItemResult::Published,
-            },
-            &mut state,
-        );
+        let wrong = sender.on_message(item_result(1, ItemResult::Published), &mut state);
         assert_eq!(wrong, [Output::Abort(ErrorCode::UnexpectedMessage)]);
         assert_eq!(
             state.transfer(&ID).unwrap().items(),
@@ -553,7 +613,7 @@ mod tests {
         accept(&mut sender, &mut state);
         assert!(matches!(
             sender.next_frame(&mut state),
-            Some(Output::Send(Message::Chunk { .. }))
+            Some(Output::Read { .. })
         ));
         assert!(!sender.should_stop(&state));
         state.revoke(&peer).unwrap();
@@ -575,44 +635,23 @@ mod tests {
 
     #[test]
     fn a_rejection_ends_the_transfer_with_the_receivers_reason() {
-        let (mut state, _, mut sender, _) = setup(&[b"abc"]);
-        let out = sender.on_message(
-            Message::OfferReject {
-                transfer: ID,
-                reason: RejectReason::Declined,
-            },
-            &mut state,
-        );
-        assert_eq!(out, [Output::End]);
-        assert_eq!(
-            state.transfer(&ID).unwrap().offer_state(),
-            crate::transfer::OfferState::Rejected(RejectCause::Receiver)
-        );
-    }
-
-    #[test]
-    fn a_payload_that_differs_from_its_offer_is_refused() {
-        let peer = DeviceKey::from_seed(&Zeroizing::new([9; 32])).id();
-        let mut state = State::new();
-        let authority = state
-            .trust
-            .trust(
-                VerifiedPeer::new(peer, PeerText::default()),
-                LocalAlias::new("rx").unwrap(),
-            )
-            .unwrap();
-        let budget = Budget::new(Limits::COMPILED);
-        let offer = Offer::for_files(ID, &[("f", b"abc")]).unwrap();
-        let session = budget.admit_session().unwrap();
-        let result = Sender::new(
-            offer,
-            vec![b"abcd".to_vec()],
-            2,
-            authority,
-            budget,
-            session,
-            &mut state,
-        );
-        assert_eq!(result.err(), Some(SendError::PayloadMismatch));
+        for (reason, cause) in [
+            (RejectReason::Declined, RejectCause::Receiver),
+            (RejectReason::Malformed, RejectCause::Invalid),
+        ] {
+            let (mut state, _, mut sender, _) = setup(&[b"abc"]);
+            let out = sender.on_message(
+                Message::OfferReject {
+                    transfer: ID,
+                    reason,
+                },
+                &mut state,
+            );
+            assert_eq!(out, [Output::End]);
+            assert_eq!(
+                state.transfer(&ID).unwrap().offer_state(),
+                crate::transfer::OfferState::Rejected(cause)
+            );
+        }
     }
 }

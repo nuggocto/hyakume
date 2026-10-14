@@ -1,22 +1,8 @@
-//! Trust records and the per-peer authorization order.
-//!
-//! Trust comes from exactly one transition: [`TrustStore::trust`] with a
-//! [`VerifiedPeer`], which only the pairing exchange can create, and only
-//! after both people confirmed the same verifier. Names and aliases never
-//! authorize anything.
-//!
-//! Each grant of trust gets a fresh [`Epoch`] from one store-wide counter.
-//! Work authorized under a peer carries an [`Authority`] naming that epoch.
-//! Revoking the peer, or pairing it again, makes every older authority stale,
-//! so a session, offer, resume request, or publication checks
-//! [`TrustStore::check`] instead of trusting a saved flag. The store is the
-//! single owner of this order: whichever of revocation and publication
-//! reaches it first decides the outcome.
-//!
-//! A pairing answers yes only while holding a [`Reservation`] for the alias
-//! and one trusted place. Another pairing cannot take either before the
-//! other device answers, so saving the trust afterwards cannot fail on a
-//! conflict that appeared in between.
+//! Trust records and the per-peer authorization order. Trust comes only from
+//! a [`VerifiedPeer`], made after both people confirmed the same words. Each
+//! grant gets a fresh [`Epoch`], so revoking or pairing again makes older
+//! [`Authority`] values stale. A [`Reservation`] holds the alias until the
+//! other device answers, so saving trust cannot hit a late conflict.
 
 use std::collections::BTreeMap;
 
@@ -55,6 +41,18 @@ impl LocalAlias {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Epoch(u64);
 
+impl Epoch {
+    pub fn value(self) -> u64 {
+        self.0
+    }
+
+    /// An epoch read back from storage. It authorizes nothing by itself:
+    /// [`TrustStore::check`] still compares it with the current grant.
+    pub(crate) fn restore(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustState {
     Trusted { epoch: Epoch },
@@ -80,6 +78,16 @@ pub struct Authority {
 impl Authority {
     pub fn device(&self) -> DeviceId {
         self.device
+    }
+
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
+    /// An authority read back from storage, as stale or current as the
+    /// trust store says when it is checked.
+    pub(crate) fn restore(device: DeviceId, epoch: Epoch) -> Self {
+        Self { device, epoch }
     }
 }
 
@@ -112,6 +120,13 @@ pub struct Reservation {
     alias: LocalAlias,
 }
 
+impl Reservation {
+    /// Names this reservation in [`TrustStore::release_key`].
+    pub(crate) fn key(&self) -> u64 {
+        self.id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrustError {
     #[error("that device is not trusted")]
@@ -126,9 +141,16 @@ pub enum TrustError {
     InvalidAlias,
     #[error("the trusted device limit is reached")]
     Full,
+    #[error("that name is one device's alias and another's fingerprint")]
+    Ambiguous,
 }
 
-#[derive(Default)]
+/// Saved trust records that cannot be loaded as they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("saved trust records are inconsistent: {0}")]
+pub struct RestoreError(&'static str);
+
+#[derive(Clone, Default)]
 pub struct TrustStore {
     records: BTreeMap<DeviceId, TrustRecord>,
     next_epoch: u64,
@@ -140,6 +162,41 @@ pub struct TrustStore {
 impl TrustStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rebuilds the store from saved records and the saved epoch counter.
+    /// The counter must be past every saved epoch, so no epoch is ever
+    /// handed out twice, and the saved records must respect the limits.
+    pub fn restore(records: Vec<TrustRecord>, next_epoch: u64) -> Result<Self, RestoreError> {
+        if records.len() > MAX_TRUST_RECORDS {
+            return Err(RestoreError("too many records"));
+        }
+        let mut store = Self {
+            next_epoch,
+            ..Self::default()
+        };
+        for record in records {
+            if let TrustState::Trusted { epoch } = record.state {
+                if epoch.0 >= next_epoch {
+                    return Err(RestoreError("an epoch is not below the counter"));
+                }
+                if store.check_alias(&record.alias, None).is_err() {
+                    return Err(RestoreError("two trusted devices share an alias"));
+                }
+            }
+            if store.records.insert(record.device, record).is_some() {
+                return Err(RestoreError("a device appears twice"));
+            }
+        }
+        if store.trusted().count() > MAX_TRUSTED_DEVICES {
+            return Err(RestoreError("too many trusted devices"));
+        }
+        Ok(store)
+    }
+
+    /// The epoch the next grant of trust will get.
+    pub fn next_epoch(&self) -> u64 {
+        self.next_epoch
     }
 
     /// Checks that `alias` is free for `device`: no other trusted device has
@@ -208,6 +265,12 @@ impl TrustStore {
     /// Gives back what a pairing held when it ends without trust.
     pub fn release(&mut self, reservation: Reservation) {
         self.reserved.remove(&reservation.id);
+    }
+
+    /// Gives back a reservation by its key, for when the reservation itself
+    /// was used in an attempt that failed.
+    pub(crate) fn release_key(&mut self, key: u64) {
+        self.reserved.remove(&key);
     }
 
     /// Saves trust in a verified peer without holding anything first.
@@ -303,6 +366,25 @@ impl TrustStore {
             .map(|r| r.device)
     }
 
+    /// The trusted device a person names by alias or fingerprint. Revoked
+    /// records never match, because a newer device may reuse their alias.
+    pub fn find(&self, name: &str) -> Result<DeviceId, TrustError> {
+        let wanted = name.replace('-', "").to_ascii_uppercase();
+        let by_fingerprint = self
+            .trusted()
+            .find(|r| r.device.fingerprint().replace('-', "") == wanted)
+            .map(|r| r.device);
+        match (self.by_alias(name), by_fingerprint) {
+            (Some(a), Some(f)) if a != f => Err(TrustError::Ambiguous),
+            (Some(device), _) | (None, Some(device)) => Ok(device),
+            (None, None) => Err(TrustError::NotTrusted),
+        }
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &TrustRecord> {
+        self.records.values()
+    }
+
     pub fn trusted(&self) -> impl Iterator<Item = &TrustRecord> {
         self.records
             .values()
@@ -378,6 +460,36 @@ mod tests {
         store.revoke(&device(1)).unwrap();
         assert!(store.trust(verified(2, "b"), alias("laptop")).is_ok());
         assert_eq!(store.by_alias("laptop"), Some(device(2)));
+    }
+
+    #[test]
+    fn a_name_finds_the_trusted_device_not_a_revoked_one_with_the_same_alias() {
+        // The revoked record must sort first to be found first by a scan.
+        let (old, new) = if device(1) < device(2) {
+            (1, 2)
+        } else {
+            (2, 1)
+        };
+        let mut store = TrustStore::new();
+        store.trust(verified(old, "a"), alias("laptop")).unwrap();
+        store.revoke(&device(old)).unwrap();
+        store.trust(verified(new, "b"), alias("laptop")).unwrap();
+        assert_eq!(store.find("laptop"), Ok(device(new)));
+        let fingerprint = device(new).fingerprint().to_ascii_lowercase();
+        assert_eq!(store.find(&fingerprint), Ok(device(new)));
+        assert_eq!(
+            store.find(&device(old).fingerprint()),
+            Err(TrustError::NotTrusted)
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_one_alias_and_another_fingerprint_is_refused() {
+        let mut store = TrustStore::new();
+        let fingerprint = device(1).fingerprint();
+        store.trust(verified(1, "a"), alias("one")).unwrap();
+        store.trust(verified(2, "b"), alias(&fingerprint)).unwrap();
+        assert_eq!(store.find(&fingerprint), Err(TrustError::Ambiguous));
     }
 
     #[test]

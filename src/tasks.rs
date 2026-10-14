@@ -1,10 +1,7 @@
-//! The fatal-invariant policy for owned tasks.
-//!
-//! Every spawned task has an owner that keeps its handle and observes its
-//! result. A task that panicked may have left shared state half-changed, so
-//! its owner stops the process instead of continuing with that state.
-//! Operational failures are typed errors returned by the task; only broken
-//! invariants panic.
+//! The fatal-invariant policy for owned tasks. Every spawned task has an
+//! owner that observes its result. A task that panicked may have left shared
+//! state half-changed, so its owner stops the process rather than go on with
+//! it; ordinary failures are typed errors instead.
 
 use tokio::task::JoinError;
 
@@ -22,4 +19,20 @@ pub fn observe<T>(result: Result<T, JoinError>) -> Option<T> {
         Err(e) if e.is_panic() => fatal("an owned task panicked"),
         Err(_) => None,
     }
+}
+
+/// Name of the variable that makes a debug build stop at a crash point.
+pub const CRASH_VAR: &str = "HYAKUME_CRASH_AT";
+
+/// Stops the process at once, as a crash would, when [`CRASH_VAR`] names
+/// `point`. Only debug builds have crash points: tests use them to stop the
+/// service between two steps of a commit and check what recovery makes of
+/// the result. Release builds compile this to nothing.
+pub fn crash_point(point: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(CRASH_VAR).is_some_and(|v| v == point) {
+        std::process::abort();
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
 }

@@ -1,12 +1,8 @@
-//! Offers: what a sender proposes before anything is transferred.
-//!
-//! An offer arrives as untrusted protocol data. [`Offer::validate`] turns
-//! it into a domain value only when every limit holds: kind, item count,
-//! exact sizes, names, preview, and totals. Sizes are exact; there is no
-//! unknown-length offer. Each item carries the BLAKE3 digest the receiver
-//! checks before publication. The offer travels on an authenticated
-//! session, so the digest is bound to an authenticated sender, and the
-//! receiver's acceptance names the digest of the whole offer it saw.
+//! Offers: what a sender proposes before any byte moves. [`Offer::validate`]
+//! accepts one only when every limit holds, and sizes are always exact, so
+//! the receiver can decide and reserve space up front. Each item carries the
+//! digest checked before publication, and acceptance names the digest of
+//! the whole offer seen.
 
 use crate::display::PeerText;
 use crate::ids::TransferId;

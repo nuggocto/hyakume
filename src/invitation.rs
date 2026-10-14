@@ -1,27 +1,7 @@
-//! Invitations, claims, and the invitation token.
-//!
-//! An invitation lets other devices start a pairing exchange. Each attempt
-//! is a claim. Every claim ends in exactly one way, and an invitation is
-//! used at most once:
-//!
-//! ```text
-//! Open ──this device's person accepts a permanent claim──▶ Consumed
-//!   │ ──temporary claim approved by the sender───────▶ Consumed (other claims refused)
-//!   │ ──verifier declined or mismatched──────────────▶ Declined
-//!   │ ──too many claims that did not verify──────────▶ Exhausted
-//!   │ ──lifetime over────────────────────────────────▶ Expired
-//!   └ ──inviter cancels──────────────────────────────▶ Cancelled
-//! ```
-//!
-//! Expiry counts only forward movement of the clock. A clock that moves
-//! backward adds no time, so it cannot extend an invitation's life.
-//!
-//! A temporary claim never becomes trust. [`Invitation::approve`] returns a
-//! [`TemporaryGrant`], which has no path into the trust store.
-//!
-//! Each invitation allows one comparison of verifier words. Once a claim
-//! has verified, it can only use the invitation or close it; no exit lets
-//! another claim compare words again.
+//! Invitations and their claims. Each invitation allows one comparison of
+//! verifier words and is used at most once, which is what makes a short
+//! verifier enough. Expiry counts only forward clock movement, and a
+//! temporary claim yields a [`TemporaryGrant`] with no path into trust.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -408,6 +388,91 @@ pub struct Route {
     pub addresses: Vec<SocketAddr>,
 }
 
+/// Text that starts a route on its own, as `hyakume status` shows it.
+pub const ROUTE_PREFIX: &str = "hyakume-route:";
+const MAX_ROUTE_BYTES: usize = 32 + 1 + MAX_ROUTE_ADDRESSES * (1 + 16 + 2);
+/// Longest route text, checked before decoding.
+pub const MAX_ROUTE_CHARS: usize = ROUTE_PREFIX.len() + MAX_ROUTE_BYTES.div_ceil(5) * 8;
+
+impl Route {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.endpoint);
+        // At most MAX_ROUTE_ADDRESSES, checked by every caller.
+        out.push(self.addresses.len() as u8);
+        for addr in &self.addresses {
+            match addr.ip() {
+                IpAddr::V4(ip) => {
+                    out.push(4);
+                    out.extend_from_slice(&ip.octets());
+                }
+                IpAddr::V6(ip) => {
+                    out.push(6);
+                    out.extend_from_slice(&ip.octets());
+                }
+            }
+            out.extend_from_slice(&addr.port().to_be_bytes());
+        }
+    }
+
+    fn decode(r: &mut &[u8]) -> Result<Self, TokenError> {
+        let endpoint = take::<32>(r)?;
+        if iroh::PublicKey::from_bytes(&endpoint).is_err() {
+            return Err(TokenError::Endpoint);
+        }
+        let count = usize::from(take::<1>(r)?[0]);
+        if count == 0 || count > MAX_ROUTE_ADDRESSES {
+            return Err(TokenError::Addresses);
+        }
+        let mut addresses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let ip = match take::<1>(r)?[0] {
+                4 => IpAddr::V4(Ipv4Addr::from(take::<4>(r)?)),
+                6 => IpAddr::V6(Ipv6Addr::from(take::<16>(r)?)),
+                _ => return Err(TokenError::AddressFamily),
+            };
+            let port = u16::from_be_bytes(take::<2>(r)?);
+            addresses.push(SocketAddr::new(ip, port));
+        }
+        Ok(Self {
+            endpoint,
+            addresses,
+        })
+    }
+
+    /// The text form, `hyakume-route:` followed by base32. A route is not
+    /// secret: it says where a device listens, not who may connect.
+    pub fn to_text(&self) -> Result<String, TokenError> {
+        if self.addresses.is_empty() || self.addresses.len() > MAX_ROUTE_ADDRESSES {
+            return Err(TokenError::Addresses);
+        }
+        let mut bytes = Vec::with_capacity(MAX_ROUTE_BYTES);
+        self.encode(&mut bytes);
+        Ok(format!(
+            "{ROUTE_PREFIX}{}",
+            data_encoding::BASE32_NOPAD
+                .encode(&bytes)
+                .to_ascii_lowercase()
+        ))
+    }
+
+    /// Parses the text form strictly, checking its length first.
+    pub fn parse(text: &str) -> Result<Self, TokenError> {
+        if text.len() > MAX_ROUTE_CHARS {
+            return Err(TokenError::TooLong);
+        }
+        let body = text.strip_prefix(ROUTE_PREFIX).ok_or(TokenError::Prefix)?;
+        let bytes = data_encoding::BASE32_NOPAD_NOCASE
+            .decode(body.as_bytes())
+            .map_err(|_| TokenError::Encoding)?;
+        let mut r = bytes.as_slice();
+        let route = Self::decode(&mut r)?;
+        if !r.is_empty() {
+            return Err(TokenError::Trailing);
+        }
+        Ok(route)
+    }
+}
+
 /// Everything a joining device needs: which invitation, its secret, and
 /// where to connect. Shown only through the explicit pairing action.
 #[derive(Debug)]
@@ -456,22 +521,7 @@ impl InvitationToken {
         });
         out.extend_from_slice(self.id.as_bytes());
         out.extend_from_slice(self.secret.expose());
-        out.extend_from_slice(&self.route.endpoint);
-        // Bounded by MAX_ROUTE_ADDRESSES above.
-        out.push(self.route.addresses.len() as u8);
-        for addr in &self.route.addresses {
-            match addr.ip() {
-                IpAddr::V4(ip) => {
-                    out.push(4);
-                    out.extend_from_slice(&ip.octets());
-                }
-                IpAddr::V6(ip) => {
-                    out.push(6);
-                    out.extend_from_slice(&ip.octets());
-                }
-            }
-            out.extend_from_slice(&addr.port().to_be_bytes());
-        }
+        self.route.encode(&mut out);
         Ok(out)
     }
 
@@ -516,24 +566,7 @@ impl InvitationToken {
         };
         let id = InvitationId::from_bytes(take::<16>(&mut r)?);
         let secret = InvitationSecret::from_bytes(take::<32>(&mut r)?);
-        let endpoint = take::<32>(&mut r)?;
-        if iroh::PublicKey::from_bytes(&endpoint).is_err() {
-            return Err(TokenError::Endpoint);
-        }
-        let count = usize::from(take::<1>(&mut r)?[0]);
-        if count == 0 || count > MAX_ROUTE_ADDRESSES {
-            return Err(TokenError::Addresses);
-        }
-        let mut addresses = Vec::with_capacity(count);
-        for _ in 0..count {
-            let ip = match take::<1>(&mut r)?[0] {
-                4 => IpAddr::V4(Ipv4Addr::from(take::<4>(&mut r)?)),
-                6 => IpAddr::V6(Ipv6Addr::from(take::<16>(&mut r)?)),
-                _ => return Err(TokenError::AddressFamily),
-            };
-            let port = u16::from_be_bytes(take::<2>(&mut r)?);
-            addresses.push(SocketAddr::new(ip, port));
-        }
+        let route = Route::decode(&mut r)?;
         if !r.is_empty() {
             return Err(TokenError::Trailing);
         }
@@ -541,10 +574,7 @@ impl InvitationToken {
             kind,
             id,
             secret,
-            route: Route {
-                endpoint,
-                addresses,
-            },
+            route,
         })
     }
 }
@@ -583,6 +613,27 @@ mod tests {
         inv.open_claim(at(1), claim(n)).unwrap();
         inv.claim_verified(at(1), claim(n), Verifier::from_bytes([n; 4]))
             .unwrap();
+    }
+
+    #[test]
+    fn a_route_round_trips_and_refuses_trailing_or_missing_parts() {
+        let key = iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let route = Route {
+            endpoint: *key.as_bytes(),
+            addresses: vec![
+                "127.0.0.1:7000".parse().unwrap(),
+                "[::1]:7001".parse().unwrap(),
+            ],
+        };
+        let text = route.to_text().unwrap();
+        assert!(text.starts_with(ROUTE_PREFIX));
+        assert_eq!(Route::parse(&text).unwrap(), route);
+        assert_eq!(
+            Route::parse(&format!("{text}aaaaaaaa")),
+            Err(TokenError::Trailing)
+        );
+        assert_eq!(Route::parse("hyakume-route:"), Err(TokenError::Truncated));
+        assert_eq!(Route::parse("hyakume://invite#aa"), Err(TokenError::Prefix));
     }
 
     #[test]

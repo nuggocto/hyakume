@@ -1,16 +1,17 @@
-//! Journeys between two endpoints over real loopback QUIC connections.
-//!
-//! Each test owns two nodes with synthetic identities and in-memory state.
-//! People's answers come from the test through the prompt channels. Tests
-//! wait for observable state with deadlines. Only tests about the handshake
-//! deadline sleep, because letting it pass is what they test.
+//! Journeys between two endpoints over real loopback QUIC connections, each
+//! test with its own nodes, memory state, and temporary folder. Tests wait
+//! for observable state; only the handshake-deadline tests sleep, because
+//! letting that time pass is what they test.
 
 // Test helpers may stop the test on unexpected failures.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyakume::files::destination::Destination;
 use hyakume::identity::{DeviceId, DeviceKey};
 use hyakume::ids::TransferId;
 use hyakume::invitation::{InvitationToken, TOKEN_PREFIX};
@@ -23,7 +24,7 @@ use hyakume::transfer::{
     BatchOutcome, CancelCause, FailCause, ItemState, OfferState, RejectCause, Unsuccessful,
 };
 use hyakume::trust::TrustError;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, sleep_until, timeout};
 
@@ -33,6 +34,34 @@ const MIB: usize = 1024 * 1024;
 struct Peer {
     node: Node,
     prompts: mpsc::Receiver<Prompt>,
+    /// Where this peer receives.
+    inbox: Inbox,
+}
+
+/// A temporary receive folder, removed when the test ends.
+struct Inbox(PathBuf);
+
+impl Drop for Inbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The files published in `peer`'s receive folder, by name. Partial files
+/// are private and never listed.
+fn received(peer: &Peer) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&peer.inbox.0)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .map(|e| e.file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with(".hyakume-"))
+        .map(|name| {
+            let bytes = std::fs::read(peer.inbox.0.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 async fn peer(name: &str) -> Peer {
@@ -52,7 +81,19 @@ async fn peer_config(config: NodeConfig) -> Peer {
     let (node, prompts) = Node::bind(config, DeviceKey::generate(&mut OsRng))
         .await
         .unwrap();
-    Peer { node, prompts }
+    let inbox = std::env::temp_dir().join(format!(
+        "hyakume-loopback-{}-{:x}",
+        std::process::id(),
+        OsRng.next_u64()
+    ));
+    std::fs::create_dir(&inbox).unwrap();
+    std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700)).unwrap();
+    node.set_destination(Some(Arc::new(Destination::qualify(&inbox).unwrap())));
+    Peer {
+        node,
+        prompts,
+        inbox: Inbox(inbox),
+    }
 }
 
 /// Answers the next verifier prompt and returns the words shown.
@@ -85,7 +126,7 @@ async fn answer_offer(prompts: &mut mpsc::Receiver<Prompt>, accept: bool) -> Str
 /// Pairs `a` (inviting) and `b` (joining), both answering yes. Returns the
 /// verifier each side showed.
 async fn pair(a: &mut Peer, b: &mut Peer) -> (Verifier, Verifier) {
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let join = b.node.join(&token, "a");
     let (joined, (_, va), (_, vb)) = timeout(DEADLINE, async {
         tokio::join!(
@@ -113,7 +154,7 @@ async fn send_and_answer(
     let send = from.node.send(
         to.node.device(),
         to.node.addr(),
-        payload,
+        payload.prepare(),
         SendOptions::default(),
     );
     let (report, screen) = timeout(DEADLINE, async {
@@ -154,7 +195,7 @@ async fn people_who_answer_after_the_handshake_deadline_still_pair_and_receive()
         peer_with("alpha", quick).await,
         peer_with("beta", quick).await,
     );
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let join = b.node.join(&token, "a");
     let answer_late = async {
         let mut answers = Vec::new();
@@ -177,7 +218,7 @@ async fn people_who_answer_after_the_handshake_deadline_still_pair_and_receive()
     let send = b.node.send(
         a.node.device(),
         a.node.addr(),
-        Payload::Text("slow yes".into()),
+        Payload::Text("slow yes".into()).prepare(),
         SendOptions::default(),
     );
     let answer_late = async {
@@ -195,7 +236,7 @@ async fn people_who_answer_after_the_handshake_deadline_still_pair_and_receive()
     let report = report.unwrap();
     assert_eq!(report.outcome, BatchOutcome::Completed);
     settled(&a.node, &report).await;
-    assert_eq!(a.node.received()[0].bytes, b"slow yes");
+    assert_eq!(received(&a)[0].1, b"slow yes");
 }
 
 #[tokio::test]
@@ -207,10 +248,11 @@ async fn text_arrives_unchanged_over_a_reconnection_with_saved_identities() {
     assert_eq!(report.outcome, BatchOutcome::Completed);
     assert!(screen.contains("remember the milk"));
     settled(&b.node, &report).await;
-    let received = b.node.received();
+    let received = received(&b);
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].bytes, text.as_bytes());
-    assert_eq!(received[0].from, a.node.device());
+    // Text arrives as a file with a name this device gives it.
+    assert!(received[0].0.starts_with("text-"), "{received:?}");
+    assert_eq!(received[0].1, text.as_bytes());
 }
 
 #[tokio::test]
@@ -229,11 +271,12 @@ async fn a_generated_file_batch_arrives_with_exact_length_bytes_and_digest() {
     assert_eq!(report.outcome, BatchOutcome::Completed);
     assert!(screen.contains("\"data.bin\""));
     settled(&a.node, &report).await;
-    let received = a.node.received();
+    let received = received(&a);
     assert_eq!(received.len(), 2);
-    assert_eq!(received[0].bytes.len(), big.len());
-    assert_eq!(blake3::hash(&received[0].bytes), blake3::hash(&big));
-    assert!(received[1].bytes.is_empty());
+    assert_eq!(received[0].0, "data.bin");
+    assert_eq!(received[0].1.len(), big.len());
+    assert_eq!(blake3::hash(&received[0].1), blake3::hash(&big));
+    assert_eq!(received[1], ("empty".to_string(), Vec::new()));
 }
 
 #[tokio::test]
@@ -255,8 +298,39 @@ async fn a_rejected_offer_creates_no_received_payload() {
         })
     );
     settled(&b.node, &report).await;
-    assert!(b.node.received().is_empty());
-    assert_eq!(b.node.held_bytes(), 0);
+    assert!(received(&b).is_empty());
+}
+
+#[tokio::test]
+async fn a_question_dropped_without_an_answer_is_refused_as_busy_not_declined() {
+    let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
+    pair(&mut a, &mut b).await;
+    let send = a.node.send(
+        b.node.device(),
+        b.node.addr(),
+        Payload::Text("hi".into()).prepare(),
+        SendOptions::default(),
+    );
+    // Whoever held the question went away without answering it.
+    let drop_question = async {
+        match timeout(DEADLINE, b.prompts.recv()).await.unwrap().unwrap() {
+            Prompt::Offer { answer, .. } => drop(answer),
+            Prompt::Verify { .. } => panic!("expected an offer prompt"),
+        }
+    };
+    let (report, ()) = timeout(DEADLINE, async { tokio::join!(send, drop_question) })
+        .await
+        .unwrap();
+    let report = report.unwrap();
+    settled(&b.node, &report).await;
+    for node in [&a.node, &b.node] {
+        node.wait_until(DEADLINE, |s| {
+            s.transfer(&report.transfer)
+                .is_some_and(|t| t.offer_state() == OfferState::Rejected(RejectCause::Busy))
+        })
+        .await
+        .unwrap();
+    }
 }
 
 /// The one transfer on `node` that has not finished.
@@ -286,7 +360,7 @@ async fn cancelling_mid_transfer_ends_both_sides_and_releases_capacity() {
     let payload = Payload::Files(vec![("big".into(), vec![9u8; 64 * 1024])]);
     let send = a
         .node
-        .send(b.node.device(), b.node.addr(), payload, options);
+        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
         // One chunk was allowed through; the receiver is now mid-item.
@@ -303,8 +377,7 @@ async fn cancelling_mid_transfer_ends_both_sides_and_releases_capacity() {
         b.node.report(report.transfer).unwrap().items,
         [ItemState::Cancelled(CancelCause::Sender)]
     );
-    assert!(b.node.received().is_empty());
-    assert_eq!(b.node.held_bytes(), 0);
+    assert!(received(&b).is_empty());
     assert_eq!(a.node.usage(), Usage::default());
     b.node.wait_idle(DEADLINE).await.unwrap();
 }
@@ -320,7 +393,7 @@ async fn the_receiver_can_cancel_mid_transfer_too() {
     let payload = Payload::Files(vec![("big".into(), vec![9u8; 64 * 1024])]);
     let send = a
         .node
-        .send(b.node.device(), b.node.addr(), payload, options);
+        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
         b.node.wait_until(DEADLINE, mid_item).await.unwrap();
@@ -336,9 +409,8 @@ async fn the_receiver_can_cancel_mid_transfer_too() {
         b.node.report(report.transfer).unwrap().items,
         [ItemState::Cancelled(CancelCause::Receiver)]
     );
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
     b.node.wait_idle(DEADLINE).await.unwrap();
-    assert_eq!(b.node.held_bytes(), 0);
 }
 
 #[tokio::test]
@@ -353,13 +425,10 @@ async fn revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_se
     let payload = Payload::Files(vec![("big".into(), vec![1u8; 32 * 1024])]);
     let send = a
         .node
-        .send(b.node.device(), b.node.addr(), payload, options);
+        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
-        b.node
-            .wait_until(DEADLINE, |s| s.held_bytes() > 0)
-            .await
-            .unwrap();
+        b.node.wait_until(DEADLINE, mid_item).await.unwrap();
         b.node.revoke(a.node.device()).unwrap();
     };
     let (report, ()) = timeout(DEADLINE, async { tokio::join!(send, drive) })
@@ -372,7 +441,7 @@ async fn revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_se
         b.node.report(report.transfer).unwrap().items,
         [ItemState::Cancelled(CancelCause::Revoked)]
     );
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
 
     // The revoked device still trusts b, but b refuses the session.
     let retry = a
@@ -380,7 +449,7 @@ async fn revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_se
         .send(
             b.node.device(),
             b.node.addr(),
-            Payload::Text("again".into()),
+            Payload::Text("again".into()).prepare(),
             SendOptions::default(),
         )
         .await;
@@ -391,12 +460,12 @@ async fn revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_se
         .send(
             a.node.device(),
             a.node.addr(),
-            Payload::Text("x".into()),
+            Payload::Text("x".into()).prepare(),
             SendOptions::default(),
         )
         .await;
     assert_eq!(back.err(), Some(NodeError::Trust(TrustError::Revoked)));
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
 }
 
 #[tokio::test]
@@ -411,11 +480,15 @@ async fn fresh_pairing_after_revocation_allows_new_work_without_reviving_old_wor
     let payload = Payload::Files(vec![("old".into(), vec![2u8; 8 * 1024])]);
     let send = a
         .node
-        .send(b.node.device(), b.node.addr(), payload, options);
+        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
+        // Accepted, and no chunk can pass the closed gate.
         b.node
-            .wait_until(DEADLINE, |s| s.held_bytes() > 0)
+            .wait_until(DEADLINE, |s| {
+                s.transfers()
+                    .any(|t| t.offer_state() == OfferState::Accepted)
+            })
             .await
             .unwrap();
         b.node.revoke(a.node.device()).unwrap();
@@ -427,7 +500,7 @@ async fn fresh_pairing_after_revocation_allows_new_work_without_reviving_old_wor
     settled(&b.node, &old).await;
 
     // Pair again: b invites this time, and both sides trust anew.
-    let token = b.node.invite("a2").unwrap();
+    let token = b.node.invite("a2").unwrap().1;
     let join = a.node.join(&token, "b2");
     let (joined, _, _) = timeout(DEADLINE, async {
         tokio::join!(
@@ -452,15 +525,15 @@ async fn fresh_pairing_after_revocation_allows_new_work_without_reviving_old_wor
         b.node.report(old.transfer).unwrap().items,
         [ItemState::Cancelled(CancelCause::Revoked)]
     );
-    let received = b.node.received();
+    let received = received(&b);
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].bytes, b"new");
+    assert_eq!(received[0].1, b"new");
 }
 
 #[tokio::test]
 async fn a_wrong_secret_fails_pairing_and_trusts_no_one() {
     let (mut a, b) = (peer("alpha").await, peer("beta").await);
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let mut parsed = InvitationToken::parse(&token).unwrap();
     let mut wrong = parsed.to_bytes().unwrap().to_vec();
     // Flip one bit of the secret (bytes 18..50 of the binary form).
@@ -484,7 +557,7 @@ async fn a_wrong_secret_fails_pairing_and_trusts_no_one() {
 #[tokio::test]
 async fn a_declined_verifier_saves_no_trust_and_closes_the_invitation() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let join = b.node.join(&token, "a");
     let (joined, _, _) = timeout(DEADLINE, async {
         tokio::join!(
@@ -517,7 +590,7 @@ async fn a_declined_verifier_saves_no_trust_and_closes_the_invitation() {
 #[tokio::test]
 async fn a_used_invitation_cannot_pair_another_device() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let join = b.node.join(&token, "a");
     let (joined, _, _) = timeout(DEADLINE, async {
         tokio::join!(
@@ -548,7 +621,7 @@ async fn an_unanswered_verifier_times_out_without_trust() {
         peer_with("alpha", short).await,
         peer_with("beta", short).await,
     );
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let join = b.node.join(&token, "a");
     // a answers; b's person never does.
     let (joined, _) = timeout(DEADLINE, async {
@@ -574,7 +647,7 @@ async fn an_unpaired_device_cannot_start_a_session() {
         .send(
             b.node.device(),
             b.node.addr(),
-            Payload::Text("hi".into()),
+            Payload::Text("hi".into()).prepare(),
             SendOptions::default(),
         )
         .await;
@@ -596,14 +669,14 @@ async fn shutdown_stops_the_endpoint_within_its_deadline() {
         b.node.send(
             device,
             addr,
-            Payload::Text("x".into()),
+            Payload::Text("x".into()).prepare(),
             SendOptions::default(),
         ),
     )
     .await
     .unwrap();
     assert!(after.is_err());
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
 }
 
 #[tokio::test]
@@ -621,7 +694,7 @@ async fn connections_past_the_limit_are_refused_before_any_handshake() {
     let holding = target.node.send(
         other.node.device(),
         other.node.addr(),
-        Payload::Text("hold".into()),
+        Payload::Text("hold".into()).prepare(),
         SendOptions::default(),
     );
     tokio::pin!(holding);
@@ -719,8 +792,8 @@ async fn a_peer_that_proves_nothing_gets_one_handshake_deadline_however_slowly_i
 async fn pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither() {
     let (mut a, mut b, mut c) = (peer("alpha").await, peer("beta").await, peer("gamma").await);
     // Two invitations name their device "phone"; only one device can have it.
-    let for_b = a.node.invite("phone").unwrap();
-    let for_c = a.node.invite("phone").unwrap();
+    let for_b = a.node.invite("phone").unwrap().1;
+    let for_c = a.node.invite("phone").unwrap().1;
     let (b_device, c_device) = (b.node.device(), c.node.device());
     let b_join = b.node.join(&for_b, "a");
     let drive = async {
@@ -762,8 +835,8 @@ async fn pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither() {
 #[tokio::test]
 async fn an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken() {
     let (mut a, mut b, mut c) = (peer("alpha").await, peer("beta").await, peer("gamma").await);
-    let for_b = a.node.invite("phone").unwrap();
-    let for_c = a.node.invite("phone").unwrap();
+    let for_b = a.node.invite("phone").unwrap().1;
+    let for_c = a.node.invite("phone").unwrap().1;
     let (b_device, c_device) = (b.node.device(), c.node.device());
     let b_join = b.node.join(&for_b, "a");
     let drive = async {
@@ -804,7 +877,7 @@ async fn an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken() {
 #[tokio::test]
 async fn abandoning_a_pairing_after_the_verifier_is_shown_closes_the_invitation() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
-    let token = a.node.invite("b").unwrap();
+    let token = a.node.invite("b").unwrap().1;
     let join = b.node.join(&token, "a");
     let shown = async {
         let on_a = timeout(DEADLINE, a.prompts.recv()).await.unwrap().unwrap();
@@ -839,7 +912,7 @@ async fn a_sender_that_disappears_mid_transfer_leaves_nothing_unfinished() {
     let payload = Payload::Files(vec![("big".into(), vec![3u8; 64 * 1024])]);
     let send = a
         .node
-        .send(b.node.device(), b.node.addr(), payload, options);
+        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
     let mid_transfer = async {
         answer_offer(&mut b.prompts, true).await;
         b.node.wait_until(DEADLINE, mid_item).await.unwrap();
@@ -860,9 +933,8 @@ async fn a_sender_that_disappears_mid_transfer_leaves_nothing_unfinished() {
         })
         .await
         .unwrap();
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
     b.node.wait_idle(DEADLINE).await.unwrap();
-    assert_eq!(b.node.held_bytes(), 0);
     assert_eq!(a.node.usage(), Usage::default());
 }
 
@@ -891,7 +963,7 @@ async fn a_receiver_that_stops_reading_cannot_hold_a_send_past_its_write_deadlin
     let send = a.node.send(
         b.node.device(),
         b.node.addr(),
-        payload,
+        payload.prepare(),
         SendOptions::default(),
     );
     let (report, _) = timeout(DEADLINE, async {
@@ -905,8 +977,7 @@ async fn a_receiver_that_stops_reading_cannot_hold_a_send_past_its_write_deadlin
     );
     assert_eq!(a.node.usage(), Usage::default());
     b.node.wait_idle(DEADLINE).await.unwrap();
-    assert!(b.node.received().is_empty());
-    assert_eq!(b.node.held_bytes(), 0);
+    assert!(received(&b).is_empty());
 }
 
 #[tokio::test]
@@ -920,7 +991,7 @@ async fn an_unanswered_offer_times_out_even_while_the_receiver_is_busy_elsewhere
     let send = a.node.send(
         b.node.device(),
         b.node.addr(),
-        Payload::Text("hi".into()),
+        Payload::Text("hi".into()).prepare(),
         SendOptions::default(),
     );
     tokio::pin!(send);
@@ -938,7 +1009,7 @@ async fn an_unanswered_offer_times_out_even_while_the_receiver_is_busy_elsewhere
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         loop {
             tick.tick().await;
-            b.node.take_received();
+            b.node.cancel(TransferId::from_bytes([0; 16]));
         }
     };
     let report = timeout(DEADLINE, async {
@@ -952,7 +1023,7 @@ async fn an_unanswered_offer_times_out_even_while_the_receiver_is_busy_elsewhere
     .unwrap();
     b.node.wait_idle(DEADLINE).await.unwrap();
     assert_eq!(b.node.usage(), Usage::default());
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
     assert_eq!(report.items, [ItemState::Rejected]);
 }
 
@@ -977,7 +1048,7 @@ async fn a_sender_whose_reader_is_stuck_still_ends_when_the_receiver_closes() {
     let send = a.node.send(
         b.node.device(),
         b.node.addr(),
-        Payload::Text("hi".into()),
+        Payload::Text("hi".into()).prepare(),
         SendOptions::default(),
     );
     tokio::pin!(send);
@@ -995,11 +1066,11 @@ async fn a_sender_whose_reader_is_stuck_still_ends_when_the_receiver_closes() {
         .await
         .expect("the send waited on its reader after the receiver closed")
         .unwrap();
-    // a never read b's answer, so the offer ends withdrawn.
+    // a never read b's answer, so the offer ends interrupted.
     a.node
         .wait_until(DEADLINE, |s| {
             s.transfer(&report.transfer)
-                .is_some_and(|t| t.offer_state() == OfferState::Rejected(RejectCause::Withdrawn))
+                .is_some_and(|t| t.offer_state() == OfferState::Rejected(RejectCause::Interrupted))
         })
         .await
         .unwrap();
@@ -1021,7 +1092,7 @@ async fn cancelling_a_send_that_waits_for_buffer_room_ends_it_at_once() {
     let first = a.node.send(
         b.node.device(),
         b.node.addr(),
-        Payload::Text("x".into()),
+        Payload::Text("x".into()).prepare(),
         SendOptions {
             gate: Some(gate.clone()),
             ..SendOptions::default()
@@ -1054,7 +1125,7 @@ async fn cancelling_a_send_that_waits_for_buffer_room_ends_it_at_once() {
     let second = a.node.send(
         b.node.device(),
         b.node.addr(),
-        Payload::Files(batch),
+        Payload::Files(batch).prepare(),
         SendOptions::default(),
     );
     let drive = async {
@@ -1085,44 +1156,18 @@ async fn cancelling_a_send_that_waits_for_buffer_room_ends_it_at_once() {
 }
 
 #[tokio::test]
-async fn a_receiver_with_a_lowered_budget_refuses_what_it_cannot_stage_and_takes_what_it_can() {
-    // No room to stage a 60 KiB file next to one chunk sent and one frame
-    // read: refused before the person is asked.
-    let tiny = Limits {
+async fn a_receiver_on_the_smallest_budget_takes_a_file_many_times_its_size() {
+    // Received bytes go to a partial file as they arrive, so the buffer
+    // budget bounds only chunks in flight, never the file.
+    let smallest = Limits {
         buffer_bytes: MIN_BUFFER_BYTES,
         ..Limits::COMPILED
     };
-    let (mut a, mut b) = (peer("alpha").await, peer_with("beta", tiny).await);
+    let (mut a, mut b) = (peer("alpha").await, peer_with("beta", smallest).await);
     pair(&mut a, &mut b).await;
-    let file = vec![4u8; 60 * 1024];
-    let report = timeout(
-        DEADLINE,
-        a.node.send(
-            b.node.device(),
-            b.node.addr(),
-            Payload::Files(vec![("f".into(), file.clone())]),
-            SendOptions::default(),
-        ),
-    )
-    .await
-    .expect("the offer reached the person instead of being refused")
-    .unwrap();
-    a.node
-        .wait_until(DEADLINE, |s| {
-            s.transfer(&report.transfer)
-                .is_some_and(|t| t.offer_state() == OfferState::Rejected(RejectCause::TooLarge))
-        })
-        .await
-        .unwrap();
-    assert!(b.prompts.try_recv().is_err());
-
-    // Room for the file on top of that: it arrives.
-    let roomy = Limits {
-        buffer_bytes: MIN_BUFFER_BYTES + 64 * 1024,
-        ..Limits::COMPILED
-    };
-    let (mut a, mut b) = (peer("alpha").await, peer_with("beta", roomy).await);
-    pair(&mut a, &mut b).await;
+    let file: Vec<u8> = (0..4 * MIN_BUFFER_BYTES as usize)
+        .map(|i| (i % 253) as u8)
+        .collect();
     let (report, _) = send_and_answer(
         &mut a,
         &mut b,
@@ -1132,7 +1177,56 @@ async fn a_receiver_with_a_lowered_budget_refuses_what_it_cannot_stage_and_takes
     .await;
     assert_eq!(report.outcome, BatchOutcome::Completed);
     settled(&b.node, &report).await;
-    assert_eq!(b.node.received()[0].bytes, file);
+    assert_eq!(received(&b), [("f".to_string(), file)]);
+    b.node.wait_idle(DEADLINE).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_partial_file_that_cannot_be_written_fails_the_item_and_publishes_nothing() {
+    let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
+    pair(&mut a, &mut b).await;
+    let mut prepared = Payload::Files(vec![
+        ("first".into(), vec![1u8; 10_000]),
+        ("second".into(), vec![2u8; 10_000]),
+    ])
+    .prepare();
+    prepared.transfer = TransferId::from_bytes([0x5a; 16]);
+    // Something already sits where the first partial file must be created,
+    // the way a full or failing disk refuses the write.
+    let blocked = b
+        .inbox
+        .0
+        .join(format!(".hyakume-{}-0.part", "5a".repeat(16)));
+    std::fs::create_dir(&blocked).unwrap();
+    let send = a.node.send(
+        b.node.device(),
+        b.node.addr(),
+        prepared,
+        SendOptions::default(),
+    );
+    let (report, _) = timeout(DEADLINE, async {
+        tokio::join!(send, answer_offer(&mut b.prompts, true))
+    })
+    .await
+    .unwrap();
+    let report = report.unwrap();
+    assert_eq!(
+        report.items,
+        [
+            ItemState::Cancelled(CancelCause::Receiver),
+            ItemState::Cancelled(CancelCause::Receiver)
+        ]
+    );
+    settled(&b.node, &report).await;
+    assert_eq!(
+        b.node.report(report.transfer).unwrap().items,
+        [
+            ItemState::Failed(FailCause::Storage),
+            ItemState::Cancelled(CancelCause::Receiver)
+        ]
+    );
+    assert!(received(&b).is_empty());
+    assert!(blocked.is_dir(), "the receiver touched what was in the way");
 }
 
 #[tokio::test]
@@ -1150,7 +1244,7 @@ async fn a_full_question_queue_refuses_new_offers_without_blocking_revocation() 
                 .send(
                     to,
                     at,
-                    Payload::Text(format!("note {n}")),
+                    Payload::Text(format!("note {n}")).prepare(),
                     SendOptions::default(),
                 )
                 .await
@@ -1166,7 +1260,7 @@ async fn a_full_question_queue_refuses_new_offers_without_blocking_revocation() 
         sender.send(
             to,
             at,
-            Payload::Text("one more".into()),
+            Payload::Text("one more".into()).prepare(),
             SendOptions::default(),
         ),
     )
@@ -1196,7 +1290,7 @@ async fn a_full_question_queue_refuses_new_offers_without_blocking_revocation() 
     while let Some(done) = timeout(DEADLINE, waiting.join_next()).await.unwrap() {
         assert_eq!(done.unwrap().unwrap().items, [ItemState::Rejected]);
     }
-    assert!(b.node.received().is_empty());
+    assert!(received(&b).is_empty());
     timeout(DEADLINE, b.node.shutdown()).await.unwrap().unwrap();
 }
 
@@ -1220,7 +1314,8 @@ async fn a_budget_set_below_the_minimum_still_sends_more_than_its_size() {
     .await;
     assert_eq!(report.outcome, BatchOutcome::Completed);
     settled(&b.node, &report).await;
-    assert_eq!(b.node.received()[1].bytes, file);
+    let received = received(&b);
+    assert!(received.contains(&("f".to_string(), file)));
 }
 
 /// `a` and `b` each send the other a file of `size` bytes at the same time.
@@ -1235,13 +1330,13 @@ async fn send_both_ways(
     let ab = a.node.send(
         b.node.device(),
         b.node.addr(),
-        file(1),
+        file(1).prepare(),
         SendOptions::default(),
     );
     let ba = b.node.send(
         a.node.device(),
         a.node.addr(),
-        file(2),
+        file(2).prepare(),
         SendOptions::default(),
     );
     let answers = async {
@@ -1259,39 +1354,24 @@ async fn send_both_ways(
 }
 
 #[tokio::test]
-async fn sending_both_ways_at_once_on_lowered_budgets_completes_or_is_refused() {
-    // Each node has room to stage 1 MiB next to one chunk sent and one
-    // frame read.
-    let lowered = Limits {
-        buffer_bytes: MIN_BUFFER_BYTES + MIB as u64,
+async fn sending_both_ways_at_once_on_the_smallest_budgets_completes() {
+    // Each node has room for one chunk sent and one frame read, and each
+    // file is several times that.
+    let smallest = Limits {
+        buffer_bytes: MIN_BUFFER_BYTES,
         ..Limits::COMPILED
     };
     let (mut a, mut b) = (
-        peer_with("alpha", lowered).await,
-        peer_with("beta", lowered).await,
+        peer_with("alpha", smallest).await,
+        peer_with("beta", smallest).await,
     );
     pair(&mut a, &mut b).await;
-    // Both fit: both arrive.
-    let (ab, ba) = send_both_ways(&mut a, &mut b, MIB, true).await;
+    let size = 3 * MIN_BUFFER_BYTES as usize;
+    let (ab, ba) = send_both_ways(&mut a, &mut b, size, true).await;
     assert_eq!(ab.outcome, BatchOutcome::Completed);
     assert_eq!(ba.outcome, BatchOutcome::Completed);
     settled(&b.node, &ab).await;
     settled(&a.node, &ba).await;
-    assert_eq!(b.node.received()[0].bytes, vec![1u8; MIB]);
-    assert_eq!(a.node.received()[0].bytes, vec![2u8; MIB]);
-
-    // Staging either one would leave too little to send the other: both
-    // are refused before anyone is asked.
-    let (ab, ba) = send_both_ways(&mut a, &mut b, 3 * MIB, false).await;
-    for (from, report) in [(&a.node, &ab), (&b.node, &ba)] {
-        assert_eq!(report.items, [ItemState::Rejected]);
-        from.wait_until(DEADLINE, |s| {
-            s.transfer(&report.transfer)
-                .is_some_and(|t| t.offer_state() == OfferState::Rejected(RejectCause::TooLarge))
-        })
-        .await
-        .unwrap();
-    }
-    assert!(a.prompts.try_recv().is_err());
-    assert!(b.prompts.try_recv().is_err());
+    assert_eq!(received(&b), [("f".to_string(), vec![1u8; size])]);
+    assert_eq!(received(&a), [("f".to_string(), vec![2u8; size])]);
 }

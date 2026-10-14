@@ -1,23 +1,7 @@
-//! Bounded, redacted diagnostics.
-//!
-//! Diagnostics are off unless `HYAKUME_LOG` names a level (`error`, `warn`,
-//! `info`, `debug`, or `trace`). They go to standard error without colour
-//! codes.
-//!
-//! Two rules keep secrets and peer-controlled text out of the output:
-//!
-//! - Secret or payload values are logged only through [`Redacted`], which
-//!   formats as `[redacted]`. Redaction happens before formatting, so the
-//!   value never reaches a buffer.
-//! - Every event passes through [`BoundedLines`], which writes one line per
-//!   event, escapes control characters so logged text cannot move the
-//!   cursor or forge extra lines, escapes the same hidden formatting
-//!   characters as peer-text projections, and cuts lines at
-//!   [`MAX_LINE_BYTES`].
-//!
-//! Formatting is bounded too. The subscriber stops keeping an event's text,
-//! and a span's fields, once they reach [`MAX_LINE_BYTES`], so a huge field
-//! never grows the formatting buffer.
+//! Diagnostics, off unless `HYAKUME_LOG` names a level. Secrets and payloads
+//! go through [`Redacted`] before formatting, so they never reach a buffer.
+//! [`BoundedLines`] escapes control and hidden characters and cuts lines at
+//! [`MAX_LINE_BYTES`], so logged text cannot add lines or grow unbounded.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -40,7 +24,7 @@ pub const LEVEL_VAR: &str = "HYAKUME_LOG";
 
 const SHORTENED: &[u8] = b" [shortened]";
 
-/// A value that must never appear in diagnostics.
+/// A value diagnostics show only as `[redacted]`.
 pub struct Redacted<T>(pub T);
 
 impl<T> std::fmt::Debug for Redacted<T> {
@@ -73,11 +57,12 @@ pub fn init_from_env() {
     if level == LevelFilter::OFF {
         return;
     }
-    // Ignore the error if a subscriber already exists.
+    // A second call, as in tests, keeps the subscriber already set.
     let _ = subscriber(level, BoundedLines::new(io::stderr())).try_init();
 }
 
-/// Builds the subscriber used by [`init_from_env`] around any sink.
+/// The subscriber [`init_from_env`] installs, around any sink so tests can
+/// read what it writes.
 pub fn subscriber<M>(
     level: LevelFilter,
     sink: M,
@@ -182,7 +167,6 @@ impl<W: Write> BoundedLines<W> {
         }
     }
 
-    /// Returns the wrapped writer.
     pub fn into_inner(self) -> W {
         match self.inner.into_inner() {
             Ok(w) => w,
