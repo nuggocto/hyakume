@@ -74,7 +74,9 @@ assumed.
   per process hides all three. The device key appears only inside
   authenticated, encrypted streams, and only after the PAKE succeeded.
 - **Lost or corrupt identity:** creates a new device that must pair again.
-  Persistence and loading come with the local service.
+  The local service refuses a stored key that is not the recorded device's,
+  and `hyakume reset` is the explicit way to start over
+  ([local service](local-service.md), section 6).
 - **Revocation:** see `src/trust.rs`. Each grant of trust has a fresh epoch;
   revoking or pairing again makes every older authority stale.
 
@@ -206,11 +208,12 @@ A session runs in this order:
 2. The dialer sends its session proof. The listener verifies it and checks
    trust before sending its own. An untrusted dialer gets `Error(NotTrusted)`.
 3. The dialer sends an offer. The receiver refuses it before asking the
-   person when it breaks a size limit, does not fit the staging room, the
-   buffer left after room for one chunk sent and one frame read, or the
-   1,024 held items, exceeds transfer capacity, or arrives while eight
-   questions already wait for an answer. Otherwise the person answers, and
-   the receiver replies with OfferAccept, naming the offer digest, or
+   person when it breaks a size limit, names an item that cannot be a file
+   name here, does not fit the partial-file quota or the free space of the
+   receive folder, exceeds transfer capacity, finds nobody receiving, or
+   arrives while eight questions already wait for an answer. A question
+   that nobody could take is refused as busy. Otherwise the person answers,
+   and the receiver replies with OfferAccept, naming the offer digest, or
    OfferReject.
 4. For each item in order, chunks with consecutive offsets, then ItemEnd. The
    receiver checks the exact length and digest, publishes only through the
@@ -299,11 +302,17 @@ set.
   23 bits, such as 7 random decimal digits. Keep the same attempt
   accounting and the 120 s code lifetime.
 - **Persistence.** Save `TrustStore`'s next epoch in the same write as the
-  trust records, and never load a lower one.
-- **Persistence of invitations.** A claim saved while its exchange ran has
-  no owner after a restart. On load, settle each one as `PairingOwner`
-  would: in progress uses an attempt, verified closes the invitation.
-  Reservations belong to running exchanges and are never saved.
+  trust records, and never load a lower one. Done: `Store::save_trust`
+  writes both in one transaction, the counter lives in its own table that
+  `reset` keeps, and loading refuses a counter that is not past every saved
+  epoch ([local service](local-service.md), section 3).
+- **Persistence of invitations.** Not needed yet: invitations stay in
+  memory, because a token names a transport key that is new every run, so
+  no saved invitation could be reached after a restart. When discovery lets
+  a token outlive its endpoint, a claim saved while its exchange ran has no
+  owner after a restart; on load, settle each one as `PairingOwner` would:
+  in progress uses an attempt, verified closes the invitation. Reservations
+  belong to running exchanges and are never saved.
 - **Resume.** The offered-ID window refuses repeated offers. Resuming a
   transfer must use its own authenticated path, never a second offer under
   the same transfer ID.

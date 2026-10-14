@@ -1,7 +1,7 @@
 ---
 tags: [rust, project, cli, gui, gpui, astro, pnpm, cloudflare-pages, p2p, file-transfer, android, ios, security]
 created: 2026-07-10
-updated: 2026-10-11
+updated: 2026-10-13
 status: planning
 license: Apache-2.0
 ---
@@ -402,10 +402,13 @@ Revoked
 Trusted
 ```
 
-A permanent invitation is consumed when verified trust is saved. A temporary
-invitation is consumed atomically when the sender approves one claimant; all
-other claimants are rejected. Expired, consumed, rejected, or raced invitations
-fail closed.
+A permanent invitation is consumed when the inviting device's person accepts
+the verifier, before that device sends its decision. Trust is saved only after
+both authenticated decisions are yes. A verified exchange that ends without
+acceptance closes the invitation, and an interrupted unverified claim uses an
+attempt. A temporary invitation is consumed atomically when the sender
+approves one claimant; all other claimants are rejected. Expired, consumed,
+rejected, or raced invitations fail closed, and a restart never reopens one.
 
 Revocation and final file publication share one per-peer authorization ordering
 owned by the service or mobile host. If revocation wins, an unpublished item
@@ -690,8 +693,10 @@ completion.
 ## Required Invariants
 
 - An invitation is consumed exactly once. A permanent invitation is consumed
-  when verified trust is saved; a temporary invitation is consumed when the
-  sender approves one claimant, and every other claimant is rejected.
+  when the inviting device's person accepts the verifier, and trust needs both
+  decisions; a temporary invitation is consumed when the sender approves one
+  claimant, and every other claimant is rejected. Each invitation allows one
+  comparison of verifier words.
 - Trust exists only after both devices confirm the same visual verifier. A
   declared device name, local alias, or discovery record never creates trust.
 - Reconnection authenticates with saved keys. No path re-derives trust from a
@@ -952,7 +957,7 @@ or interrupted work as complete.
 | Mobile core bridge | narrow Rust FFI contract selected and pinned in Phase 8; validated commands and bounded immutable events cross the boundary |
 | Website | Static Astro in `hyakume-front`, pnpm, Cloudflare Pages at the acquired `hyakume.org` domain; introduced in Phase 12 |
 | Hosted APIs | Axum + Tower where the Iroh integration needs them |
-| Persistence | SQLite through rusqlite, or simpler files if Phase 2 proves better |
+| Persistence | SQLite through rusqlite with bundled SQLite, chosen in Phase 2 ([decision record](docs/local-service.md)) |
 | Key storage | Linux Secret Service or passphrase-encrypted key file in Phase 2; Windows Credential Manager / DPAPI in Phase 7; Android Keystore in Phase 8 |
 | Config and DTOs | serde, JSON, TOML |
 | Errors | thiserror in libraries, anyhow at executable boundaries |
@@ -1016,7 +1021,7 @@ dependencies justify it.
 #### V1
 
 - [x] **Phase 1** - Deterministic core and loopback protocol
-- [ ] **Phase 2** - CLI, local service, IPC, and safe file pipeline
+- [x] **Phase 2** - CLI, local service, IPC, and safe file pipeline
 - [ ] **Phase 3** - LAN discovery and permanent pairing
 - [ ] **Phase 4** - Reliable LAN transfer and clipboard
 - [ ] **Phase 5** - Linux desktop GUI alpha
@@ -1090,55 +1095,58 @@ dependencies justify it.
 
 #### Build now
 
-- [ ] Add one per-user desktop service and authenticated local IPC.
-- [ ] Add CLI commands for service status, receive, send, cancel, and inspect.
-- [ ] Implement safe names, private partial files, disk reservation, no-clobber
+- [x] Add one per-user desktop service and authenticated local IPC.
+- [x] Add CLI commands for service status, receive, send, cancel, and inspect.
+- [x] Implement safe names, private partial files, disk reservation, no-clobber
   publication, integrity verification, cleanup, and bounded streaming.
-- [ ] Qualify atomic publication and crash reconciliation for supported receive
+- [x] Qualify atomic publication and crash reconciliation for supported receive
   locations. Refuse unsupported destinations before acceptance.
-- [ ] Spool stdin and other accepted unknown-length sources under byte, time,
+- [x] Spool stdin and other accepted unknown-length sources under byte, time,
   and disk limits before offering exact-size immutable content. Persist bounded
   spool retention for resume and recover or clean it after restart. Apply the
   same accounting to receive partials, paused work, and failed cleanup.
-- [ ] Apply safe display projections at every CLI, consent, and log output path.
-- [ ] Choose SQLite or atomic files from the actual migration, corruption,
+- [x] Apply safe display projections at every CLI, consent, and log output path.
+- [x] Choose SQLite or atomic files from the actual migration, corruption,
   concurrency, and recovery requirements of this phase.
-- [ ] Persist identity, trust, invitation, and transfer state with migrations.
-- [ ] Fail closed on missing or corrupt identity material and provide an explicit
+- [x] Persist identity, trust, and transfer state with migrations. Invitations
+  stay in memory: a token names a transport key that is new every run, so no
+  saved invitation could be reached after a restart. Persist them when
+  discovery lets a token outlive its endpoint.
+- [x] Fail closed on missing or corrupt identity material and provide an explicit
   local reset path that requires fresh pairing.
-- [ ] Store the device key and pair secrets in the Secret Service or a
+- [x] Store the device key and pair secrets in the Secret Service or a
   passphrase-encrypted key file, chosen once at `hyakume init` under Local key
   storage. Refuse when neither is set up.
-- [ ] Add `hyakume unlock` and `hyakume lock`, and report the store and its
+- [x] Add `hyakume unlock` and `hyakume lock`, and report the store and its
   locked state in `hyakume status`. Read passphrases from the terminal without
   echo, and bound every Secret Service call with a timeout.
-- [ ] Own service, IPC, filesystem, and transfer tasks under the Shutdown contract.
-- [ ] Qualify the shutdown overrun path with stalled blocking work and restart
+- [x] Own service, IPC, filesystem, and transfer tasks under the Shutdown contract.
+- [x] Qualify the shutdown overrun path with stalled blocking work and restart
   recovery. Verify that deadline expiry never reports successful cancellation
   or releases resources still in use.
-- [ ] Add real filesystem, persistence, IPC, and exact-binary tests with
+- [x] Add real filesystem, persistence, IPC, and exact-binary tests with
   disposable state.
 
 #### Done when
 
-- [ ] Two local service instances exchange file, text, URL, stdin, and a file
+- [x] Two local service instances exchange file, text, URL, stdin, and a file
   batch through the public CLI.
-- [ ] Rejection, cancellation, full disk, permission denial, existing files,
+- [x] Rejection, cancellation, full disk, permission denial, existing files,
   mid-batch failure, crashes, and restart leave no false completion or unsafe
   output. Published items and the aggregate batch outcome always agree.
-- [ ] Revocation during transfer and final publication obeys the declared
+- [x] Revocation during transfer and final publication obeys the declared
   ordering across restart and blocks old resume authority.
-- [ ] Empty, bounded, oversized, interrupted, and timed-out stdin input has the
+- [x] Empty, bounded, oversized, interrupted, and timed-out stdin input has the
   declared offer and cleanup outcome. Sealed spools retain their exact identity
   across restart and are released under the retention policy.
-- [ ] Unsupported publication destinations receive a typed refusal, and hostile
+- [x] Unsupported publication destinations receive a typed refusal, and hostile
   peer text cannot inject terminal controls or forge a consent prompt.
-- [ ] Over SSH and on a headless machine, a device initializes with a
+- [x] Over SSH and on a headless machine, a device initializes with a
   passphrase-encrypted key file, unlocks after a restart, and transfers. A
   copied state directory reveals no key material without the passphrase.
-- [ ] A locked, unresponsive, or absent key store gives a typed refusal or a
+- [x] A locked, unresponsive, or absent key store gives a typed refusal or a
   `locked` status, never a hang and never an unprotected key on disk.
-- [ ] Packaged CLI artifacts pass a clean-host smoke test.
+- [x] Packaged CLI artifacts pass a clean-host smoke test.
 
 ### Phase 3 - LAN discovery and permanent pairing
 

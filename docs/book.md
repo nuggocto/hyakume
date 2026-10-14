@@ -2,7 +2,8 @@
 
 What got built, how it works, and why, one step at a time. The newest step
 is at the end. Decision records sit next to this file:
-[pairing, identity, sessions, and the wire protocol](pairing-identity-session.md)
+[pairing, identity, sessions, and the wire protocol](pairing-identity-session.md),
+[the local service, its storage, and the file pipeline](local-service.md),
 and the [resource estimate](resource-estimate.md).
 
 ## 1. The trust and transfer core
@@ -22,7 +23,7 @@ src/
 ├── session.rs      trusted devices prove who they are on each connection
 ├── offer.rs        offer checks: exact sizes, digests, item and size limits
 ├── transfer.rs     item states; the batch outcome is computed from them
-├── receive.rs      receiving side, a state machine with no I/O
+├── receive.rs      receiving side, a state machine; no file or network I/O
 ├── send.rs         sending side, the same
 ├── protocol.rs     17 message types, strict decoding, lengths checked first
 ├── display.rs      escaped projections of names and previews
@@ -598,3 +599,830 @@ such as resume or route changes. The old `Route` entry is gone from that row,
 because the `Route` in the code is the inviter's address inside an invitation
 token, not a session's path. Diagnostics now call the same hidden-format check as the projections; their
 own copy missed soft hyphens, variation selectors, and tag characters.
+
+## 11. The local service, command line, and safe files
+
+**What got built.** Hyakume is now a command. `hyakume service run` starts
+the one service that owns this user's installation. Every other command is
+a client of it over a local socket: `init`, `status`, `unlock`, `lock`,
+`pair`, `devices`, `remove`, `receive`, `send`, `cancel`, `inspect`,
+`transfers`, `cleanup`, and `reset`. State survives restarts in SQLite, the
+device key lives in the Secret Service or a passphrase-encrypted key file,
+and received items are real files, published only after their length and
+digest match. The decision record is
+[the local service, its storage, and the file pipeline](local-service.md).
+
+```text
+src/
+├── cli.rs, terminal.rs   the command: arguments, prompts, exit codes
+├── service.rs            the owner: startup, lock lifecycle, requests, shutdown
+├── ipc.rs                the local protocol: frames, messages, limits
+├── storage.rs            SQLite: schema, migrations, checked loading
+├── recovery.rs           startup reconciliation, expiry, cleanup
+├── secrets.rs            key file (age) and Secret Service
+├── paths.rs              private directories and the instance lock
+└── files/
+    ├── names.rs          which offered names can become file names
+    ├── destination.rs    qualified folders, partial files, no-replace rename
+    └── source.rs         prepared files and sealed spools
+```
+
+### Who owns what
+
+```diagram
+hyakume send ─┐                ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+hyakume receive ─┼── Unix socket ━━▶┃ service                           ┃
+hyakume pair ─┘  (this user only)  ┃   StateCell: Mutex<State + SQLite>┃
+                                   ┃   Node: endpoint, sessions, sends ┃
+                                   ┃   blocking file jobs (4 permits)  ┃
+                                   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                                         │              │
+                                   hyakume.db     spools, partial files,
+                                   key file       published files
+```
+
+A client never touches state. A send belongs to the service once it
+starts: if its client goes away, the transfer goes on, and only `cancel`
+stops it. Questions for the person are different. They belong to the client
+that is pairing or receiving, travel to it as events with a random prompt
+number and a context, and only an answer on that same connection, with that
+context, counts. A client that disconnects answers no to everything it
+held.
+
+The state lock that already ordered revocation against publication now also
+orders durable writes. The SQLite connection lives inside `State`, so each
+decision and its record share one critical section. A change that claims
+success, such as trust granted, an offer accepted, or an item published, is
+saved before memory changes. A change that ends work is applied first and
+saved after; if that save fails, the service refuses new work until a
+restart, and recovery settles what the database still shows as unfinished.
+
+### Receiving into real files
+
+The receive state machine used to collect bytes in memory and hand them to
+a model publisher. Now it tells the runtime where each chunk goes and
+decides only the outcome:
+
+```diagram
+Before                                  After
+
+Chunk ─▶ Receiver                       Chunk ─▶ Receiver ─▶ Output::Write
+         buf.extend(chunk)                                     │ runtime, outside the lock:
+         (64 MiB staging budget)                               │ pwrite to .hyakume-<id>-<n>.part (0600)
+ItemEnd ─▶ hash buf, publish to memory                         │ hash as written
+                                        ItemEnd ─▶ Output::Verify
+                                                     │ runtime: fsync partial
+                                                     ▼
+                                        on_verified(digest, commit step), under the lock:
+                                          may_publish: cancelled? trust epoch same?
+                                          ┃ renameat2(partial, name, NOREPLACE)
+                                          ┃ fsync folder
+                                          ┃ save: item published
+                                          ▼
+                                        ItemResult::Published
+```
+
+Memory no longer grows with the file. A node on the smallest buffer budget
+takes a file four times that budget, and two such nodes send several times
+their budgets to each other at once (`tests/loopback.rs`). The rename runs
+under the state lock, so revocation either happens before it, and the item
+is never published, or after it, and the published file stays.
+
+`renameat2` with `RENAME_NOREPLACE` is the only thing that decides whether
+a name is free. A file already there makes the item fail as `exists` while
+the batch goes on, and the old file is not touched. The folder is checked
+when someone starts receiving: its path may not pass through a symbolic
+link, nobody else may write to it, its filesystem must be ext4, btrfs, XFS,
+or tmpfs, and a probe in it must show that the rename really refuses an
+existing name. A folder that fails is refused with the reason, and
+Hyakume's own folder is offered instead.
+
+### Crashes and restarts
+
+Nothing new is written to record the intent to publish. The output name is
+saved at acceptance, and the partial file's device and inode as soon as the
+file exists. After a crash, recovery looks at the folder:
+
+```diagram
+crash between the rename and its record
+  output name has the partial's inode? ━━▶ published (record saved now)
+  partial still has its inode?         ──▶ paused, partial kept and charged
+  neither                              ──▶ failed: lost
+```
+
+An identical file that was already there has another inode, so it never
+counts as the received item. Debug builds have crash points
+(`HYAKUME_CRASH_AT`) that stop the service between those steps, so
+`tests/service.rs` checks both sides of the rename with real processes.
+
+Work cut off by a stop, a lock, or a crash pauses and keeps its partial
+file or sealed spool, and its quota, for 7 days. Resuming it comes with the
+reliable-transfer work; until then it can be inspected or cancelled, and it
+expires on its own.
+
+### Sending files and standard input
+
+```text
+send notes.txt   ──▶ open no-follow, regular file? ─▶ hash (1 MiB buffer)
+                     remember device, inode, size, times ─▶ offer
+send -  / --text ──▶ spool (0600) ─▶ EOF ─▶ chmod 0400, fsync ─▶ ledger ─▶ offer
+                     limits: size, all spools, free space, deadline, client gone
+while sending    ──▶ hash again; source changed? ─▶ fail item, cancel the rest
+```
+
+Nothing is offered before its exact length and digest are known. Input that
+stops early, grows past its limit, or stops arriving drops its spool and
+makes no offer. Text and links use the same spool, so every item reads from
+a file.
+
+### Files Hyakume owns
+
+Spools and partial files are rows in one ledger table. A row charges its
+bytes from reservation until the file is published or deleted. When an item
+ends, its row is marked for deletion in the same write. A cleanup pass
+every 5 seconds deletes due files, retrying with longer waits for up to 24
+hours. A file that still cannot be deleted is reported by `status` as kept,
+with its bytes still charged, until `cleanup --retry` or the next start.
+
+### Keys and locking
+
+```diagram
+Uninitialized ──init──▶ Unlocked ◀──unlock── Locked
+                            ┗━━━━lock, stop━━━━▶┛
+```
+
+`init` asks where to keep the key. The Secret Service is offered when it is
+reachable and unlocked; otherwise the key goes in a file encrypted with age
+and a passphrase. scrypt runs at N = 2^17, which uses 128 MiB, because 2^18
+would take the service's whole memory budget while it unlocks. A key in the
+Secret Service unlocks at start without anyone typing. A key file waits for
+`hyakume unlock`. Every Secret Service call gives up after 3 seconds, and
+Hyakume never asks the keyring to unlock, so an SSH session is never left
+waiting on a desktop prompt. Unlocking checks that the key belongs to this
+installation and is the device recorded in the database.
+
+Invitations stay in memory. A token names the endpoint key, which is new
+every run, so after a restart no saved invitation could be reached anyway.
+Saving its secret would only have added a vault key to protect it.
+
+### Packaging
+
+`mise run package` builds `dist/hyakume-VERSION-TARGET.tar.gz` with the
+release binary, the license, the notices of all 374 crates compiled in, a
+systemd user unit, install notes, and the build's commit, toolchain, and
+`Cargo.lock` digest, plus a checksum. `mise run qualify` checks the
+checksum and runs that exact binary through the whole journey in a fresh
+container with no network beyond loopback: install, init, restart and
+unlock, pairing, every payload kind, rejection, cancellation, an existing
+file, a crash, revocation, lock, stop, and uninstall.
+
+**Why this shape.** Each piece keeps a rule the core already had, now on
+disk. The state lock still decides every order. The state machines still do
+no file or network I/O, so their tests did not need a filesystem; their
+state changes now reach SQLite through `State`, and the runtime does the
+file work behind them. The end-to-end tests check that through the public
+command.
+
+## 12. Fixes after the review of the local service
+
+A reviewer read the whole uncommitted service work and reproduced ten
+defects. Each one was checked against the code before it was fixed; all ten
+held. They share one pattern. Work outlived its owner, an identifier was
+reused, or an error did not say whether its side effect had already
+happened.
+
+**A name finds a trusted device, never a revoked one.** A revoked device's
+alias is free for a new device, so two records can share it. `find_device`
+scanned every record and took the first, which could be the revoked one:
+`remove laptop` then revoked the old record again, reported success, and
+left the new laptop trusted. `TrustStore::find` now looks only at trusted
+records, and refuses a name that is one device's alias and another's
+fingerprint.
+
+**Requests cannot keep a stopped node alive.** A running `receive`, an
+invitation, or a send preparing its files held an `Arc<Node>` across waits.
+`lock` stopped the node, but the node, with its key, stayed in memory until
+those requests ended. Requests now reach the node only through a closure
+that cannot wait, and a joining pairing became a task of the node:
+
+```diagram
+Before                                  After
+
+request ──holds Arc<Node>──┐            request ──with_node(|n| ..)──▶ node
+  awaits files, input,     │              (synchronous; nothing kept)
+  pairing ...              ▼
+                     ● node + key       pair --join ━━▶ node task
+lock ──shutdown──▶   still in memory                    ┃ shutdown waits
+                                        lock ━━shutdown━┛ node and key gone
+```
+
+If the node's work cannot stop within the drain deadline, `lock` and
+`reset` now stop the whole service, as `service stop` already did, instead
+of starting a new node beside work that still runs. The service's own
+blocking jobs (preparing files, spooling, key files, folder checks,
+deletions) hold permits the way the node's file jobs do, and shutdown takes
+them all back before it reports a clean stop.
+
+**Late cleanup results touch only their own row.** Ledger rows used
+SQLite's reusable row IDs, and two cleanup passes could act on one
+snapshot. A late result about a deleted file could remove a new file's row
+and free its charged bytes. Row IDs now never repeat, passes run one at a
+time, and a result changes a row only while it is still marked for
+deletion.
+
+**After the rename, a failed directory sync still means published.** It was
+recorded as `failed: storage` while the file sat under its final name, and
+recovery never looked at it again. The file is there with its bytes synced,
+so the item now counts as published and the sync error is logged. The
+decision record explains why another `fsync` would prove nothing. (The next
+review showed that this acknowledged a file nobody knew to be durable;
+section 14 replaces it.)
+
+**Smaller fixes.**
+
+- Text that is not UTF-8 is refused before its spool is sealed, so dropping
+  the spool still deletes it. Before, a sealed and uncharged spool stayed
+  until the next start.
+- `FrameReader` keeps a frame read in part. The service and the command
+  line race reads against other work, and a cancelled read used to drop
+  the bytes already taken from the socket.
+- `reset` refuses while the old key cannot be confirmed deleted, for any
+  reason, and an unfinished initialization keeps its record until its key
+  is gone. The installation record is what finds the key.
+- `transfers` returns one summary per transfer. The full list of 256
+  transfers with 256 items each could exceed the 1 MiB frame.
+- Deadlines are checked against a lifetime clock that never runs behind its
+  latest reading and follows the monotonic clock while the service runs.
+  Setting the wall clock back no longer extends paused work.
+- The terminal is put back on every way out of a passphrase prompt; the
+  guard exists before echo goes off.
+
+Most fixes have a test that was seen to fail without the fix. Three have
+none: the terminal guard, whose failure needs file-descriptor exhaustion
+inside a pseudo-terminal; the permits on the service's own jobs; and
+stopping the service when `lock` cannot drain, which would need a job that
+outlasts the 20 s deadline. The node-holding rule needs no test, because
+the compiler enforces it: `with_node` hands out a `&Node` inside a
+synchronous closure, so a request cannot keep it.
+
+## 13. Packaging tasks in Rust
+
+**What changed.** The Linux package was built and qualified by two shell
+scripts and a Python script. They are now one Rust package, `xtask`, run as
+`cargo xtask package` and `cargo xtask qualify`; the mise tasks call them.
+
+```diff
+ packaging/linux/
+-├── build.sh          cargo build, tar, sha256sum
+-├── notices.py        license notices from cargo metadata
+-├── qualify.sh        checksum, then docker running sh -c
+ ├── hyakume.service
+ └── INSTALL.md
++xtask/src/
++├── main.rs           the two tasks and the processes they run
++├── package.rs        archive, checksum, BUILD-INFO
++├── notices.rs        normal dependencies of hyakume only, typed
++└── qualify.rs        checksum, unpack and check, then the journey in docker
+```
+
+**How it works.** `package` reads `cargo metadata` into typed structs,
+builds the release binary, and writes the archive in Rust (`tar` and
+`flate2`): folders first, every entry owned by root and stamped with the
+commit's time. The same commit gives the same archive, byte for byte, which
+the shell version could not promise. The notices are those `notices.py`
+wrote, byte for byte. `qualify` checks the checksum, unpacks the package on
+the host and checks its files and the binary's mode, then runs the
+end-to-end test binary directly in a fresh container. No shell runs inside
+the container any more.
+
+The tasks still start cargo, rustc, git, and docker, because those are the
+source of truth for what they report. The seven crates they add (`tar`,
+`flate2`, and their dependencies) reach only `xtask`, never the shipped
+binary, and `cargo deny` checks them like the rest.
+
+**Why.** Windows comes next, and its package needs the same steps; shell and
+Python would not run there, and Rust code can be shared. The notices decide
+which licenses ship with the binary, so the dependency walk now has a test:
+development and build dependencies, and packages Hyakume does not depend on,
+stay out. A package whose checksum does not match is refused before
+anything runs.
+
+## 14. Fixes after the second review of the local service
+
+The reviewer reread everything and confirmed seven of the earlier fixes. Of
+the other three, two were only partly fixed and one was fixed the wrong
+way. The reviewer also reproduced two new defects. All five held when
+checked against the code.
+
+**An unsynced rename is neither published nor failed.** Section 12 turned a
+failed folder sync after the rename into success, so the sender heard
+`published` about a name that might not survive a crash. The item now waits
+for evidence:
+
+```diagram
+Before                                  After
+
+rename ok, folder sync fails            rename ok, folder sync fails
+        │                                       ┃
+        ▼                                       ▼
+item published, row removed             ● item paused, row kept (inode)
+sender told: published                    rest of the batch cancelled
+                                          sender told: storage-failed
+                                                ┃ next start
+                                                ▼
+                                        name has the inode and the
+                                        folder syncs ━━▶ published
+                                        otherwise ━━━━━▶ stays paused
+```
+
+A later sync that succeeds is real evidence for a name, unlike for file
+data: ext4, XFS, and btrfs journal names, and a failed commit leaves the
+filesystem read-only.
+
+**A restart measures the time it was stopped.** Each saved reading of the
+lifetime clock now carries the wall clock's time. At the next start, the
+time stopped is what the wall clock advanced since then. If the wall clock
+reads earlier than the saved one, nobody can tell how long the service was
+stopped, and recovery expires paused work. Before, a rollback across a
+restart counted the stop as no time at all.
+
+**A finished identity is never replaced by `init`.** `init` saved the
+identity and then started the endpoint. When that failed, for example
+because another program held the port, the service still said
+`uninitialized`, and a second `init` deleted the saved key and made a new
+identity. The identity now stays saved and locked, and `unlock` tries the
+endpoint again; `init` undoes only an initialization that never finished.
+
+**Spool accounting holds through every outcome.**
+
+- A sealed spool whose ledger row cannot be written is deleted at once, and
+  the failed write stops new work. If the spool cannot be deleted either,
+  its bytes stay counted until the next start removes it.
+- Admission read the ledger's total and the in-progress total under two
+  locks, so a spool sealed between the two reads was counted in neither.
+  Admission and the handoff now take the same two locks in the same order.
+
+Each fix has a test that failed without it, except the lock order, whose
+failure is a thread interleaving that no test could produce reliably.
+
+
+## 15. Fixes after the third review of the local service
+
+Two reviewers read the whole uncommitted service work and reported eight
+defects between them. Each was checked against the code before anything
+changed, and all eight held; the wildcard address was confirmed with a
+probe. Most share one cause: work that has to finish was owned by
+something that can be cancelled, such as a client's request.
+
+**Lock-state changes belong to the service.** A request runs as a task of
+its client's connection, and a disconnect aborts it. For `lock` and `reset`
+that abort could land in the middle of the node's drain:
+
+```diagram
+Before                                   After
+
+client: lock ──▶ request task            client: lock ──▶ request task
+                   │ phase := locked                         │ waits for
+                   │ node.shutdown() ━┓                      ▼
+client leaves ──▶  ✗ aborted          ┃   service task ━━▶ phase := locked
+                     drain dropped,   ┃     node.shutdown() runs to its end
+                     pausing stays on ┃   client leaves ──▶ only the wait ends
+unlock ──▶ new node beside old work ◀━┛   unlock waits for the transition
+```
+
+`init`, `unlock`, `lock`, and `reset` now run through `Service::own`, which
+spawns them into a task set the service keeps and shutdown waits for. A
+client that leaves stops waiting for the answer, never the change. Once the
+service is stopping, no transition starts, so none can start a node after
+the last one stopped. `Node::shutdown` was hardened as well: it keeps the
+accept task's handle until it has seen the task end, and it reports success
+only after every file job's permit is back. A second call after one that
+was cut short waits for the same work instead of saying all is done.
+
+**Input stays charged until its file is gone.** Input being spooled is
+counted in memory until it is sealed. When its client left, the spool's
+destructor tried to delete the file, ignored a failure, and the count went
+anyway: the file stayed on disk, uncounted and unknown to cleanup.
+`InputSpool` now holds the spool and its count together. Dropping it
+deletes the file through `Spool::discard`, which reports failure; a file
+that stays gets a ledger row marked for deletion, still charged, and the
+regular cleanup retries it and reports it if it never goes.
+
+**A sealed spool always reaches the ledger or the bin.** Sealing ran in a
+blocking job awaited by the request. A client that left while it ran left a
+sealed spool with no row. From the end of input on, sealing, the row, and
+starting the send are now one service task (`Service::offer_input`), so the
+request's end no longer decides whether they happen.
+
+**Saved file names never reach outside their folder.** Cleanup deletes the
+name a ledger row records. A row naming `../something` was accepted on load,
+and `unlinkat` follows `..`, so a damaged database could delete a file
+beside the spool folder. Rows now must carry exactly the name Hyakume gives
+their kind (`.hyakume-<transfer>-<item>.part` or `<transfer>.spool`), saved
+output names must be valid file names, and the deletion itself refuses
+anything but a single name.
+
+**One clock for every deadline.** Expiry was checked with the lifetime
+clock, but transfers were stamped with the raw wall clock. After the wall
+clock was set back, a new transfer's stamp sat behind the lifetime clock,
+which cut its 7-day window short, or ended it at once after a rollback of
+more than a week. Cleanup windows had the same mix. `State::now_ms` now
+stamps and checks everything.
+
+**Questions hold a place only while someone waits.** A receiving client
+holds at most eight questions. A question whose offer was withdrawn stayed
+in its list until answered, so eight withdrawn offers made every later
+offer fail as if the person had declined. Questions the node gave up on now
+free their place, an acceptance counts only once the node received it, and
+a question nobody could take is refused as `busy`. A client that leaves
+still answers no to what it held.
+
+**A route names an address others can dial.** The unit file suggested
+`--listen 0.0.0.0:7400` for LAN use, but the route then told other devices
+to dial `0.0.0.0`, which is never this machine for them. `service run` and
+`Node::bind` now refuse an unspecified address and ask for the LAN address
+instead. Advertising every interface is discovery work.
+
+**Smaller changes.** `Store::delete_trust`, `ipc::MAX_PATHS`, and two
+one-line wrappers had no use and are gone. The session sequence in the
+pairing record no longer describes the removed in-memory staging, and the
+resource estimate counts 256 kept transfers, not 320. Long functions got
+blank lines between their steps, so each one reads in parts.
+
+Every fix has a test that failed without it, checked by undoing the fix
+once: `a_shutdown_cut_short_leaves_its_work_to_the_next_one`,
+`unfinished_input_that_cannot_be_deleted_stays_charged_until_cleanup_deletes_it`,
+`a_file_row_whose_name_could_leave_its_folder_is_refused`,
+`removal_never_reaches_outside_its_folder`,
+`work_received_after_the_wall_clock_went_back_keeps_its_whole_window`,
+`questions_the_node_stopped_waiting_for_hold_no_place`,
+`a_question_dropped_without_an_answer_is_refused_as_busy_not_declined`, and
+`an_address_other_devices_cannot_dial_is_refused`. Two changes have no test
+of their own. Moving transitions and sealing into service tasks would need
+a client to leave at an exact moment inside a blocking job; the node-level
+test covers what that left broken. `a_spool_that_cannot_be_deleted_says_what_is_left`
+covers the report the ledger row is built from.
+
+## 16. Two more gaps from the fourth review
+
+A last review reproduced two defects. Both held when checked against the
+code.
+
+**A queued send is settled even if it never runs.** `start_send` records
+the transfer, then queues a task for the accept loop. The guard that ends
+an unfinished transfer was created inside that task, so a task still in the
+queue when shutdown began was dropped before it existed. The transfer
+stayed `offered` with nothing behind it:
+
+```diagram
+Before                                    After
+
+start_send ─▶ record transfer             start_send ─▶ record transfer
+           ─▶ queue task                                 + guard ━━┓
+                │ first poll                         ─▶ queue task  ┃ carried
+                ▼                                                   ┃ inside
+              guard created               shutdown: queue dropped ━━┛
+shutdown: queue dropped                     guard ends it: interrupted
+  transfer stays offered ✗
+```
+
+The guard now travels in `Outgoing` from the moment the transfer is
+recorded. Whoever drops the send settles it: the task when it finishes, the
+accept loop when it drains its queue at shutdown, or `start_send` when the
+queue refuses it.
+
+**State paths are resolved once.** The state folder was checked only at its
+last component, while cleanup and receiving reopen folders without
+following any link. A state folder under a linked ancestor, such as a home
+folder that is a link, therefore worked for writing spools but not for
+deleting them, and the default receive folder was refused. The service now
+resolves its state and runtime folders to real paths at start, checks them
+again there, and records only those.
+
+`sends_still_queued_when_shutdown_begins_never_stay_offered`,
+`folders_under_a_linked_ancestor_are_kept_by_their_real_path`, and
+`a_state_folder_under_a_linked_ancestor_still_cleans_up_its_spools` each
+failed before the fix.
+
+## 17. Three gaps from the fifth review
+
+All three held against the code. Each one is a step that must happen
+before the next is safe, but nothing enforced the order.
+
+**No publication without the record recovery needs.** When a partial file
+is created, its inode goes to the ledger. That record is the only way
+recovery can tell the received file from anything else under the output
+name. If the write failed, `State::file_created` only logged it, and
+receiving went on to publish. A crash after the rename then left a complete
+file that recovery could only call paused, with its bytes still charged.
+`file_created` now returns the failure. `open_partial` removes the new file
+and fails the item as a storage failure before any byte is written to it.
+
+```diagram
+Before                                    After
+
+create partial ─▶ save inode ✗ (logged)   create partial ─▶ save inode ✗
+write, verify, rename ━━▶ published                          │
+crash before the record                   remove the partial ┃
+restart: inode unknown ─▶ paused ✗        item fails: storage, nothing published
+```
+
+**The read-only mode is synced with the bytes.** Sealing synced the spool,
+then made it read-only. Syncing the directory afterwards does not cover the
+file's own mode, so after a power loss a spool could come back writable,
+and recovery treats a writable spool as lost. The mode now changes first,
+and the one sync covers both.
+
+**A client that stops reading gives its place back.** A client that lets
+its event queue fill is disconnected, but the service then waited for its
+writer to finish, and that writer was blocked on a socket nobody read. The
+connection and one of the eight client places stayed taken for good.
+Whatever is still queued now gets 5 seconds to go out; then the writer is
+stopped and its end observed.
+
+`a_partial_file_whose_record_cannot_be_saved_is_never_used` and
+`a_client_that_stops_reading_gives_its_place_back` failed before their
+fixes. The mode order has no test: showing it needs a power cut between
+the sync and the next write of the inode.
+
+## 18. Five gaps from the sixth review
+
+All five held against the code. Four were confirmed by a test that failed
+before its fix. The first was not: no test could show it, so the fix makes
+it impossible by design.
+
+**A reply goes out only after its request has ended.** A connection runs
+one request at a time and answers `busy` to a second. The request task sent
+its own reply and then returned, so for a moment the client could hold the
+reply while the connection still counted the request as running. A client
+that asked again at once, as the command line does after `status`, could
+be told `busy`. The request now returns its reply, and the connection loop
+sends it after taking the finished task off its slot.
+
+```diagram
+Before                                   After
+
+request task: send reply ─▶ return       request task: return reply
+client: reply ─▶ next request            loop: slot free ─▶ send reply
+loop: slot still taken ━━▶ busy ✗        client: reply ─▶ next request ─▶ runs
+```
+
+Over a real socket the round trip almost always gave the task time to
+finish: 30,000 requests in a row never hit it. So there is no test for this
+one; the order of the two steps is the fix.
+
+**A partial file needs its reservation.** Recording a new partial file's
+inode updated the reserved ledger row and reported success even when no row
+matched. A cancel or revoke marks the item's row for deletion in the same
+write that ends the item, so a partial file created just after was written
+into with no row naming it, and cleanup would never find it.
+`Store::file_created` now says whether a reservation took the record, and
+`open_partial` removes the file when none did, as it already did when the
+write itself failed.
+
+That exposed an ordering question in the receiver. The revoke test
+revoked the sender between the first chunk arriving and its partial file
+being opened, and the transfer then reported a storage failure instead of
+the revoke. `Receiver::on_storage_failure` now lets a cancel or revoke that
+already reached the state win, the rule `on_message` already followed.
+
+**Locking ends the endpoint's invitations.** Invitations live in the shared
+state, but their deadlines come from the node's monotonic clock and their
+tokens name its endpoint. A lock stopped the node and left them there. The
+node started at unlock has a new clock starting at zero, so the old
+invitations looked open for another full lifetime and held the eight
+invitation slots. `Node::shutdown` now clears them once every exchange has
+ended.
+
+**The lifetime clock keeps fractions of a millisecond.** Each reading
+counted whole milliseconds since the last one and then dropped the
+remainder. After the wall clock went back, only that count moved the clock,
+so readings every half millisecond moved it not at all. The clock now
+advances its starting point by the milliseconds it counted, and the rest
+carries over.
+
+**A leftover spool is charged by its real size.** A spool write that fails
+partway can leave bytes the spool never counted. If the file then could not
+be deleted, its ledger row charged only the counted bytes, and the
+in-memory charge, which had counted them all, was released. The row now
+takes the file's size on disk, or the most the file can hold when that
+cannot be read.
+
+`a_partial_file_whose_reservation_is_gone_is_never_used`,
+`invitations_open_when_the_node_stops_leave_room_for_the_next_node`,
+`readings_less_than_a_millisecond_apart_still_add_up`, and the extended
+`a_spool_that_cannot_be_deleted_says_what_is_left` each failed before their
+fix. `revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_sessions`
+failed after the reservation fix and before the receiver change.
+
+## 19. Three gaps from the seventh review
+
+Each one was an order of two steps that held only most of the time.
+
+**An ended transfer always becomes evictable.** The service keeps 256
+transfers and makes room by dropping the oldest finished one. A transfer's
+end and its finish order are two separate writes, so a crash between them
+left a row that was ended but had no finish order. Loading skipped it for
+eviction, and recovery skipped it because it had already ended. Enough of
+those and every new send failed with `TooManyTransfers`. `State::load` now
+gives each such transfer the next finish order, which closes the gap at the
+next start whatever caused it.
+
+**`stop` gets its reply before shutdown ends its connection.** The request
+signalled the service to stop and then returned its reply. Shutdown could
+run first and abort every client, reply included, so the command line
+reported a lost connection for a stop that worked: about one stop in 500.
+Two changes fix it:
+
+```diagram
+Before                                   After
+
+stop request: signal ─▶ return reply     stop request: return reply
+shutdown: abort clients ━━▶ reply lost   connection: queue reply ─▶ signal
+                                         shutdown: clients end ─▶ queues flushed
+```
+
+The connection that ran `stop` signals only after queueing the reply. And
+shutdown no longer aborts clients outright: it sets `closing`, each client
+ends its request and drains its queue through the usual 5-second writer
+limit, and only a client still there after 6 seconds is aborted.
+
+**The input deadline holds under a backlog.** `timeout_at` polls the
+receive first, so a frame already queued was accepted even after the
+deadline. A stream that kept the queue full, because spool writes were
+slow, could outlast `--stdin-deadline` and be offered. `next_input` now
+checks the deadline on every frame.
+
+`transfers_that_ended_just_before_a_crash_still_make_room_after_it` and
+`input_still_queued_when_its_deadline_passes_is_refused` fail every time
+without their fix. `the_stop_command_is_always_told_the_service_stopped`
+stops the service 200 times. Before the fix it failed in about a third of
+its runs. After it, 1,200 stops in a row all got their reply.
+
+## 20. Four gaps from the eighth review
+
+Three of these are ownership handed over at the wrong moment. The fourth
+replaces a library that could open a window.
+
+**A receiver leaving cannot clear its replacement.** Ending a receive did
+two things under two separate locks: clear the route, then clear the node's
+destination. A new receiver could register and set its destination between
+them, and the old one's second step then wiped it out. The new client said
+it was receiving while every offer was refused as busy.
+
+```diagram
+Before                                      After
+
+old: routes.receiver = None   (unlock)      old: lock routes
+new: routes.receiver = new                       receiver = None
+new: node.destination = new                      node.destination = None
+old: node.destination = None  ━━▶ lost           unlock
+                                            new: lock routes ─▶ register ─▶ set
+```
+
+Registering, leaving, and the node starting all change the destination
+with the routes locked, and the routes lock is always taken before the
+phase lock. No test covers it: a whole receive request would have to fit
+between two lock acquisitions in one `Drop`, so the lock itself is the fix.
+
+**A paused transfer keeps its place.** Each unfinished transfer holds a
+`TransferSlot` from the node's budget, which caps how many can exist. When
+a rename succeeds but the folder sync fails, the transfer pauses until
+recovery can tell whether the file is on disk. The slot lived in the
+receiver's `Active` state and was dropped with it, so the paused transfer
+counted for nothing, and new offers could be admitted past the limit until
+the next unlock. `unconfirmed` now hands the slot to the state's
+`paused_slots`, the same place `hold_paused` puts slots for work paused
+before a node started. The state lets it go when the transfer ends.
+
+```diagram
+session ── Active { slot } ──▶ unconfirmed ──▶ State.paused_slots[id]
+                                                  │
+                                    expire/cancel ▼ settle() drops the slot
+```
+
+**Making room survives a failed delete.** To keep 256 transfers, inserting
+one drops the oldest finished one. The code popped it from the finish queue
+before deleting its row, so when the delete failed, the transfer stayed in
+memory and in SQLite but was gone from the queue: never evictable again in
+that run. It now reads the head of the queue, deletes, and pops only on
+success.
+
+**The Secret Service never gets to show a prompt.** A keyring can be set to
+ask someone to confirm creating or deleting an item. The Secret Service
+then answers with a prompt object, and nothing shows until the client calls
+`Prompt`. The `secret-service` crate made that call inside `create_item`
+and `delete` and waited, so on a desktop session a window opened that
+nobody on SSH could answer. The timeout ended the wait but not the window.
+The crate keeps its D-Bus proxies and session key private, so there was no
+way to stop it.
+
+`src/secrets.rs` now talks to the Secret Service through `zbus` directly. A
+`Keyring` opens one session and makes each call itself. A reply that names
+a prompt is dismissed unseen and fails with `SecretError::Confirmation`,
+which tells the person to allow the action without confirmation or use the
+key file.
+
+```diagram
+CreateItem / Item.Delete
+        │
+        ▼
+ prompt == "/" ? ── yes ──▶ done
+        │ no
+        ▼
+ Prompt.Dismiss  (never Prompt.Prompt)
+        │
+        ▼
+ Err(Confirmation)
+```
+
+The session keeps the encryption the crate used. `Exchange` runs
+Diffie-Hellman in RFC 2409's 1024-bit group with `crypto-bigint`'s
+constant-time arithmetic, refuses public values of 0, 1, and p − 1, and
+derives the AES-128 key with HKDF-SHA256. Secrets go out and come back as
+AES-CBC with a fresh IV. These crates were already in the tree; only `cbc`
+is new, and `secret-service` with its own copies of them is gone.
+
+`a_secret_service_that_wants_confirmation_never_gets_to_ask` runs a
+stand-in Secret Service on a private D-Bus connection that wants
+confirmation for everything, and counts the prompts it is asked to show. It
+must stay at zero. Running the prompt, as the crate did, fails it. The real
+check that the session interoperates is
+`a_secret_service_key_unlocks_at_start_and_is_deleted_on_reset` under
+`mise run test-keyring`. Against gnome-keyring, it stores the key at init,
+loads it at start (the key must match the recorded device), and deletes it
+at reset.
+
+`a_rename_whose_folder_cannot_be_synced_is_never_acknowledged` now checks
+that the paused transfer still counts after its session ends, and stops
+counting when it expires. `transfers_that_failed_to_make_room_still_make_room_later`
+makes every finished transfer fail its delete once, then inserts one more.
+Both fail without their fix.
+
+## 21. Four fixes from the ninth and tenth reviews
+
+**The device's own name is checked when it loads.** `init` accepts a name
+only through `LocalAlias::new`: 1 to 64 bytes, no control or formatting
+characters, no surrounding spaces. Loading checked only that it was UTF-8
+and at most 64 bytes, so a name changed in the database could carry an
+escape sequence and a newline, and `hyakume status` printed them as they
+were. That needs write access to the user's own database, so it is not a
+peer attack, but the rule is now applied on both sides.
+`Store::installation` runs the same check, so a changed name is a damaged
+row, refused like any other. The status view also escapes the name with
+`SafeLine`. A valid name comes through unchanged, and the display no longer
+depends on the check that came before it.
+
+```diagram
+init ──LocalAlias::new──▶ installation.name ──load: LocalAlias::new──▶ Installation
+                                                                        │
+                                              status: SafeLine (no quotes)
+```
+
+**One folder can hold both state and socket.** The service takes a lock
+in the state directory, to own the database, and one in the runtime
+directory, to own the socket. `flock` locks belong to an open file, not to
+a process. With `--state-dir` and `--runtime-dir` naming the same folder,
+the service opened `service.lock` twice, and the second lock was refused
+by the first, which this same process held. The service reported "another
+Hyakume service already uses" the folder and never started.
+`paths::lock_service` opens both lock files and compares their device and
+inode. A match means one file, so the lock it already holds covers both.
+Comparing paths would not do: two paths, such as through a bind mount, can
+name one folder.
+
+```diagram
+lock_service
+  ├─ open + flock  state/service.lock
+  ├─ open          runtime/service.lock
+  └─ same (dev, ino)?  yes ─▶ keep the one lock
+                       no  ─▶ flock the second too
+```
+
+**The keyring test cannot hang.** Its shell script waited for each
+service start with an unbounded `until` loop, and the test collected the
+script's output with no deadline. A service that failed to start turned a
+test failure into a stall. The script now waits at most 10 seconds for
+each start and stops any service still running when it exits, keeping its
+own exit status. The test runs the session in its own process group, and
+`wait_group` kills the whole group after 60 seconds. A simulated startup
+failure now ends the test in about 10 seconds with "the service never
+answered". A simulated hang ends at the deadline and leaves no process
+behind.
+
+One trap in that script was easy to miss. `/bin/sh` is bash here, and
+`set -e` still applies inside an exit trap. `kill` on a service that has
+already stopped fails, the trap exits 1, and the script fails although
+every step passed. The trap ends its `kill` with `|| true`.
+
+**rustls 0.23.46.** A new advisory, RUSTSEC-2026-0346, covers rustls
+0.23.45, which reaches Hyakume through Iroh, and it failed the dependency
+check. It concerns `Debug` output of TLS session values in custom session
+stores, which Hyakume does not have. Both lockfiles move to 0.23.46, and
+`cargo deny check` passes again.
+
+`damaged_rows_are_refused_instead_of_repaired` now saves a device name,
+rewrites it in the database with an escape sequence and a newline, and
+expects loading to refuse it. `one_folder_for_state_and_socket_is_locked_once`
+gives the same folder by two paths and expects one lock that still keeps a
+second service out. Both fail without their fix.
