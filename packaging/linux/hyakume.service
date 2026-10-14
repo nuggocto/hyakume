@@ -1,0 +1,17 @@
+# The Hyakume service for one user: systemctl --user enable --now hyakume
+[Unit]
+Description=Hyakume: pass files, text, and links between your own devices
+Documentation=https://github.com/nuggocto/hyakume
+
+[Service]
+Type=simple
+# Peers reach this device on the loopback address only. To pair and send
+# between two machines on a LAN, add this machine's LAN address, for
+# example --listen 192.168.1.20:7400. 0.0.0.0 is refused: other devices
+# cannot dial it.
+ExecStart=%h/.local/bin/hyakume service run
+Restart=on-failure
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

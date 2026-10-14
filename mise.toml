@@ -18,15 +18,15 @@ run = [
 
 [tasks.lint]
 description = "Run Clippy with warnings treated as errors"
-run = "cargo clippy --locked --all-targets -- -D warnings"
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 
 [tasks.check]
 description = "Check all Rust targets without building binaries"
-run = "cargo check --locked --all-targets"
+run = "cargo check --locked --workspace --all-targets"
 
 [tasks.test]
 description = "Run Rust tests"
-run = "cargo test --locked"
+run = "cargo test --locked --workspace"
 
 [tasks.build]
 description = "Build the application"
@@ -48,6 +48,14 @@ run = "cargo test --locked --test service -- --ignored --exact a_secret_service_
 [tasks.test-full-disk]
 description = "Run the full-disk test on small filesystems (needs unprivileged user namespaces)"
 run = "cargo test --locked --test service -- --ignored --exact a_full_disk_refuses_offers_and_input_and_leaves_nothing_behind"
+
+[tasks.package]
+description = "Build the Linux package in dist/"
+run = "cargo xtask package"
+
+[tasks.qualify]
+description = "Run the Linux package through the clean-host journey in a container (needs docker)"
+run = "cargo xtask qualify"
 
 [tasks.deny]
 description = "Check dependency licenses, sources, and advisories (needs cargo-deny)"

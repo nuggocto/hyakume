@@ -30,6 +30,9 @@ mise.local.toml
 .DS_Store
 Thumbs.db
 
+# Packages built by cargo xtask package
+/dist/
+
 # Hyakume's own files, in case its state or a receive folder is ever
 # pointed inside the repository: the database, the encrypted device key,
 # spools, partial files, and the socket

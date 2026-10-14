@@ -7,6 +7,10 @@ description = "Pass files, text, and links between your own devices"
 repository = "https://github.com/nuggocto/hyakume"
 publish = false
 
+[workspace]
+# Project tasks; see xtask/src/main.rs. They never ship in the binary.
+members = ["xtask"]
+
 [dependencies]
 # aes, cbc, and crypto-bigint run the Secret Service session (src/secrets.rs)
 # in versions already used elsewhere in the tree.
