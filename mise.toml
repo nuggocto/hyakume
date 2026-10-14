@@ -41,6 +41,14 @@ run = [
   "mise run build",
 ]
 
+[tasks.test-keyring]
+description = "Run the Secret Service test in an isolated keyring (needs dbus-run-session, gnome-keyring-daemon, and secret-tool)"
+run = "cargo test --locked --test service -- --ignored --exact a_secret_service_key_unlocks_at_start_and_is_deleted_on_reset"
+
+[tasks.test-full-disk]
+description = "Run the full-disk test on small filesystems (needs unprivileged user namespaces)"
+run = "cargo test --locked --test service -- --ignored --exact a_full_disk_refuses_offers_and_input_and_leaves_nothing_behind"
+
 [tasks.deny]
 description = "Check dependency licenses, sources, and advisories (needs cargo-deny)"
 run = "cargo deny check"
@@ -50,5 +58,6 @@ description = "Run each fuzz target for 120 seconds (needs cargo-fuzz and nightl
 run = [
   "cargo +nightly-2026-09-04 fuzz run frame -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
   "cargo +nightly-2026-09-04 fuzz run invitation_token -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
+  "cargo +nightly-2026-09-04 fuzz run ipc_message -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
   "cargo +nightly-2026-09-04 fuzz run stored_values -- -max_total_time=120 -max_len=65536 -rss_limit_mb=1024 -timeout=5",
 ]

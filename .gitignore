@@ -29,3 +29,14 @@ mise.local.toml
 *~
 .DS_Store
 Thumbs.db
+
+# Hyakume's own files, in case its state or a receive folder is ever
+# pointed inside the repository: the database, the encrypted device key,
+# spools, partial files, and the socket
+hyakume.db
+hyakume.db-journal
+identity.age
+identity.age.new
+*.spool
+.hyakume-*
+hyakume.sock
