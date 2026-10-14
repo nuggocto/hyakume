@@ -416,7 +416,8 @@ mod tests {
         let dir = temp("remove");
         let dest = Destination::qualify(&dir).unwrap();
         let (_, id) = dest.create_partial(".hyakume-y-0.part").unwrap();
-        std::fs::remove_file(dir.join(".hyakume-y-0.part")).unwrap();
+        // Moved aside, not deleted, so the new file cannot reuse its inode.
+        std::fs::rename(dir.join(".hyakume-y-0.part"), dir.join("moved")).unwrap();
         std::fs::write(dir.join(".hyakume-y-0.part"), b"someone else's").unwrap();
         assert!(dest.remove(b".hyakume-y-0.part", Some(id.key())).is_err());
         assert!(dir.join(".hyakume-y-0.part").exists());
