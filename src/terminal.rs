@@ -124,9 +124,11 @@ pub async fn secret(prompt: &str) -> Result<Zeroizing<Vec<u8>>, TerminalError> {
     let mut quiet = saved.clone();
     quiet.local_modes.remove(LocalModes::ECHO);
     quiet.local_modes.insert(LocalModes::ECHONL);
+    // Echo goes off before the prompt shows, so nothing typed or pasted as
+    // soon as it appears can reach the screen.
+    rustix::termios::tcsetattr(&tty, OptionalActions::Now, &quiet).map_err(io::Error::from)?;
     tty.write_all(prompt.as_bytes())?;
     tty.flush()?;
-    rustix::termios::tcsetattr(&tty, OptionalActions::Now, &quiet).map_err(io::Error::from)?;
     blocking(Some(&restore), move || {
         let line = read_line(&mut tty);
         let _ = rustix::termios::tcsetattr(&tty, OptionalActions::Now, &saved);

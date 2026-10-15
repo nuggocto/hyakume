@@ -1514,3 +1514,14 @@ and its service-level twin plant a spool in a folder nothing can be
 deleted from and follow it through start, a failed deletion, the charge,
 and the retry. Each test fails without its fix. The restart test, with the
 check removed, stops on the same "saved offer" error the review reported.
+
+**Two races CI found after these fixes.** Neither came from them.
+`terminal::secret` printed its prompt and only then turned echo off.
+Anything typed or pasted the moment "Passphrase again:" appeared could be
+echoed before the terminal changed mode, and the CI runner caught the
+passphrase on screen that way. Echo now goes off first, and the prompt
+follows. The `Restore` guard is already in place, so a failed write still
+turns echo back on. The place test for a stalled client unwrapped each
+retry's hello, but a refused client gets a busy reply and a socket closed
+without reading, so the write can fail with a broken pipe. That failure
+now counts as one more refusal.
