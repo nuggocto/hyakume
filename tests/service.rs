@@ -1436,12 +1436,13 @@ fn a_client_that_stops_reading_gives_its_place_back() {
         })
         .collect();
 
-    // The flooding client is dropped, so a new one gets its place.
+    // The flooding client is dropped, so a new one gets its place. Until
+    // then each attempt is refused: the service replies busy and closes
+    // without reading, so the hello may meet a closed socket.
     let start = Instant::now();
     loop {
         let mut s = raw(&a);
-        s.write_all(&hello).unwrap();
-        if read_reply(&mut s).is_some_and(|r| r["type"] == "hello") {
+        if s.write_all(&hello).is_ok() && read_reply(&mut s).is_some_and(|r| r["type"] == "hello") {
             break;
         }
         assert!(
