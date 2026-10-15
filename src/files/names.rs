@@ -98,6 +98,14 @@ pub fn spool_name(transfer: TransferId) -> String {
     format!("{}.spool", super::hex(transfer.as_bytes()))
 }
 
+/// The transfer whose spool has exactly this name, if any.
+pub fn spool_transfer(name: &[u8]) -> Option<TransferId> {
+    let hex = name.strip_suffix(b".spool")?;
+    let bytes = data_encoding::HEXLOWER.decode(hex).ok()?;
+    let transfer = TransferId::from_bytes(bytes.try_into().ok()?);
+    (spool_name(transfer).as_bytes() == name).then_some(transfer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

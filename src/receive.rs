@@ -558,7 +558,8 @@ impl Receiver {
                 let reason = match e {
                     OfferError::ItemTooLarge
                     | OfferError::TotalTooLarge
-                    | OfferError::TooManyItems => RejectReason::TooLarge,
+                    | OfferError::TooManyItems
+                    | OfferError::MetadataTooLarge => RejectReason::TooLarge,
                     _ => RejectReason::Malformed,
                 };
                 return vec![Output::Send(reject(id, reason))];

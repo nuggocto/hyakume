@@ -160,6 +160,15 @@ one purpose is valid for another.
   (`claims_made_at_once_never_get_more_guesses_than_attempts_left`). An
   invitation takes at most 8 claims and lives 15 minutes;
   expiry counts only forward clock movement.
+- A permanent invitation allows one comparison of words. The first claim
+  to prove the secret takes it. A later claim that also proves it is
+  refused before the inviting side's person sees any words, and its device
+  gets `Error(InvitationUnavailable)`
+  (`a_permanent_invitation_allows_one_comparison_of_words`, loopback
+  `two_devices_joining_with_one_invitation_get_one_comparison_of_words`).
+  The refused device has already asked its own person by then, because the
+  joining side asks as soon as its exchange ends. That answer can change
+  nothing: the inviting side never compares those words.
 - Invitation tokens carry 256-bit secrets. Short human codes come with LAN
   pairing and use the same exchange.
 

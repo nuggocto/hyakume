@@ -76,6 +76,8 @@ pub enum ClaimRefusal {
     Declined,
     /// Another claim used the invitation first.
     OtherClaimUsed,
+    /// Another claim of a permanent invitation was already comparing words.
+    OtherClaimComparing,
     /// The invitation closed before this claim finished.
     Closed,
 }
@@ -102,6 +104,8 @@ pub enum InvitationError {
     UnknownClaim,
     #[error("that claim is not waiting for this step")]
     WrongClaimState,
+    #[error("another device is already comparing words for this invitation")]
+    ComparisonTaken,
     #[error("that step does not apply to this kind of invitation")]
     WrongKind,
 }
@@ -255,7 +259,11 @@ impl Invitation {
         Ok(())
     }
 
-    /// Records that a claim's exchange proved the secret.
+    /// Records that a claim's exchange proved the secret. A permanent
+    /// invitation allows one comparison of words, so the first claim to
+    /// prove the secret takes it, and any later one is refused here,
+    /// before anyone is shown its words. A temporary invitation lets every
+    /// claim verify; the sender approves one of them.
     pub fn claim_verified(
         &mut self,
         now: Moment,
@@ -263,9 +271,18 @@ impl Invitation {
         verifier: Verifier,
     ) -> Result<(), InvitationError> {
         self.require_open(now)?;
+        let comparing = self.kind == InvitationKind::Permanent
+            && self
+                .claims
+                .iter()
+                .any(|c| matches!(c.state, ClaimState::Verified(_)));
         let c = self.claim_mut(claim)?;
         if c.state != ClaimState::Exchanging {
             return Err(InvitationError::WrongClaimState);
+        }
+        if comparing {
+            c.state = ClaimState::Refused(ClaimRefusal::OtherClaimComparing);
+            return Err(InvitationError::ComparisonTaken);
         }
         c.state = ClaimState::Verified(verifier);
         Ok(())
@@ -670,17 +687,43 @@ mod tests {
     }
 
     #[test]
+    fn a_permanent_invitation_allows_one_comparison_of_words() {
+        let mut inv = invitation(InvitationKind::Permanent);
+        inv.open_claim(at(1), claim(1)).unwrap();
+        inv.open_claim(at(1), claim(2)).unwrap();
+        inv.claim_verified(at(1), claim(1), Verifier::from_bytes([1; 4]))
+            .unwrap();
+        // The second claim proved the secret too, but nobody sees its words.
+        assert_eq!(
+            inv.claim_verified(at(1), claim(2), Verifier::from_bytes([2; 4])),
+            Err(InvitationError::ComparisonTaken)
+        );
+        assert_eq!(
+            inv.claim_state(claim(2)),
+            Some(ClaimState::Refused(ClaimRefusal::OtherClaimComparing))
+        );
+        assert_eq!(
+            inv.confirm_permanent(at(2), claim(2)),
+            Err(InvitationError::WrongClaimState)
+        );
+        assert_eq!(
+            inv.claim_state(claim(1)),
+            Some(ClaimState::Verified(Verifier::from_bytes([1; 4])))
+        );
+    }
+
+    #[test]
     fn a_permanent_invitation_is_used_once_and_refuses_other_claims() {
         let mut inv = invitation(InvitationKind::Permanent);
         verified(&mut inv, 1);
-        verified(&mut inv, 2);
+        inv.open_claim(at(1), claim(2)).unwrap();
         assert!(inv.confirm_permanent(at(2), claim(1)).is_ok());
         assert_eq!(
             inv.claim_state(claim(2)),
             Some(ClaimState::Refused(ClaimRefusal::OtherClaimUsed))
         );
         assert_eq!(
-            inv.confirm_permanent(at(2), claim(2)),
+            inv.claim_verified(at(2), claim(2), Verifier::from_bytes([2; 4])),
             Err(InvitationError::Consumed)
         );
         assert_eq!(

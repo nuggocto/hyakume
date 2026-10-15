@@ -8,13 +8,17 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::files::destination::{Destination, DestinationError, remove_owned};
-use crate::files::names::partial_name;
+use rustix::fs::AtFlags;
+use rustix::io::Errno;
+
+use crate::files::destination::{Destination, DestinationError};
+use crate::files::names::{partial_name, spool_transfer};
 use crate::files::source::reopen_spool;
+use crate::files::{FileIdentity, owned_regular};
 use crate::ids::TransferId;
-use crate::limits::CLEANUP_WINDOW;
-use crate::state::{State, StateError};
-use crate::storage::{FileKind, FileState, OwnedFile};
+use crate::limits::{CLEANUP_WINDOW, MAX_SPOOL_BYTES};
+use crate::state::{Place, State, StateError};
+use crate::storage::{FileKind, FileState, NewFile, OwnedFile};
 use crate::transfer::{FailCause, ItemEvent, OfferState, Transfer};
 
 /// What recovery found.
@@ -26,7 +30,14 @@ pub struct Recovered {
     pub interrupted: usize,
     pub revoked: usize,
     pub expired: usize,
+    /// Spools no row recorded, now in the ledger for cleanup to delete.
     pub orphans: usize,
+    /// Entries in the spool folder that are not spools Hyakume makes.
+    /// They are left alone.
+    pub strays: usize,
+    /// The spool folder could not be read in full, so a spool may still
+    /// be there unrecorded until a later start finds it.
+    pub spool_unread: bool,
 }
 
 /// Settles unfinished work after a restart, from the evidence on disk.
@@ -100,7 +111,7 @@ pub fn recover(state: &mut State, spool_dir: &Path, now_ms: u64) -> Result<Recov
         }
     }
 
-    found.orphans = remove_orphan_spools(state, spool_dir)?;
+    record_orphan_spools(state, spool_dir, now_ms, &mut found)?;
     state.store().retry_retained(now_ms)?;
     Ok(found)
 }
@@ -162,9 +173,17 @@ fn spool_evidence(row: Option<&OwnedFile>) -> Evidence {
     }
 }
 
-/// Deletes files in the spool directory that no row records: spools of
-/// input that never finished. The spool directory is private to Hyakume.
-fn remove_orphan_spools(state: &mut State, spool_dir: &Path) -> Result<usize, StateError> {
+/// Records each spool no row records, left by input that never finished,
+/// as a file to delete. Cleanup then deletes it like any other owned file:
+/// its bytes stay charged until it is gone, and a deletion that fails is
+/// retried. Recovery itself deletes nothing here, so a deletion that fails
+/// cannot leave a file the ledger does not know.
+fn record_orphan_spools(
+    state: &mut State,
+    spool_dir: &Path,
+    now_ms: u64,
+    found: &mut Recovered,
+) -> Result<(), StateError> {
     let known: Vec<Vec<u8>> = state
         .store()
         .files()?
@@ -172,23 +191,78 @@ fn remove_orphan_spools(state: &mut State, spool_dir: &Path) -> Result<usize, St
         .filter(|f| f.kind == FileKind::Spool)
         .map(|f| f.name)
         .collect();
-    let (Ok(entries), Ok(dir)) = (std::fs::read_dir(spool_dir), std::fs::File::open(spool_dir))
-    else {
-        tracing::warn!("cannot read the spool directory");
-        return Ok(0);
+    let opened = std::fs::File::open(spool_dir).and_then(|dir| {
+        let st = rustix::fs::fstat(&dir)?;
+        Ok((dir, st, std::fs::read_dir(spool_dir)?))
+    });
+    let (dir, st, entries) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the spool folder");
+            found.spool_unread = true;
+            return Ok(());
+        }
     };
-    let mut removed = 0;
-    for entry in entries.flatten() {
+    let id = FileIdentity::of(&st);
+    let place = Place {
+        dir: spool_dir.as_os_str().as_bytes().to_vec(),
+        dev: id.dev,
+        ino: id.ino,
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the spool folder to its end");
+                found.spool_unread = true;
+                break;
+            }
+        };
         let name = entry.file_name();
         let name = name.as_bytes();
         if known.iter().any(|k| k == name) {
             continue;
         }
-        if remove_owned(&dir, name, None).is_ok() {
-            removed += 1;
-        }
+        let Some(transfer) = spool_transfer(name) else {
+            found.strays += 1;
+            continue;
+        };
+        let (identity, bytes) = match rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if owned_regular(&st) => {
+                let id = FileIdentity::of(&st);
+                (Some(id.key()), id.size)
+            }
+            Ok(_) => {
+                found.strays += 1;
+                continue;
+            }
+            Err(Errno::NOENT) => continue,
+            // Its size cannot be read, so it is charged the most a spool
+            // can hold.
+            Err(_) => (None, MAX_SPOOL_BYTES),
+        };
+        state.store().add_file_to_delete(
+            &NewFile {
+                kind: FileKind::Spool,
+                transfer,
+                item: 0,
+                dir: &place,
+                name,
+                identity,
+                bytes,
+            },
+            now_ms,
+        )?;
+        found.orphans += 1;
     }
-    Ok(removed)
+    if found.strays > 0 {
+        tracing::warn!(
+            strays = found.strays,
+            "the spool folder holds entries Hyakume did not make; they stay"
+        );
+    }
+    Ok(())
 }
 
 /// Deletes one file Hyakume owns, if it is still the file recorded. A
@@ -363,6 +437,54 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(found.expired, 1);
         assert_eq!(items(&state, &id), [ItemState::Expired]);
+    }
+
+    #[test]
+    fn an_orphan_spool_that_cannot_be_deleted_stays_charged_until_a_retry_deletes_it() {
+        use rand_core::{OsRng, RngCore};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "hyakume-orphans-{}-{:x}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let orphan = dir.join(crate::files::names::spool_name(TransferId::from_bytes(
+            [7; 16],
+        )));
+        std::fs::write(&orphan, [1; 300]).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"not a spool").unwrap();
+        // Nothing can be removed from the folder.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let mut state = State::in_memory().unwrap();
+        let now = state.now_ms();
+        let found = recover(&mut state, &dir, now).unwrap();
+        let due = state.store().files_due(now).unwrap();
+        let first = delete_owned(&due[0]);
+        let failed = first.is_err();
+        record_deletion(&mut state, &due[0], first, now).unwrap();
+        let charged_after_failure = state.store().charged().unwrap();
+        let retry_at = state.store().files().unwrap()[0].next_attempt_ms;
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let later = retry_at.unwrap();
+        let due_later = state.store().files_due(later).unwrap();
+        let second = delete_owned(&due_later[0]);
+        record_deletion(&mut state, &due_later[0], second, later).unwrap();
+        let orphan_left = orphan.exists();
+        let stray_left = dir.join("notes.txt").exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!((found.orphans, found.strays), (1, 1));
+        assert_eq!(due.len(), 1);
+        assert!(failed);
+        assert_eq!(charged_after_failure, (300, 0));
+        assert!(retry_at.is_some_and(|t| t > now));
+        assert!(!orphan_left);
+        assert!(stray_left);
+        assert_eq!(state.store().charged().unwrap(), (0, 0));
+        assert!(state.store().files().unwrap().is_empty());
     }
 
     fn file(attempts: u32, since: u64) -> OwnedFile {

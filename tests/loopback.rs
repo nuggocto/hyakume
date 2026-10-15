@@ -611,6 +611,80 @@ async fn a_used_invitation_cannot_pair_another_device() {
     assert!(c.node.trusted().is_empty());
 }
 
+/// Joins with `token` and reports which device joined and how it ended.
+async fn join_and_report(
+    node: &Node,
+    token: &str,
+    done: mpsc::Sender<(DeviceId, Result<DeviceId, NodeError>)>,
+) {
+    let result = node.join(token, "a").await;
+    done.send((node.device(), result)).await.unwrap();
+}
+
+#[tokio::test]
+async fn two_devices_joining_with_one_invitation_get_one_comparison_of_words() {
+    let mut a = peer("alpha").await;
+    let Peer {
+        node: b,
+        prompts: mut b_prompts,
+        inbox: _b_inbox,
+    } = peer("beta").await;
+    let Peer {
+        node: c,
+        prompts: mut c_prompts,
+        inbox: _c_inbox,
+    } = peer("gamma").await;
+    let token = a.node.invite("friend").unwrap().1;
+    let (done, mut ended) = mpsc::channel(2);
+
+    let ((), (), (winner, loser)) = timeout(DEADLINE, async {
+        tokio::join!(
+            join_and_report(&b, &token, done.clone()),
+            join_and_report(&c, &token, done),
+            async {
+                // The first claim to prove the secret is shown its words, and
+                // that answer waits while the other claim finishes.
+                let (winner, held) = match a.prompts.recv().await.unwrap() {
+                    Prompt::Verify { peer, answer, .. } => (peer, answer),
+                    Prompt::Offer { .. } => panic!("expected a verifier prompt"),
+                };
+                let (loser_prompts, winner_prompts) = if winner == b.device() {
+                    (&mut c_prompts, &mut b_prompts)
+                } else {
+                    (&mut b_prompts, &mut c_prompts)
+                };
+                answer_verify(loser_prompts, false).await;
+                let (loser, refused) = tokio::select! {
+                    ended = ended.recv() => ended.unwrap(),
+                    _ = a.prompts.recv() => panic!("the inviting side compared words twice"),
+                };
+                assert_ne!(loser, winner);
+                assert_eq!(
+                    refused.err(),
+                    Some(NodeError::Peer(ErrorCode::InvitationUnavailable))
+                );
+                // The inviting side never compared a second set of words.
+                assert!(a.prompts.try_recv().is_err());
+
+                held.send(true).unwrap();
+                answer_verify(winner_prompts, true).await;
+                let (joined, paired) = ended.recv().await.unwrap();
+                assert_eq!((joined, paired.unwrap()), (winner, a.node.device()));
+                (winner, loser)
+            }
+        )
+    })
+    .await
+    .unwrap();
+
+    a.node
+        .wait_until(DEADLINE, |s| s.trust().authorize(&winner).is_ok())
+        .await
+        .unwrap();
+    assert_eq!(a.node.trusted(), [winner]);
+    assert_ne!(loser, winner);
+}
+
 #[tokio::test]
 async fn an_unanswered_verifier_times_out_without_trust() {
     let short = Limits {

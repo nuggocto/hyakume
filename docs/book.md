@@ -1426,3 +1426,91 @@ rewrites it in the database with an escape sequence and a newline, and
 expects loading to refuse it. `one_folder_for_state_and_socket_is_locked_once`
 gives the same folder by two paths and expects one lock that still keeps a
 second service out. Both fail without their fix.
+
+## 22. Three fixes from the eleventh review
+
+The review found one theme behind all three defects. Each component
+passed its own tests, but two components disagreed on the rule between
+them.
+
+**An offer that validates can be sent and loaded again.** `Offer::validate`
+checked each name, the item count, and the sizes. The 64 KiB limit on the
+whole offer lived only in the wire encoder. A batch of 256 files with
+255-byte names passes every per-item check and still encodes to 76,568
+bytes. The sender recorded that offer, the encoder refused it, and at the
+next start loading ran the offer through the decoder, which refused it as
+well. The service stopped with "the state database is damaged: saved offer"
+before its socket opened, so `reset` could not reach it either.
+
+```diagram
+before                                   after
+validate ─ok─▶ record ─▶ encode ✗        validate ─✗ MetadataTooLarge (nothing recorded)
+                 │
+restart ─▶ decode saved offer ✗
+```
+
+`protocol::offer_payload_len` measures the payload with the same writer the
+encoder uses, so the size rule exists in one place. `validate` checks it
+after the per-item checks, so one bad name still gets its own error. The
+receiver never sees the new error, because its decoder refuses oversized
+offers first, but it maps it to `TooLarge` anyway. The encoder keeps its
+own check: it is the last line before bytes leave.
+
+**A spool found at start goes through the ledger.** Recovery deleted
+spools that no row recorded and ignored the result. When the deletion
+failed, the file stayed on disk with no row, no charge, and no retry, and
+only another restart could find it. Recovery now deletes nothing itself.
+It records each such spool as a file to delete, with its inode and size,
+and the cleanup pass that runs right after start deletes it, retrying on
+the usual schedule. Its bytes stay charged until it is gone.
+
+```diagram
+recover ─▶ unknown <transfer>.spool ─▶ ledger row (delete, charged)
+                                            │
+maintain (first tick at start) ─▶ delete ─ok─▶ row removed, bytes freed
+                                     └─✗─▶ retry in 10 s, 40 s, … up to 24 h
+```
+
+This puts orphans on the same path as every other owned file. Recovery
+already only marked unneeded ledger files for deletion and left the
+deleting to maintenance. Only a name Hyakume gives a spool, on a regular
+file of this user, gets a row. Anything else in the folder is left alone
+and counted in `Recovered::strays`, because the ledger cannot name it and
+Hyakume did not create it. A folder that cannot be read in full sets
+`Recovered::spool_unread` and logs the error instead of returning zero.
+
+**A permanent invitation allows one comparison.** The 32-bit verifier is
+enough because each invitation gets one comparison of words.
+`claim_verified` let every claim that proved the secret reach that step,
+so two devices joining with one invitation each showed the inviting person
+a set of words. Now the first permanent claim to verify takes the
+comparison, and a later one is refused in the same state change, before
+any prompt. Its device gets `InvitationUnavailable`. Temporary invitations
+keep their rule: every claim may verify, and the sender approves one.
+
+```diagram
+claim A verifies ─▶ Verified(words) ─▶ prompt ─▶ confirm_permanent
+claim B verifies ─▶ A is Verified? yes ─▶ Refused(OtherClaimComparing), no prompt
+```
+
+The refused device still asks its own person, because a joining device
+asks as soon as its exchange ends. Its answer cannot change anything.
+Telling the joiner first would need a new message, so that waits for the
+pairing work.
+
+The old permanent-invitation test verified two claims before using one, so
+it assumed the defect. It now leaves the second claim exchanging. A new
+unit test checks the refusal itself, and a loopback test drives two real
+joins with one invitation and fails at once if the inviting side is asked
+twice.
+
+`every_offer_that_validates_can_be_sent` grows a batch of longest names
+until validation refuses it, then checks that the refusal is the metadata
+limit and that the last accepted batch encodes as a frame.
+`a_batch_too_large_for_one_offer_is_refused_and_the_service_still_restarts`
+sends the review's batch through the CLI and restarts the service.
+`an_orphan_spool_that_cannot_be_deleted_stays_charged_until_a_retry_deletes_it`
+and its service-level twin plant a spool in a folder nothing can be
+deleted from and follow it through start, a failed deletion, the charge,
+and the retry. Each test fails without its fix. The restart test, with the
+check removed, stops on the same "saved offer" error the review reported.

@@ -293,7 +293,8 @@ file keeps mode 0600 from its partial.
 | | otherwise | failed: lost |
 | peer revoked or re-paired | — | cancelled: revoked |
 | resume window over, clock behind, or time stopped unmeasurable | — | expired |
-| a spool file no row records | — | deleted (input that never finished) |
+| a spool file no row records | named `<transfer>.spool`, a regular file of this user | recorded for deletion, charged until cleanup deletes it (input that never finished) |
+| | anything else in the spool folder | left alone, counted, and logged |
 | transfer ended but not given its finish order | — | given the next one |
 
 An identical file that was already under the output name proves nothing,
@@ -316,6 +317,13 @@ inode, size, and times are recorded before the offer exists. While sending,
 the bytes are hashed again; a different digest or a changed identity fails
 the item as `source-changed` and cancels the rest. Different bytes are
 never sent under the same transfer.
+
+One offer carries at most 256 items, and its names, sizes, and digests
+together take at most 64 KiB on the wire. `Offer::validate` checks both
+before anything is recorded. 256 files with 255-byte names pass every
+per-item check and still come to 76,568 bytes, so `send` refuses them and
+asks for fewer files at once. Before this check the sender saved such an
+offer, failed to send it, and then refused its own record at the next start.
 
 **Standard input, text, and links** go through one spool pipeline, so every
 item is read from a file:
@@ -348,7 +356,8 @@ the service owns (`Service::own`), so a client that leaves then cannot
 leave a sealed spool behind without a row. If the row cannot be written,
 the sealed spool is deleted at once and the failed write stops new work, as
 any failed durable write does; if it cannot be deleted either, its bytes
-stay counted until the next start removes it. A spool no transfer took,
+stay counted until the next start, which records the spool for cleanup to
+delete. A spool no transfer took,
 because the send could not start, is marked for deletion.
 
 Spool bytes are counted in memory while input arrives and in the ledger
@@ -634,6 +643,8 @@ start recovers. A worker that panics still stops the process.
 | The reply to `stop` | `the_stop_command_is_always_told_the_service_stopped` |
 | Transfers that ended just before a crash | `storage::tests::transfers_that_ended_just_before_a_crash_still_make_room_after_it` |
 | Unfinished input whose spool cannot be deleted | `unfinished_input_that_cannot_be_deleted_stays_charged_until_cleanup_deletes_it`, `source::tests::a_spool_that_cannot_be_deleted_says_what_is_left` |
+| A spool found at start with no row, in a folder nothing can be deleted from | `a_spool_found_at_start_that_cannot_be_deleted_stays_charged_until_cleanup_deletes_it`, `recovery::tests::an_orphan_spool_that_cannot_be_deleted_stays_charged_until_a_retry_deletes_it` |
+| A batch whose names pass the offer's metadata limit | `a_batch_too_large_for_one_offer_is_refused_and_the_service_still_restarts`, `offer::tests::every_offer_that_validates_can_be_sent` |
 | A ledger row naming a path outside its folder | `storage::tests::a_file_row_whose_name_could_leave_its_folder_is_refused`, `destination::tests::removal_never_reaches_outside_its_folder` |
 | Questions the node gave up on, and one nobody took | `service::tests::questions_the_node_stopped_waiting_for_hold_no_place`, `a_question_dropped_without_an_answer_is_refused_as_busy_not_declined` |
 | A transfer started after the wall clock went back | `receive::tests::work_received_after_the_wall_clock_went_back_keeps_its_whole_window` |

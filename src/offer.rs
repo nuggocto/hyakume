@@ -2,14 +2,17 @@
 //! accepts one only when every limit holds, and sizes are always exact, so
 //! the receiver can decide and reserve space up front. Each item carries the
 //! digest checked before publication, and acceptance names the digest of
-//! the whole offer seen.
+//! the whole offer seen. An offer that validates also fits the wire's
+//! metadata limit, so the sender never records an offer it cannot send or
+//! load again.
 
 use crate::display::PeerText;
 use crate::ids::TransferId;
 use crate::limits::{
-    MAX_BATCH_BYTES, MAX_BATCH_ITEMS, MAX_FILE_BYTES, MAX_PEER_NAME_BYTES, MAX_PREVIEW_BYTES,
-    MAX_TEXT_BYTES, MAX_URL_BYTES,
+    MAX_BATCH_BYTES, MAX_BATCH_ITEMS, MAX_FILE_BYTES, MAX_OFFER_METADATA_BYTES,
+    MAX_PEER_NAME_BYTES, MAX_PREVIEW_BYTES, MAX_TEXT_BYTES, MAX_URL_BYTES,
 };
+use crate::protocol;
 
 const CTX_OFFER_DIGEST: &str = "hyakume v1 offer digest";
 
@@ -81,6 +84,8 @@ pub enum OfferError {
     MissingName,
     #[error("the preview is too long")]
     PreviewTooLong,
+    #[error("the item names together are too long for one offer; send fewer files at once")]
+    MetadataTooLarge,
 }
 
 /// A validated offer.
@@ -112,6 +117,8 @@ impl Offer {
         if kind != PayloadKind::Files && fields.items.len() != 1 {
             return Err(OfferError::NotSingle);
         }
+        // Checked last, so a single bad item still gets its own error.
+        let encoded = protocol::offer_payload_len(&fields);
         let mut total = 0u64;
         let mut items = Vec::with_capacity(fields.items.len());
         for (name, size, digest) in fields.items {
@@ -140,6 +147,9 @@ impl Offer {
         }
         let preview =
             PeerText::new(fields.preview, preview_limit).map_err(|_| OfferError::PreviewTooLong)?;
+        if encoded > MAX_OFFER_METADATA_BYTES {
+            return Err(OfferError::MetadataTooLarge);
+        }
         Ok(Self {
             transfer: fields.transfer,
             kind,
@@ -291,6 +301,25 @@ mod tests {
             ],
         );
         assert_eq!(Offer::validate(over), Err(OfferError::TotalTooLarge));
+    }
+
+    #[test]
+    fn every_offer_that_validates_can_be_sent() {
+        // Grow a batch of longest names until validation refuses it. The
+        // last batch accepted must fit in a frame, and the refusal must come
+        // from the metadata limit before the item limit is reached.
+        let name = vec![b'n'; MAX_PEER_NAME_BYTES];
+        let mut items = Vec::new();
+        let refused = loop {
+            items.push((name.clone(), 1));
+            if let Err(e) = Offer::validate(fields(PayloadKind::Files, items.clone())) {
+                break e;
+            }
+        };
+        assert_eq!(refused, OfferError::MetadataTooLarge);
+        items.pop();
+        let offer = Offer::validate(fields(PayloadKind::Files, items)).unwrap();
+        assert!(protocol::encode_frame(&protocol::Message::Offer(offer.fields())).is_ok());
     }
 
     #[test]

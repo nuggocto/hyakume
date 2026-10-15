@@ -264,6 +264,29 @@ pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, ProtocolError> {
     Ok(frame)
 }
 
+/// The length of `offer` encoded as a payload, which
+/// [`MAX_OFFER_METADATA_BYTES`] bounds. Offer validation checks it, so an
+/// offer that can be recorded can also be sent and loaded again.
+pub fn offer_payload_len(offer: &OfferFields) -> usize {
+    let mut w = Writer::default();
+    write_offer(&mut w, offer);
+    w.0.len()
+}
+
+fn write_offer(w: &mut Writer, o: &OfferFields) {
+    w.u8(tag::OFFER);
+    w.bytes(o.transfer.as_bytes());
+    w.u8(o.kind);
+    // Callers build offers from validated values, so the count fits.
+    w.u16(o.items.len() as u16);
+    for (name, size, digest) in &o.items {
+        w.var(name);
+        w.u64(*size);
+        w.bytes(digest);
+    }
+    w.var(&o.preview);
+}
+
 pub fn encode_payload(msg: &Message) -> Vec<u8> {
     let mut w = Writer::default();
     match msg {
@@ -325,19 +348,7 @@ pub fn encode_payload(msg: &Message) -> Vec<u8> {
             w.bytes(&p.device);
             w.bytes(&p.sig);
         }
-        Message::Offer(o) => {
-            w.u8(tag::OFFER);
-            w.bytes(o.transfer.as_bytes());
-            w.u8(o.kind);
-            // Callers build offers from validated values, so the count fits.
-            w.u16(o.items.len() as u16);
-            for (name, size, digest) in &o.items {
-                w.var(name);
-                w.u64(*size);
-                w.bytes(digest);
-            }
-            w.var(&o.preview);
-        }
+        Message::Offer(o) => write_offer(&mut w, o),
         Message::OfferAccept {
             transfer,
             offer_digest,

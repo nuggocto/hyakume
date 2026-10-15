@@ -41,7 +41,7 @@ impl FileIdentity {
 
 /// Whether `st` is a regular file owned by this user.
 #[allow(clippy::unnecessary_cast)]
-fn owned_regular(st: &Stat) -> bool {
+pub(crate) fn owned_regular(st: &Stat) -> bool {
     rustix::fs::FileType::from_raw_mode(st.st_mode as _) == rustix::fs::FileType::RegularFile
         && st.st_uid as u32 == rustix::process::geteuid().as_raw()
 }

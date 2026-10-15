@@ -1116,6 +1116,36 @@ fn unfinished_input_that_cannot_be_deleted_stays_charged_until_cleanup_deletes_i
 }
 
 #[test]
+fn a_spool_found_at_start_that_cannot_be_deleted_stays_charged_until_cleanup_deletes_it() {
+    let home = Home::new();
+    let mut a = started(&home, "alpha", Path::new(BIN));
+    a.stop();
+    // Input that never finished before a crash: a spool no row records.
+    let spool = a.state.join("spool");
+    let orphan = spool.join(format!("{}.spool", "ab".repeat(16)));
+    std::fs::write(&orphan, vec![7u8; 2048]).unwrap();
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    a.start_with(&[("HYAKUME_LOG", "warn")], &[]);
+    let status = a.wait_status(|s| s["spool_bytes"] == 2048);
+    let start = Instant::now();
+    while !a
+        .log_text()
+        .contains("could not delete a file Hyakume owns")
+    {
+        assert!(start.elapsed() < DEADLINE, "cleanup never tried the spool");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(orphan.exists(), "{status}");
+
+    // A later cleanup pass deletes it, and only then frees its bytes.
+    a.wait_status(|s| s["spool_bytes"] == 0);
+    assert!(!orphan.exists());
+    a.stop();
+}
+
+#[test]
 fn a_state_folder_under_a_linked_ancestor_still_cleans_up_its_spools() {
     let home = Home::new();
     let real = home.folder("real");
@@ -1171,6 +1201,40 @@ fn a_sealed_spool_the_ledger_cannot_record_is_deleted_at_once() {
     assert_eq!(status["spool_bytes"], 0);
     // The failed write is visible, and new work waits for a restart.
     assert_eq!(status["store_failed"], true, "{status}");
+    p.a.stop();
+    p.b.stop();
+}
+
+#[test]
+fn a_batch_too_large_for_one_offer_is_refused_and_the_service_still_restarts() {
+    let mut p = pair();
+    let outbox = p.home.folder("outbox");
+    // 256 files with distinct 255-byte names: each name is valid, but
+    // together they pass the offer's metadata limit.
+    let paths: Vec<String> = (0..256)
+        .map(|n| {
+            let path = outbox.join(format!("{n:03}{}", "n".repeat(252)));
+            std::fs::write(&path, b"x").unwrap();
+            path.to_str().unwrap().to_owned()
+        })
+        .collect();
+    let route = p.b.route();
+    let mut args = vec!["send", "beta", "--at", route.as_str()];
+    args.extend(paths.iter().map(String::as_str));
+    let out = p.a.run(&args, b"");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("too long for one offer"),
+        "{}",
+        text(&out)
+    );
+
+    // Nothing was recorded, so the next start loads the state as before.
+    p.a.stop();
+    p.a.start();
+    let status = p.a.json(&["status"]);
+    assert_eq!(status["unfinished"], 0, "{status}");
+    assert_eq!(status["trusted"], 1, "{status}");
     p.a.stop();
     p.b.stop();
 }
