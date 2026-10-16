@@ -15,6 +15,11 @@ pub enum ItemState {
     Verifying,
     Paused,
     Resuming,
+    /// May already be under its final name, but the disk has not shown it:
+    /// the folder sync failed, or the folder could not be read at startup.
+    /// Deleting its record could orphan a published file, so a stop is only
+    /// kept here, and applies if [`Transfer::found_on_disk`] finds no rename.
+    Unconfirmed(Option<Stop>),
     Published,
     Rejected,
     Cancelled(CancelCause),
@@ -33,6 +38,32 @@ impl ItemState {
     /// Whether the item is moving or verifying bytes right now.
     fn is_active(self) -> bool {
         matches!(self, Self::Transferring | Self::Verifying | Self::Resuming)
+    }
+
+    pub fn is_unconfirmed(self) -> bool {
+        matches!(self, Self::Unconfirmed(_))
+    }
+
+    /// Whether a cancel, failure, pause, or expiry of the whole transfer may
+    /// change this item. An unconfirmed rename may not: only the disk can.
+    fn stoppable(self) -> bool {
+        !self.is_terminal() && !self.is_unconfirmed()
+    }
+}
+
+/// How a cancel, revocation, or expiry would have ended an unconfirmed item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    Cancelled(CancelCause),
+    Expired,
+}
+
+impl Stop {
+    fn state(self) -> ItemState {
+        match self {
+            Self::Cancelled(cause) => ItemState::Cancelled(cause),
+            Self::Expired => ItemState::Expired,
+        }
     }
 }
 
@@ -157,6 +188,8 @@ impl ItemState {
             Self::Verifying => "verifying".into(),
             Self::Paused => "paused".into(),
             Self::Resuming => "resuming".into(),
+            Self::Unconfirmed(None) => "unconfirmed".into(),
+            Self::Unconfirmed(Some(stop)) => format!("unconfirmed:{}", stop.state().name()),
             Self::Published => "published".into(),
             Self::Rejected => "rejected".into(),
             Self::Cancelled(c) => format!("cancelled:{}", c.name()),
@@ -167,6 +200,14 @@ impl ItemState {
 
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name.split_once(':') {
+            // Only the two kept stops follow, matched directly: recursing
+            // on the rest would let a damaged row nest deep enough to
+            // overflow the stack instead of failing to load.
+            Some(("unconfirmed", then)) => Self::Unconfirmed(Some(match then.split_once(':') {
+                Some(("cancelled", c)) => Stop::Cancelled(CancelCause::from_name(c)?),
+                None if then == "expired" => Stop::Expired,
+                _ => return None,
+            })),
             Some(("cancelled", c)) => Self::Cancelled(CancelCause::from_name(c)?),
             Some(("failed", c)) => Self::Failed(FailCause::from_name(c)?),
             Some(_) => return None,
@@ -176,6 +217,7 @@ impl ItemState {
                 "verifying" => Self::Verifying,
                 "paused" => Self::Paused,
                 "resuming" => Self::Resuming,
+                "unconfirmed" => Self::Unconfirmed(None),
                 "published" => Self::Published,
                 "rejected" => Self::Rejected,
                 "expired" => Self::Expired,
@@ -456,7 +498,7 @@ impl Transfer {
             OfferState::Offered => self.reject(RejectCause::Interrupted),
             OfferState::Accepted => {
                 for state in &mut self.items {
-                    if !state.is_terminal() {
+                    if state.stoppable() {
                         *state = ItemState::Failed(cause);
                     }
                 }
@@ -466,25 +508,22 @@ impl Transfer {
     }
 
     /// Applies revocation: an unanswered offer is rejected, and every
-    /// unfinished item is cancelled. Published items stay published.
+    /// unfinished item is cancelled. Published items stay published, and so
+    /// does an unconfirmed one if the disk later shows the rename: it was
+    /// renamed before trust changed.
     pub fn revoke(&mut self) {
         match self.offer_state {
             OfferState::Offered => self.reject(RejectCause::Revoked),
-            OfferState::Accepted => {
-                for state in &mut self.items {
-                    if !state.is_terminal() {
-                        *state = ItemState::Cancelled(CancelCause::Revoked);
-                    }
-                }
-            }
+            OfferState::Accepted => self.stop_all(Stop::Cancelled(CancelCause::Revoked)),
             OfferState::Rejected(_) => {}
         }
     }
 
-    /// Records an item found committed under its final name after a
-    /// restart, when the record of its publication was not saved. Only
-    /// startup recovery calls this, with the file's identity as evidence.
-    pub fn recovered_published(&mut self, item: usize) -> Result<(), TransitionError> {
+    /// Records what the disk shows for an item, judged by the file's inode:
+    /// published, unconfirmed, paused (partial still there), or lost. Paused
+    /// means no rename happened, so a stop the item kept applies instead.
+    /// Only the receiver's commit step and `recovery` may call it.
+    pub fn found_on_disk(&mut self, item: usize, found: ItemState) -> Result<(), TransitionError> {
         if self.offer_state != OfferState::Accepted {
             return Err(TransitionError::WrongOfferState(self.offer_state));
         }
@@ -492,13 +531,26 @@ impl Transfer {
             .items
             .get(item)
             .ok_or(TransitionError::NoSuchItem { item })?;
-        if from.is_terminal() {
+        let evidence = matches!(
+            found,
+            ItemState::Published
+                | ItemState::Unconfirmed(_)
+                | ItemState::Paused
+                | ItemState::Failed(FailCause::Lost)
+        );
+        if from.is_terminal() || !evidence {
             return Err(TransitionError::NotAllowed {
                 from,
                 event: ItemEvent::BytesComplete,
             });
         }
-        self.items[item] = ItemState::Published;
+        self.items[item] = match (from, found) {
+            (ItemState::Unconfirmed(then), ItemState::Unconfirmed(_)) => {
+                ItemState::Unconfirmed(then)
+            }
+            (ItemState::Unconfirmed(Some(stop)), ItemState::Paused) => stop.state(),
+            (_, found) => found,
+        };
         Ok(())
     }
 
@@ -510,7 +562,7 @@ impl Transfer {
             OfferState::Offered => self.reject(RejectCause::Interrupted),
             OfferState::Accepted => {
                 for state in &mut self.items {
-                    if !state.is_terminal() {
+                    if state.stoppable() {
                         *state = ItemState::Paused;
                     }
                 }
@@ -523,13 +575,7 @@ impl Transfer {
     pub fn expire_all(&mut self) {
         match self.offer_state {
             OfferState::Offered => self.reject(RejectCause::Interrupted),
-            OfferState::Accepted => {
-                for state in &mut self.items {
-                    if !state.is_terminal() {
-                        *state = ItemState::Expired;
-                    }
-                }
-            }
+            OfferState::Accepted => self.stop_all(Stop::Expired),
             OfferState::Rejected(_) => {}
         }
     }
@@ -542,14 +588,20 @@ impl Transfer {
                 CancelCause::Receiver => RejectCause::Receiver,
                 CancelCause::Sender | CancelCause::Shutdown => RejectCause::Withdrawn,
             }),
-            OfferState::Accepted => {
-                for state in &mut self.items {
-                    if !state.is_terminal() {
-                        *state = ItemState::Cancelled(cause);
-                    }
-                }
-            }
+            OfferState::Accepted => self.stop_all(Stop::Cancelled(cause)),
             OfferState::Rejected(_) => {}
+        }
+    }
+
+    /// Ends every stoppable item with `stop`. An unconfirmed item keeps the
+    /// first stop it meets, like a terminal state never changes.
+    fn stop_all(&mut self, stop: Stop) {
+        for state in &mut self.items {
+            match state {
+                ItemState::Unconfirmed(then @ None) => *then = Some(stop),
+                s if s.stoppable() => *s = stop.state(),
+                _ => {}
+            }
         }
     }
 
@@ -588,7 +640,8 @@ impl Transfer {
                 | ItemState::Transferring
                 | ItemState::Verifying
                 | ItemState::Paused
-                | ItemState::Resuming => {}
+                | ItemState::Resuming
+                | ItemState::Unconfirmed(_) => {}
             }
         }
         if published == self.items.len() {
@@ -608,14 +661,14 @@ impl Transfer {
 fn next(from: ItemState, event: ItemEvent) -> Option<ItemState> {
     use ItemEvent as E;
     use ItemState as S;
-    if from.is_terminal() {
+    // Only the disk settles an unconfirmed rename; see `found_on_disk`.
+    if from.is_terminal() || from.is_unconfirmed() {
         return None;
     }
     Some(match (from, event) {
         (S::Queued, E::Start) => S::Transferring,
         (S::Transferring, E::BytesComplete) => S::Verifying,
-        // A verified item pauses when its publication cannot be confirmed.
-        (S::Transferring | S::Resuming | S::Verifying, E::Pause) => S::Paused,
+        (S::Transferring | S::Resuming, E::Pause) => S::Paused,
         (S::Paused, E::Resume) => S::Resuming,
         (S::Resuming, E::Resumed) => S::Transferring,
         (S::Queued | S::Paused, E::Expire) => S::Expired,
@@ -663,7 +716,7 @@ mod tests {
             (S::Queued, E::Pause, None),
             (S::Transferring, E::BytesComplete, Some(S::Verifying)),
             (S::Transferring, E::Resume, None),
-            (S::Verifying, E::Pause, Some(S::Paused)),
+            (S::Verifying, E::Pause, None),
             (
                 S::Verifying,
                 E::Fail(FailCause::Digest),
@@ -677,9 +730,34 @@ mod tests {
             (S::Published, E::Cancel(CancelCause::Sender), None),
             (S::Cancelled(CancelCause::Sender), E::Start, None),
             (S::Failed(FailCause::Length), E::Resume, None),
+            (S::Unconfirmed(None), E::Cancel(CancelCause::Receiver), None),
+            (S::Unconfirmed(None), E::Expire, None),
+            (S::Unconfirmed(None), E::Fail(FailCause::Lost), None),
         ];
         for (from, event, to) in allowed {
             assert_eq!(next(from, event), to, "{from:?} + {event:?}");
+        }
+    }
+
+    #[test]
+    fn unconfirmed_names_round_trip_and_nesting_is_refused() {
+        let kept = [
+            ItemState::Unconfirmed(None),
+            ItemState::Unconfirmed(Some(Stop::Cancelled(CancelCause::Revoked))),
+            ItemState::Unconfirmed(Some(Stop::Expired)),
+        ];
+        for state in kept {
+            assert_eq!(ItemState::from_name(&state.name()), Some(state));
+        }
+        let deep = format!("{}expired", "unconfirmed:".repeat(1_000_000));
+        for bad in [
+            "unconfirmed:unconfirmed:expired",
+            "unconfirmed:published",
+            "unconfirmed:cancelled:nobody",
+            "unconfirmed:",
+            &deep,
+        ] {
+            assert_eq!(ItemState::from_name(bad), None, "{:.40}", bad);
         }
     }
 

@@ -39,6 +39,10 @@ enum TransferOp {
     Publish(usize),
     Resume(usize),
     Revoke,
+    /// The rename happened but its folder did not sync.
+    Unconfirm(usize),
+    /// Something ends or pauses the whole transfer.
+    Stop(u8),
 }
 
 fn item_event() -> impl Strategy<Value = ItemEvent> {
@@ -60,6 +64,8 @@ fn transfer_op() -> impl Strategy<Value = TransferOp> {
         3 => (0..4usize).prop_map(TransferOp::Publish),
         1 => (0..4usize).prop_map(TransferOp::Resume),
         1 => Just(TransferOp::Revoke),
+        1 => (0..4usize).prop_map(TransferOp::Unconfirm),
+        2 => (0..4u8).prop_map(TransferOp::Stop),
     ]
 }
 
@@ -67,8 +73,9 @@ proptest! {
     #![proptest_config(config())]
 
     /// No sequence produces a false `Completed`, a published item never
-    /// changes, nothing is published after revocation, and at most one item
-    /// is active.
+    /// changes, nothing is published after revocation, at most one item is
+    /// active, nothing but the disk ends an unconfirmed item, and the stop an
+    /// unconfirmed item keeps never changes.
     #[test]
     fn transfer_outcomes_never_disagree_with_item_states(
         items in 1..4usize,
@@ -81,6 +88,8 @@ proptest! {
             .unwrap();
         let mut t = Transfer::offered(TransferId::from_bytes([1; 16]), authority, items).unwrap();
         let mut published = vec![false; items];
+        let mut unconfirmed = vec![false; items];
+        let mut kept = vec![None; items];
         let mut revoked = false;
         for op in ops {
             let before: Vec<ItemState> = t.items().to_vec();
@@ -98,10 +107,29 @@ proptest! {
                     revoked = true;
                     t.revoke();
                 }
+                TransferOp::Unconfirm(i) => {
+                    let i = i % items;
+                    if t.found_on_disk(i, ItemState::Unconfirmed(None)).is_ok() {
+                        unconfirmed[i] = true;
+                    }
+                }
+                TransferOp::Stop(n) => match n {
+                    0 => t.cancel(CancelCause::Receiver),
+                    1 => t.fail_rest(FailCause::Connection),
+                    2 => t.pause_all(),
+                    _ => t.expire_all(),
+                },
             }
             for (i, state) in t.items().iter().enumerate() {
                 if published[i] {
                     prop_assert_eq!(*state, ItemState::Published);
+                }
+                if unconfirmed[i] {
+                    prop_assert!(state.is_unconfirmed(), "{state:?}");
+                }
+                if let ItemState::Unconfirmed(Some(stop)) = state {
+                    prop_assert!(kept[i].is_none_or(|k| k == *stop), "{state:?}");
+                    kept[i] = Some(*stop);
                 }
                 if *state == ItemState::Published && !published[i] {
                     prop_assert!(!revoked, "published after revocation");

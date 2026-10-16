@@ -361,7 +361,7 @@ impl Shared {
             .acquire_owned()
             .await
             .map_err(|_| NodeError::Stopping)?;
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = tasks::spawn_blocking(move || {
             let result = job();
             drop(permit);
             result

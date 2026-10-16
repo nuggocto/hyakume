@@ -813,20 +813,19 @@ fn reject(transfer: TransferId, reason: RejectReason) -> Message {
     Message::OfferReject { transfer, reason }
 }
 
-/// The rename happened but the folder could not be synced, so nobody can
-/// say whether the file survives a crash. The item pauses with its ledger
-/// row, which records the file's inode, and startup recovery decides it;
-/// the rest of the batch is cancelled. The sender hears that storage
-/// failed, never that the item was published.
+/// The rename happened but the folder sync failed, so the file may not
+/// survive a crash. The item becomes unconfirmed and keeps the ledger row
+/// with its inode, so a later disk check can settle it. The sender hears
+/// `storage-failed`, never `published`; the rest of the batch is cancelled.
 fn unconfirmed(a: Active, state: &mut State) -> Vec<Output> {
     let (id, item) = (a.offer.transfer(), a.item);
     state.update_transfer(&id, |t| {
-        let _ = t.apply(item, ItemEvent::Pause);
+        let _ = t.found_on_disk(item, ItemState::Unconfirmed(None));
         for rest in item + 1..t.items().len() {
             let _ = t.apply(rest, ItemEvent::Cancel(CancelCause::Receiver));
         }
     });
-    // The paused work outlives this session, so its place among the
+    // The unfinished work outlives this session, so its place among the
     // unfinished transfers goes to the state until the work ends.
     state.hold_paused_slot(id, a.slot);
     vec![
@@ -855,7 +854,7 @@ mod tests {
     use crate::identity::DeviceKey;
     use crate::limits::{Limits, Usage};
     use crate::storage::FileState;
-    use crate::transfer::{BatchOutcome, OfferState};
+    use crate::transfer::{BatchOutcome, OfferState, Stop};
     use crate::trust::{LocalAlias, VerifiedPeer};
     use zeroize::Zeroizing;
 
@@ -1204,33 +1203,30 @@ mod tests {
                 Output::End,
             ]
         );
-        // The item waits for recovery, keeping the ledger row that names
-        // its file; the item that never started is cancelled.
-        assert_eq!(
-            items(&f, 1),
-            [
-                ItemState::Paused,
-                ItemState::Cancelled(CancelCause::Receiver)
-            ]
-        );
-        let rows: Vec<FileState> = f
-            .state
-            .store()
-            .files()
-            .unwrap()
-            .iter()
-            .map(|r| r.state)
-            .collect();
-        assert_eq!(rows, [FileState::Reserved, FileState::Delete]);
+        let rest = ItemState::Cancelled(CancelCause::Receiver);
+        let rows = |state: &mut State| -> Vec<FileState> {
+            let files = state.store().files().unwrap();
+            files.iter().map(|r| r.state).collect()
+        };
+        // The item waits for the disk to settle it, keeping the ledger row
+        // that names its file; the item that never started is cancelled.
+        assert_eq!(items(&f, 1), [ItemState::Unconfirmed(None), rest]);
+        assert_eq!(rows(&mut f.state), [FileState::Reserved, FileState::Delete]);
 
-        // The paused transfer still counts as unfinished after its session
-        // ends, until it expires.
+        // A cancel, a revocation, or the end of the resume window cannot end
+        // the item or drop the row recovery needs; the item keeps the first
+        // stop in case no rename happened. The transfer keeps its place
+        // among the unfinished ones after its session ends.
         drop(f.rx);
-        assert_eq!(f.budget.usage().nonterminal_transfers, 1);
+        f.state.request_cancel(id(1));
+        f.state.revoke(&f.peer).unwrap();
         let now = f.state.now_ms();
         let window = crate::limits::RESUME_WINDOW.as_millis() as u64;
-        assert_eq!(f.state.expire(now + window), [id(1)]);
-        assert_eq!(f.budget.usage().nonterminal_transfers, 0);
+        assert!(f.state.expire(now + window).is_empty());
+        let kept = ItemState::Unconfirmed(Some(Stop::Cancelled(CancelCause::Receiver)));
+        assert_eq!(f.state.transfer(&id(1)).unwrap().items(), [kept, rest]);
+        assert_eq!(rows(&mut f.state), [FileState::Reserved, FileState::Delete]);
+        assert_eq!(f.budget.usage().nonterminal_transfers, 1);
     }
 
     #[test]

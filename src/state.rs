@@ -414,19 +414,22 @@ impl State {
     }
 
     /// Records a transfer that reached a terminal state as finished, so it
-    /// may be dropped later to make room, and lets its paused slot go.
+    /// may be dropped later to make room, drops its offer's preview, and
+    /// lets its paused slot go.
     fn settle(&mut self, id: TransferId) {
-        let Some(kept) = self.transfers.get(&id) else {
+        let Some(kept) = self.transfers.get_mut(&id) else {
             return;
         };
         if !kept.transfer.is_terminal() || self.finished.contains(&id) {
             return;
         }
-        self.cancels.remove(&id);
-        self.paused_slots.remove(&id);
+        // History keeps no content; see `Offer::forget_preview`.
+        kept.info.offer.forget_preview();
         let order = self.next_finish;
         self.next_finish = order.saturating_add(1);
-        let saved = self.store.finish_transfer(id, order);
+        let saved = self.store.finish_transfer(id, order, &kept.info.offer);
+        self.cancels.remove(&id);
+        self.paused_slots.remove(&id);
         self.note(saved);
         self.finished.push_back(id);
     }
@@ -533,14 +536,19 @@ impl State {
         saved
     }
 
-    /// Startup recovery found `item` committed under its final name, with
-    /// the identity its partial file had; the record of that is saved now.
+    /// Recovery found `item` committed under its final name, with the
+    /// identity its partial file had, and its folder synced; the record of
+    /// that is saved now.
     pub(crate) fn recovered_published(&mut self, id: &TransferId, item: usize) {
         let now = self.now_ms();
         let Some(kept) = self.transfers.get_mut(id) else {
             return;
         };
-        if kept.transfer.recovered_published(item).is_ok() {
+        if kept
+            .transfer
+            .found_on_disk(item, ItemState::Published)
+            .is_ok()
+        {
             let saved = self.store.publish(&kept.transfer, item, now);
             self.note(saved);
             self.settle(*id);
@@ -633,7 +641,8 @@ impl State {
     }
 
     /// Asks the connection carrying `id` to cancel it. Paused work has no
-    /// connection, so it is cancelled here.
+    /// connection, so it is cancelled here. An unconfirmed item keeps the
+    /// cancel until the disk shows whether it was published.
     pub fn request_cancel(&mut self, id: TransferId) -> bool {
         let Some(kept) = self.transfers.get(&id) else {
             return false;
@@ -690,12 +699,17 @@ impl State {
     }
 
     /// Expires paused work whose time to resume has passed. Returns the
-    /// transfers that expired.
+    /// transfers that expired. An unconfirmed item does not expire; it
+    /// waits for the disk to settle it.
     pub fn expire(&mut self, now_ms: u64) -> Vec<TransferId> {
         let due: Vec<TransferId> = self
             .transfers
             .values()
-            .filter(|k| is_paused(&k.transfer) && k.info.expired(now_ms))
+            .filter(|k| {
+                is_paused(&k.transfer)
+                    && k.transfer.items().contains(&ItemState::Paused)
+                    && k.info.expired(now_ms)
+            })
             .map(|k| k.transfer.id())
             .collect();
         for id in &due {
@@ -726,12 +740,13 @@ impl State {
     }
 }
 
-/// Unfinished work with no connection: every unfinished item is paused.
+/// Unfinished work with no connection: every unfinished item is paused or
+/// waits for its folder to sync.
 pub fn is_paused(t: &Transfer) -> bool {
     !t.is_terminal()
         && t.items()
             .iter()
-            .all(|s| s.is_terminal() || *s == ItemState::Paused)
+            .all(|s| s.is_terminal() || *s == ItemState::Paused || s.is_unconfirmed())
 }
 
 /// The state behind one lock, with a signal for everything that waits on

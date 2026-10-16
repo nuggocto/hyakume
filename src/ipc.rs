@@ -396,8 +396,9 @@ pub struct TransferView {
     pub peer: String,
     pub kind: String,
     pub offer: String,
-    /// `offered`, `in-progress`, `completed`, `partially-completed`, or
-    /// `unsuccessful`.
+    /// `offered`, `in-progress`, `paused`, `unconfirmed` (a file was
+    /// renamed into place but its folder did not sync yet), `completed`,
+    /// `partially-completed`, or `unsuccessful`.
     pub outcome: String,
     pub items: Vec<ItemView>,
     /// Receiving: the folder items go to.

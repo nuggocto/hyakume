@@ -96,8 +96,11 @@ pub struct Offer {
     items: Vec<Item>,
     total: u64,
     /// For text and URLs, the first bytes of the content shown before
-    /// consent. Empty for files.
+    /// consent. Empty for files, and once the transfer has finished.
     preview: PeerText,
+    /// [`Offer::digest`], computed once at validation over every field as
+    /// sent, so it stays right after [`Offer::forget_preview`].
+    digest: [u8; 32],
 }
 
 impl Offer {
@@ -150,13 +153,16 @@ impl Offer {
         if encoded > MAX_OFFER_METADATA_BYTES {
             return Err(OfferError::MetadataTooLarge);
         }
-        Ok(Self {
+        let mut offer = Self {
             transfer: fields.transfer,
             kind,
             items,
             total,
             preview,
-        })
+            digest: [0; 32],
+        };
+        offer.digest = offer.compute_digest();
+        Ok(offer)
     }
 
     /// Builds an outgoing offer for text or a URL, with its preview.
@@ -231,9 +237,30 @@ impl Offer {
         }
     }
 
-    /// A digest of every field of the offer. The receiver's acceptance
-    /// names it, so the sender knows exactly which offer was accepted.
+    /// A digest of every field of the offer as it was sent. The receiver's
+    /// acceptance names it, so the sender knows exactly which offer was
+    /// accepted. It stays the same after [`Offer::forget_preview`].
     pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// Drops the preview once the transfer is finished, because for short
+    /// text it is the whole payload and history needs none of it. The
+    /// digest keeps naming the offer as sent, so [`Offer::fields`] no
+    /// longer match it and the offer must never be sent again.
+    pub fn forget_preview(&mut self) {
+        self.preview = PeerText::default();
+    }
+
+    /// The offer of a finished transfer loaded from storage: its preview
+    /// was forgotten, so only the digest saved with it names the offer as
+    /// sent.
+    pub(crate) fn with_saved_digest(mut self, digest: [u8; 32]) -> Self {
+        self.digest = digest;
+        self
+    }
+
+    fn compute_digest(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new_derive_key(CTX_OFFER_DIGEST);
         h.update(self.transfer.as_bytes());
         h.update(&[self.kind.code()]);

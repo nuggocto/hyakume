@@ -3,7 +3,9 @@
 //! state half-changed, so its owner stops the process rather than go on with
 //! it; ordinary failures are typed errors instead.
 
-use tokio::task::JoinError;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use tokio::task::{JoinError, JoinHandle};
 
 /// Stops the process after a broken internal invariant.
 pub fn fatal(what: &str) -> ! {
@@ -19,6 +21,18 @@ pub fn observe<T>(result: Result<T, JoinError>) -> Option<T> {
         Err(e) if e.is_panic() => fatal("an owned task panicked"),
         Err(_) => None,
     }
+}
+
+/// Runs `job` on a blocking thread. A panic stops the process from that
+/// thread, because the request awaiting the handle may be gone by then,
+/// and a dropped handle would let the panic pass unseen.
+pub fn spawn_blocking<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    tokio::task::spawn_blocking(move || match catch_unwind(AssertUnwindSafe(job)) {
+        Ok(value) => value,
+        Err(_) => fatal("a blocking job panicked"),
+    })
 }
 
 /// Name of the variable that makes a debug build stop at a crash point.

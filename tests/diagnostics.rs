@@ -1,11 +1,12 @@
-//! Diagnostics keep secrets out and stay one bounded line per event.
+//! Each diagnostic event stays one bounded line, whatever text it carries,
+//! so a peer's name or a huge value cannot forge or flood log lines.
 
 // Test helpers may stop the test on unexpected I/O failure.
 #![allow(clippy::unwrap_used)]
 
 use std::sync::{Arc, Mutex};
 
-use hyakume::diagnostics::{BoundedLines, MAX_LINE_BYTES, Redacted, subscriber};
+use hyakume::diagnostics::{BoundedLines, MAX_LINE_BYTES, subscriber};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -29,19 +30,6 @@ fn capture(emit: impl FnOnce()) -> String {
     tracing::subscriber::with_default(dispatch, emit);
     let bytes = sink.0.lock().unwrap().clone();
     String::from_utf8(bytes).unwrap()
-}
-
-#[test]
-fn redacted_secrets_and_payloads_never_reach_the_output() {
-    let key = "k3y-6b1f0e8d2c4a";
-    let payload = "remember the milk";
-    let out = capture(|| {
-        tracing::info!(key = %Redacted(key), payload = ?Redacted(payload.as_bytes()), "pairing step");
-    });
-    assert!(out.contains("pairing step"), "{out}");
-    assert!(out.contains("[redacted]"), "{out}");
-    assert!(!out.contains(key), "{out}");
-    assert!(!out.contains(payload), "{out}");
 }
 
 #[test]

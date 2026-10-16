@@ -356,12 +356,32 @@ fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Expires paused work past its window and deletes files that are due.
+/// Expires paused work past its window, checks unconfirmed renames again,
+/// and deletes files that are due.
 async fn maintain(svc: Arc<Service>) {
     let _pass = svc.maintaining.lock().await;
-    let due = svc.cell.change(|s| {
+    let unsettled = svc.cell.change(|s| {
         let now = s.now_ms();
         s.expire(now);
+        crate::recovery::unsettled(s)
+    });
+    match unsettled {
+        Ok(unsettled) => {
+            for item in unsettled {
+                let check = item.clone();
+                let Ok(evidence) = svc.blocking(move || crate::recovery::recheck(&check)).await
+                else {
+                    return;
+                };
+                svc.cell
+                    .change(|s| crate::recovery::settle(s, &item, evidence));
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "cannot read the file ledger"),
+    }
+
+    let due = svc.cell.change(|s| {
+        let now = s.now_ms();
         s.store().files_due(now)
     });
     let due = match due {
@@ -887,7 +907,7 @@ impl Service {
             .acquire_owned()
             .await
             .map_err(|_| stopping())?;
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = tasks::spawn_blocking(move || {
             let result = job();
             drop(permit);
             result
@@ -1358,6 +1378,9 @@ impl Service {
         };
         let outcome = match t.outcome() {
             BatchOutcome::Offered => "offered",
+            BatchOutcome::InProgress if t.items().iter().any(|s| s.is_unconfirmed()) => {
+                "unconfirmed"
+            }
             BatchOutcome::InProgress if is_paused(t) => "paused",
             BatchOutcome::InProgress => "in-progress",
             BatchOutcome::Completed => "completed",
@@ -1861,7 +1884,7 @@ impl Service {
                 .cell
                 .lock()
                 .transfer(&id)
-                .is_none_or(|t| t.is_terminal());
+                .is_none_or(|t| t.is_terminal() || is_paused(t));
             if settled {
                 break;
             }

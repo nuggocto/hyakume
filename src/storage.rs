@@ -21,7 +21,7 @@ use crate::transfer::{ItemState, OfferState, Transfer};
 use crate::trust::{Authority, Epoch, LocalAlias, TrustRecord, TrustState};
 
 /// The schema this build writes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE installation (
@@ -91,6 +91,13 @@ CREATE TABLE files (
     last_error TEXT,
     UNIQUE (kind, transfer, item)
 ) STRICT;
+";
+
+/// Each offer's digest, saved beside it, so the offer of a finished
+/// transfer can lose its preview and still name what was accepted.
+/// [`to_v2`] fills it in for transfers saved before.
+const SCHEMA_V2: &str = "
+ALTER TABLE transfers ADD COLUMN offer_digest BLOB CHECK (length(offer_digest) = 32);
 ";
 
 #[derive(Debug, thiserror::Error)]
@@ -298,6 +305,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "DELETE")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // A preview dropped from a finished transfer must not stay behind
+        // in a free page.
+        conn.pragma_update(None, "secure_delete", true)?;
         let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if check != "ok" {
             return Err(corrupt("SQLite's integrity check failed"));
@@ -314,12 +324,23 @@ impl Store {
         if version > SCHEMA_VERSION {
             return Err(StoreError::NewerSchema(version));
         }
-        if version == 0 {
-            let tx = self.conn.transaction()?;
-            tx.execute_batch(SCHEMA_V1)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            tx.commit()?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
         }
+        if version == 1 {
+            // Schema 1 wrote without `secure_delete`, so free pages may hold
+            // offers dropped long ago. This runs before the version changes,
+            // so a stop here redoes it at the next open.
+            self.conn.execute_batch("VACUUM")?;
+        }
+        let tx = self.conn.transaction()?;
+        if version == 0 {
+            tx.execute_batch(SCHEMA_V1)?;
+        }
+        to_v2(&tx)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        crate::tasks::crash_point("migrated");
         Ok(())
     }
 
@@ -450,19 +471,20 @@ impl Store {
     // ---- Transfers ----
 
     pub fn insert_transfer(&mut self, t: &Transfer, info: &TransferInfo) -> Result<(), StoreError> {
-        let offer = protocol::encode_payload(&Message::Offer(info.offer.fields()));
+        let offer = encode_offer(&info.offer);
         let tx = self.conn.transaction()?;
         let place = info.place.as_ref();
         tx.execute(
-            "INSERT INTO transfers (id, outgoing, peer, epoch, offer, offer_state, created_ms,
-                                    expires_ms, place_dir, place_dev, place_ino)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO transfers (id, outgoing, peer, epoch, offer, offer_digest, offer_state,
+                                    created_ms, expires_ms, place_dir, place_dev, place_ino)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &t.id().as_bytes()[..],
                 info.outgoing,
                 &t.peer().as_bytes()[..],
                 to_sql(t.authority().epoch().value()),
                 offer,
+                &info.offer.digest()[..],
                 t.offer_state().name(),
                 to_sql(info.created_ms),
                 to_sql(info.expires_ms),
@@ -554,10 +576,18 @@ impl Store {
         Ok(())
     }
 
-    pub fn finish_transfer(&mut self, id: TransferId, order: u64) -> Result<(), StoreError> {
+    /// Gives an ended transfer its finish order and saves `offer`, whose
+    /// preview is forgotten. One write, so a crash cannot leave a finished
+    /// transfer that still holds its text.
+    pub fn finish_transfer(
+        &mut self,
+        id: TransferId,
+        order: u64,
+        offer: &Offer,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE transfers SET finished = ?2 WHERE id = ?1",
-            params![&id.as_bytes()[..], to_sql(order)],
+            "UPDATE transfers SET finished = ?2, offer = ?3 WHERE id = ?1",
+            params![&id.as_bytes()[..], to_sql(order), encode_offer(offer)],
         )?;
         Ok(())
     }
@@ -833,8 +863,8 @@ impl Store {
 
     fn load_transfers(&self) -> Result<Vec<SavedTransfer>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, outgoing, peer, epoch, offer, offer_state, created_ms, expires_ms,
-                    place_dir, place_dev, place_ino, finished
+            "SELECT id, outgoing, peer, epoch, offer, offer_digest, offer_state, created_ms,
+                    expires_ms, place_dir, place_dev, place_ino, finished
              FROM transfers ORDER BY finished IS NOT NULL, finished",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -844,13 +874,14 @@ impl Store {
                 peer: r.get(2)?,
                 epoch: r.get(3)?,
                 offer: r.get(4)?,
-                offer_state: r.get(5)?,
-                created_ms: r.get(6)?,
-                expires_ms: r.get(7)?,
-                place_dir: r.get(8)?,
-                place_dev: r.get(9)?,
-                place_ino: r.get(10)?,
-                finished: r.get(11)?,
+                offer_digest: r.get(5)?,
+                offer_state: r.get(6)?,
+                created_ms: r.get(7)?,
+                expires_ms: r.get(8)?,
+                place_dir: r.get(9)?,
+                place_dev: r.get(10)?,
+                place_ino: r.get(11)?,
+                finished: r.get(12)?,
             })
         })?;
         let mut raws = Vec::new();
@@ -939,6 +970,41 @@ fn save_states(tx: &Transaction<'_>, t: &Transfer, now_ms: u64) -> Result<(), St
     Ok(())
 }
 
+fn encode_offer(offer: &Offer) -> Vec<u8> {
+    protocol::encode_payload(&Message::Offer(offer.fields()))
+}
+
+fn decode_offer(bytes: &[u8]) -> Result<Offer, StoreError> {
+    match protocol::decode_payload(bytes) {
+        Ok(Message::Offer(fields)) => Offer::validate(fields).map_err(|_| corrupt("saved offer")),
+        _ => Err(corrupt("saved offer")),
+    }
+}
+
+/// Moves a schema 1 database to schema 2: each offer's digest is saved,
+/// and the offers of transfers that already finished lose their preview,
+/// which under schema 1 stayed with them for as long as the transfer was
+/// kept.
+fn to_v2(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(SCHEMA_V2)?;
+    let saved: Vec<(Vec<u8>, Vec<u8>, bool)> = tx
+        .prepare("SELECT id, offer, finished IS NOT NULL FROM transfers")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, offer, finished) in saved {
+        let mut offer = decode_offer(&offer)?;
+        let digest = offer.digest();
+        if finished {
+            offer.forget_preview();
+        }
+        tx.execute(
+            "UPDATE transfers SET offer = ?2, offer_digest = ?3 WHERE id = ?1",
+            params![id, encode_offer(&offer), &digest[..]],
+        )?;
+    }
+    Ok(())
+}
+
 fn add_file(tx: &Transaction<'_>, file: &NewFile<'_>) -> Result<i64, StoreError> {
     let state = if file.identity.is_some() {
         FileState::Live
@@ -981,6 +1047,7 @@ struct RawTransfer {
     peer: Vec<u8>,
     epoch: i64,
     offer: Vec<u8>,
+    offer_digest: Option<Vec<u8>>,
     offer_state: String,
     created_ms: i64,
     expires_ms: i64,
@@ -998,11 +1065,19 @@ impl RawTransfer {
         sources: Vec<Option<Vec<u8>>>,
     ) -> Result<SavedTransfer, StoreError> {
         let id = transfer_id(&self.id)?;
-        let fields = match protocol::decode_payload(&self.offer) {
-            Ok(Message::Offer(fields)) => fields,
-            _ => return Err(corrupt("saved offer")),
+        let offer = decode_offer(&self.offer)?;
+        let digest: [u8; 32] = self
+            .offer_digest
+            .as_deref()
+            .and_then(|d| d.try_into().ok())
+            .ok_or_else(|| corrupt("offer digest"))?;
+        // An unfinished offer is whole, so hashing it catches a damaged row.
+        // A finished one lost its preview and can only take the saved digest.
+        let offer = match self.finished {
+            Some(_) => offer.with_saved_digest(digest),
+            None if offer.digest() == digest => offer,
+            None => return Err(corrupt("offer digest")),
         };
-        let offer = Offer::validate(fields).map_err(|_| corrupt("saved offer"))?;
         if offer.transfer() != id || offer.items().len() != states.len() {
             return Err(corrupt("saved offer does not match its transfer"));
         }
@@ -1103,8 +1178,9 @@ mod tests {
     use super::*;
     use crate::display::PeerText;
     use crate::identity::DeviceKey;
+    use crate::offer::PayloadKind;
     use crate::state::{PartialFile, State};
-    use crate::transfer::{CancelCause, ItemEvent};
+    use crate::transfer::{CancelCause, ItemEvent, RejectCause};
     use crate::trust::VerifiedPeer;
     use rand_core::{OsRng, RngCore};
     use std::os::unix::fs::PermissionsExt;
@@ -1324,6 +1400,144 @@ mod tests {
             state.trust().check(&first),
             Err(crate::trust::TrustError::Stale)
         );
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn a_finished_transfer_keeps_no_content_in_the_database() {
+        let dir = dir();
+        let db = dir.0.join("hyakume.db");
+        let ended = TransferId::from_bytes([1; 16]);
+        let paused = TransferId::from_bytes([2; 16]);
+        let ended_text = b"declined-text-31c6a0e2";
+        let paused_text = b"accepted-text-5d9b47f8";
+        let digests = {
+            let mut state = State::load(Store::open(&db).unwrap()).unwrap();
+            let peer = trusted(&mut state, 1, "laptop");
+            let mut digests = Vec::new();
+            for (id, text) in [(ended, ended_text), (paused, paused_text)] {
+                let offer = Offer::for_text(id, PayloadKind::Text, text).unwrap();
+                digests.push(offer.digest());
+                let t = Transfer::offered(id, peer, 1).unwrap();
+                state
+                    .insert_transfer(t, TransferInfo::new(true, offer, 1_000))
+                    .unwrap();
+            }
+            state.update_transfer(&ended, |t| t.reject(RejectCause::Receiver));
+            state.accept(&paused, None).unwrap();
+            state.update_transfer(&paused, Transfer::pause_all);
+            assert!(state.info(&ended).unwrap().offer.preview().is_empty());
+            digests
+        };
+
+        // The declined text is gone from the file, not only from its row.
+        // The paused one stays, since a resume would check the text
+        // against it.
+        let file = std::fs::read(&db).unwrap();
+        assert!(!contains(&file, ended_text));
+        assert!(contains(&file, paused_text));
+
+        let state = State::load(Store::open(&db).unwrap()).unwrap();
+        let ended_offer = &state.info(&ended).unwrap().offer;
+        let paused_offer = &state.info(&paused).unwrap().offer;
+        assert!(ended_offer.preview().is_empty());
+        assert_eq!(paused_offer.preview().as_bytes(), paused_text);
+        assert_eq!([ended_offer.digest(), paused_offer.digest()], digests[..]);
+    }
+
+    const KEPT_TEXT: &[u8] = b"kept-by-schema-1-8e02f4b1";
+    const DROPPED_TEXT: &[u8] = b"dropped-under-schema-1-b7731c05";
+
+    /// A schema 1 database with a declined transfer, which kept its offer
+    /// whole, and one dropped from history, whose bytes stay in a free page.
+    /// Returns the kept transfer's ID and offer.
+    fn schema_1_database(db: &Path) -> (TransferId, Offer) {
+        let id = TransferId::from_bytes([3; 16]);
+        let dropped = TransferId::from_bytes([4; 16]);
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        for (id, text) in [(id, KEPT_TEXT), (dropped, DROPPED_TEXT)] {
+            let offer = Offer::for_text(id, PayloadKind::Text, text).unwrap();
+            conn.execute(
+                "INSERT INTO transfers (id, outgoing, peer, epoch, offer, offer_state,
+                                        created_ms, expires_ms, finished)
+                 VALUES (?1, 1, ?2, 0, ?3, 'rejected:declined', 0, 0, 0)",
+                params![
+                    &id.as_bytes()[..],
+                    &device(1).as_bytes()[..],
+                    encode_offer(&offer)
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO items (transfer, item, state) VALUES (?1, 0, 'rejected')",
+                params![&id.as_bytes()[..]],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "DELETE FROM transfers WHERE id = ?1",
+            params![&dropped.as_bytes()[..]],
+        )
+        .unwrap();
+        assert!(contains(&std::fs::read(db).unwrap(), DROPPED_TEXT));
+        let offer = Offer::for_text(id, PayloadKind::Text, KEPT_TEXT).unwrap();
+        (id, offer)
+    }
+
+    #[test]
+    fn a_schema_1_database_drops_the_previews_of_finished_transfers() {
+        let dir = dir();
+        let db = dir.0.join("hyakume.db");
+        let (id, offer) = schema_1_database(&db);
+
+        let state = State::load(Store::open(&db).unwrap()).unwrap();
+        let loaded = &state.info(&id).unwrap().offer;
+        assert!(loaded.preview().is_empty());
+        assert_eq!(loaded.digest(), offer.digest());
+        let file = std::fs::read(&db).unwrap();
+        assert!(!contains(&file, KEPT_TEXT));
+        assert!(!contains(&file, DROPPED_TEXT));
+    }
+
+    #[test]
+    fn a_migration_stopped_once_recorded_leaves_no_old_text() {
+        // The child opens the database and aborts at the crash point right
+        // after the new version is committed. An abort would end this test
+        // runner, so it runs in a process of its own.
+        const CHILD: &str = "HYAKUME_MIGRATION_TEST_DB";
+        if let Some(db) = std::env::var_os(CHILD) {
+            let _ = Store::open(Path::new(&db));
+            return;
+        }
+        let dir = dir();
+        let db = dir.0.join("hyakume.db");
+        schema_1_database(&db);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::a_migration_stopped_once_recorded_leaves_no_old_text",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &db)
+            .env(crate::tasks::CRASH_VAR, "migrated")
+            .output()
+            .unwrap();
+
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child.status.signal(), Some(6), "{:?}", child.status);
+        let version: u32 = Connection::open(&db)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let file = std::fs::read(&db).unwrap();
+        assert!(!contains(&file, KEPT_TEXT));
+        assert!(!contains(&file, DROPPED_TEXT));
     }
 
     #[test]

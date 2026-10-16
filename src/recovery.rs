@@ -19,12 +19,18 @@ use crate::ids::TransferId;
 use crate::limits::{CLEANUP_WINDOW, MAX_SPOOL_BYTES};
 use crate::state::{Place, State, StateError};
 use crate::storage::{FileKind, FileState, NewFile, OwnedFile};
-use crate::transfer::{FailCause, ItemEvent, OfferState, Transfer};
+use crate::transfer::{FailCause, ItemState, OfferState, Transfer};
 
 /// What recovery found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Recovered {
     pub published: usize,
+    /// Items renamed under their final name whose folder still does not
+    /// sync. They wait for a later check.
+    pub unconfirmed: usize,
+    /// Items whose folder or file could not be read. They become unconfirmed,
+    /// since a crash after the rename can leave one saved as queued.
+    pub unreadable: usize,
     pub paused: usize,
     pub lost: usize,
     pub interrupted: usize,
@@ -66,16 +72,13 @@ pub fn recover(state: &mut State, spool_dir: &Path, now_ms: u64) -> Result<Recov
                 partial_evidence(row, info.outputs.get(item).cloned().flatten(), id, item)
             };
             match evidence {
-                Evidence::Published => {
-                    state.recovered_published(&id, item);
-                    found.published += 1;
-                }
+                Evidence::Published => found.published += 1,
+                Evidence::Unconfirmed => found.unconfirmed += 1,
+                Evidence::Unreadable => found.unreadable += 1,
                 Evidence::Kept => {}
-                Evidence::Lost => {
-                    state.update_transfer(&id, |t| t.apply(item, ItemEvent::Fail(FailCause::Lost)));
-                    found.lost += 1;
-                }
+                Evidence::Lost => found.lost += 1,
             }
+            record(state, &id, item, evidence);
         }
 
         let Some(transfer) = state.transfer(&id).cloned() else {
@@ -85,13 +88,19 @@ pub fn recover(state: &mut State, spool_dir: &Path, now_ms: u64) -> Result<Recov
             continue;
         }
 
+        // An unconfirmed item keeps a revocation or expiry for later, so
+        // these run even when nothing else is left to stop.
         if state.trust().check(&transfer.authority()).is_err() {
             state.update_transfer(&id, Transfer::revoke);
             found.revoked += 1;
         } else if info.expired(now_ms) || state.downtime_unknown() {
             state.update_transfer(&id, Transfer::expire_all);
             found.expired += 1;
-        } else {
+        } else if !transfer
+            .items()
+            .iter()
+            .all(|s| s.is_terminal() || s.is_unconfirmed())
+        {
             state.update_transfer(&id, Transfer::pause_all);
             found.paused += 1;
         }
@@ -116,10 +125,95 @@ pub fn recover(state: &mut State, spool_dir: &Path, now_ms: u64) -> Result<Recov
     Ok(found)
 }
 
-enum Evidence {
+/// What the disk shows for one unfinished item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evidence {
+    /// The file Hyakume wrote is under its final name and the folder
+    /// synced.
     Published,
+    /// The file Hyakume wrote is under its final name, but the folder does
+    /// not sync.
+    Unconfirmed,
+    /// The data for the item is still there to resume from.
     Kept,
+    /// The folder or a file in it could not be read, so nothing is known.
+    Unreadable,
     Lost,
+}
+
+/// Records what the disk shows for one item. A partial file found again
+/// after an unconfirmed rename means the rename did not survive, so the
+/// item is paused work again.
+fn record(state: &mut State, id: &TransferId, item: usize, evidence: Evidence) {
+    let found = match evidence {
+        Evidence::Published => return state.recovered_published(id, item),
+        // Unknown is not gone, and the rename may have happened; a later
+        // check decides.
+        Evidence::Unconfirmed | Evidence::Unreadable => ItemState::Unconfirmed(None),
+        Evidence::Kept => ItemState::Paused,
+        Evidence::Lost => ItemState::Failed(FailCause::Lost),
+    };
+    state.update_transfer(id, |t| {
+        // Startup pauses kept work later, together with its revocation and
+        // expiry checks.
+        if evidence != Evidence::Kept || t.items().get(item).is_some_and(|s| s.is_unconfirmed()) {
+            let _ = t.found_on_disk(item, found);
+        }
+    });
+}
+
+/// An unconfirmed item and what checking it again needs, copied out under
+/// the lock so the blocking check can run outside it.
+#[derive(Clone, Debug)]
+pub struct Unsettled {
+    transfer: TransferId,
+    item: usize,
+    row: Option<OwnedFile>,
+    output: Option<Vec<u8>>,
+}
+
+/// The unconfirmed items, for maintenance to check again while the service
+/// runs, so one does not wait for a restart.
+pub fn unsettled(state: &mut State) -> Result<Vec<Unsettled>, StateError> {
+    let files = state.store().files()?;
+    let mut out = Vec::new();
+    for id in state.unfinished() {
+        let (Some(transfer), Some(info)) = (state.transfer(&id), state.info(&id)) else {
+            continue;
+        };
+        for (item, s) in transfer.items().iter().enumerate() {
+            if s.is_unconfirmed() {
+                out.push(Unsettled {
+                    transfer: id,
+                    item,
+                    row: files
+                        .iter()
+                        .find(|f| f.transfer == id && f.item == item)
+                        .cloned(),
+                    output: info.outputs.get(item).cloned().flatten(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Checks the disk again for an unconfirmed item, as startup recovery
+/// would. Blocking.
+pub fn recheck(u: &Unsettled) -> Evidence {
+    partial_evidence(u.row.as_ref(), u.output.clone(), u.transfer, u.item)
+}
+
+/// Records what [`recheck`] found. The check ran without the lock, so the
+/// item may have changed meanwhile; only a still unconfirmed one is touched.
+pub fn settle(state: &mut State, u: &Unsettled, evidence: Evidence) {
+    let waiting = state
+        .transfer(&u.transfer)
+        .and_then(|t| t.items().get(u.item))
+        .is_some_and(|s| s.is_unconfirmed());
+    if waiting {
+        record(state, &u.transfer, u.item, evidence);
+    }
 }
 
 fn partial_evidence(
@@ -136,24 +230,38 @@ fn partial_evidence(
         // The item can still resume from the start.
         return Evidence::Kept;
     };
-    let Ok(dest) = Destination::reopen(&row.dir) else {
-        return Evidence::Lost;
+    let dest = match Destination::reopen(&row.dir) {
+        Ok(dest) => dest,
+        // The path no longer leads to the recorded folder, so neither name
+        // can hold the file there.
+        Err(
+            DestinationError::Missing
+            | DestinationError::Replaced
+            | DestinationError::NotDirectory
+            | DestinationError::Symlink,
+        ) => return Evidence::Lost,
+        Err(_) => return Evidence::Unreadable,
     };
     // The file under its final name is published only once the folder
     // syncs: a rename whose sync failed is not known to survive a crash.
-    if let Some(output) = output
-        && dest.identity_of(&output).ok().flatten() == Some(key)
-    {
-        return match dest.sync() {
-            Ok(()) => Evidence::Published,
-            Err(_) => Evidence::Kept,
-        };
+    let at_output = match output {
+        Some(output) => dest.identity_of(&output),
+        None => Ok(None),
+    };
+    match at_output {
+        Ok(Some(found)) if found == key => {
+            return match dest.sync() {
+                Ok(()) => Evidence::Published,
+                Err(_) => Evidence::Unconfirmed,
+            };
+        }
+        Ok(_) => {}
+        Err(_) => return Evidence::Unreadable,
     }
-    let partial = partial_name(transfer, item);
-    if dest.identity_of(partial.as_bytes()).ok().flatten() == Some(key) {
-        Evidence::Kept
-    } else {
-        Evidence::Lost
+    match dest.identity_of(partial_name(transfer, item).as_bytes()) {
+        Ok(Some(found)) if found == key => Evidence::Kept,
+        Ok(_) => Evidence::Lost,
+        Err(_) => Evidence::Unreadable,
     }
 }
 
@@ -485,6 +593,305 @@ mod tests {
         assert!(stray_left);
         assert_eq!(state.store().charged().unwrap(), (0, 0));
         assert!(state.store().files().unwrap().is_empty());
+    }
+
+    /// A fresh folder in the temporary directory, mode 0700 because
+    /// `Destination::qualify` refuses a folder others can write to.
+    fn private_dir(tag: &str) -> std::path::PathBuf {
+        use rand_core::{OsRng, RngCore};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "hyakume-{tag}-{}-{:x}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    const RECEIVED: &[u8] = b"every byte verified";
+
+    /// Receives one file into `dir/inbox`, with the state saved in
+    /// `dir/hyakume.db`. The rename really happens; the folder sync after
+    /// it is what fails.
+    fn unsynced_rename(dir: &Path) -> (State, TransferId) {
+        use crate::files::destination::PublishFailure;
+        use crate::limits::{Budget, Limits};
+        use crate::protocol::Message;
+        use crate::receive::{Content, Receiver, Target};
+        use std::io::Write;
+
+        let inbox = dir.join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        let dest = Destination::qualify(&inbox).unwrap();
+        let mut state =
+            State::load(crate::storage::Store::open(&dir.join("hyakume.db")).unwrap()).unwrap();
+        let reservation = state
+            .trust
+            .reserve(device(), LocalAlias::new("peer").unwrap())
+            .unwrap();
+        let authority = state
+            .trust_peer(
+                VerifiedPeer::new(device(), PeerText::default()),
+                reservation,
+            )
+            .unwrap();
+        let budget = Budget::new(Limits::COMPILED);
+        let session = budget.admit_session().unwrap();
+        let mut rx = Receiver::new(authority, budget, session);
+
+        let id = TransferId::from_bytes([8; 16]);
+        let offer = Offer::for_files(id, &[("final.txt", RECEIVED)]).unwrap();
+        let target = Target {
+            place: dest.place(),
+            free_bytes: u64::MAX,
+        };
+        rx.on_message(Message::Offer(offer.fields()), Some(&target), &mut state);
+        rx.on_answer(id, true, Some(&target), &mut state);
+        let (mut file, identity) = dest.create_partial(&partial_name(id, 0)).unwrap();
+        assert!(
+            state
+                .file_created(FileKind::Partial, id, 0, identity.key())
+                .unwrap()
+        );
+        let chunk = Message::Chunk {
+            transfer: id,
+            item: 0,
+            offset: 0,
+            data: RECEIVED.to_vec(),
+        };
+        rx.on_message(chunk, None, &mut state);
+        file.write_all(RECEIVED).unwrap();
+        file.sync_all().unwrap();
+        rx.on_message(
+            Message::ItemEnd {
+                transfer: id,
+                item: 0,
+            },
+            None,
+            &mut state,
+        );
+        let content = Content {
+            digest: offer.items()[0].digest,
+            text_ok: true,
+        };
+        rx.on_verified(0, content, &mut state, |partial, output| {
+            dest.publish(partial, output.as_str()).unwrap();
+            Err(PublishFailure::Unsynced(io::Error::other("EIO")))
+        });
+        assert_eq!(items(&state, &id), [ItemState::Unconfirmed(None)]);
+        (state, id)
+    }
+
+    /// Deletes every file that is due, as maintenance does.
+    fn clean(state: &mut State) {
+        for file in state.store().files_due(u64::MAX).unwrap() {
+            let result = delete_owned(&file);
+            record_deletion(state, &file, result, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_rename_survives_cancel_revocation_expiry_and_cleanup_until_recovery_publishes_it()
+     {
+        for action in ["nothing", "cancel", "revoke", "expire"] {
+            let dir = private_dir("unconfirmed");
+            let (mut state, id) = unsynced_rename(&dir);
+            match action {
+                "cancel" => {
+                    state.request_cancel(id);
+                }
+                "revoke" => state.revoke(&device()).unwrap(),
+                "expire" => {
+                    let at = state.info(&id).unwrap().expires_ms;
+                    state.expire(at);
+                }
+                _ => {}
+            }
+            clean(&mut state);
+            drop(state);
+
+            let store = crate::storage::Store::open(&dir.join("hyakume.db")).unwrap();
+            let mut state = State::load(store).unwrap();
+            let now = state.now_ms();
+            let found = recover(&mut state, &spool_dir(), now).unwrap();
+            clean(&mut state);
+            let received = std::fs::read(dir.join("inbox").join("final.txt")).unwrap();
+            let charged = state.store().charged().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            assert_eq!(found.published, 1, "after {action}");
+            assert_eq!(items(&state, &id), [ItemState::Published], "after {action}");
+            assert_eq!(received, RECEIVED, "after {action}");
+            assert_eq!(charged, (0, 0), "after {action}");
+        }
+    }
+
+    #[test]
+    fn maintenance_settles_an_unconfirmed_rename_from_the_disk() {
+        let cases = [
+            (false, ItemState::Published),
+            // The person removed the file before its folder synced.
+            (true, ItemState::Failed(FailCause::Lost)),
+        ];
+        for (removed, expected) in cases {
+            let dir = private_dir("unconfirmed");
+            let (mut state, id) = unsynced_rename(&dir);
+            if removed {
+                std::fs::remove_file(dir.join("inbox").join("final.txt")).unwrap();
+            }
+            let waiting = unsettled(&mut state).unwrap();
+            for item in &waiting {
+                let evidence = recheck(item);
+                settle(&mut state, item, evidence);
+            }
+            clean(&mut state);
+            let charged = state.store().charged().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(items(&state, &id), [expected], "removed: {removed}");
+            assert_eq!(charged, (0, 0), "removed: {removed}");
+            assert!(unsettled(&mut state).unwrap().is_empty());
+        }
+    }
+
+    /// Runs one maintenance check of every unconfirmed item.
+    fn maintain(state: &mut State) {
+        for item in unsettled(state).unwrap() {
+            let evidence = recheck(&item);
+            settle(state, &item, evidence);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_folder_leaves_an_unconfirmed_rename_for_a_later_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir("unreadable");
+        let inbox = dir.join("inbox");
+        let (mut state, id) = unsynced_rename(&dir);
+        let mode = |m| std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(m));
+
+        // Neither maintenance nor a restart may take an access error for a
+        // missing file, or cleanup would drop the row that names it.
+        mode(0o000).unwrap();
+        maintain(&mut state);
+        let while_running = items(&state, &id);
+        clean(&mut state);
+        drop(state);
+        let store = crate::storage::Store::open(&dir.join("hyakume.db")).unwrap();
+        let mut state = State::load(store).unwrap();
+        let now = state.now_ms();
+        let found = recover(&mut state, &spool_dir(), now).unwrap();
+        let after_restart = items(&state, &id);
+        clean(&mut state);
+
+        mode(0o700).unwrap();
+        maintain(&mut state);
+        clean(&mut state);
+        let charged = state.store().charged().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(while_running, [ItemState::Unconfirmed(None)]);
+        assert_eq!((found.unreadable, found.lost), (1, 0));
+        assert_eq!(after_restart, [ItemState::Unconfirmed(None)]);
+        assert_eq!(items(&state, &id), [ItemState::Published]);
+        assert_eq!(charged, (0, 0));
+    }
+
+    /// A stop that reaches an unconfirmed item.
+    type Stopping = fn(State, &Path, TransferId) -> State;
+    /// How the disk check then happens.
+    type Checking = fn(State, &Path) -> State;
+
+    fn cancel(mut state: State, _: &Path, id: TransferId) -> State {
+        state.request_cancel(id);
+        state
+    }
+
+    fn revoke(mut state: State, _: &Path, _: TransferId) -> State {
+        state.revoke(&device()).unwrap();
+        state
+    }
+
+    fn reopen(dir: &Path) -> State {
+        State::load(crate::storage::Store::open(&dir.join("hyakume.db")).unwrap()).unwrap()
+    }
+
+    /// A restart with the folder unreadable, while the wall clock reads a
+    /// day behind its last saved reading, so the downtime is unknown.
+    fn restart_with_unknown_downtime(mut state: State, dir: &Path, _: TransferId) -> State {
+        use std::os::unix::fs::PermissionsExt;
+        let now = crate::clock::wall_now();
+        state.lifetime_now(now + 86_400_000, std::time::Instant::now());
+        drop(state);
+        let inbox = dir.join("inbox");
+        let mode = |m| std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(m));
+        mode(0o000).unwrap();
+        let mut state = reopen(dir);
+        let at = state.lifetime_now(crate::clock::wall_now(), std::time::Instant::now());
+        let found = recover(&mut state, &spool_dir(), at).unwrap();
+        mode(0o700).unwrap();
+        assert!(state.downtime_unknown());
+        assert_eq!((found.unreadable, found.expired), (1, 1));
+        state
+    }
+
+    fn by_maintenance(mut state: State, _: &Path) -> State {
+        maintain(&mut state);
+        state
+    }
+
+    fn by_restart(state: State, dir: &Path) -> State {
+        drop(state);
+        let mut state = reopen(dir);
+        let now = state.now_ms();
+        recover(&mut state, &spool_dir(), now).unwrap();
+        state
+    }
+
+    #[test]
+    fn a_kept_stop_ends_the_item_once_the_disk_shows_no_rename() {
+        let stops: [(&str, Stopping, ItemState); 3] = [
+            (
+                "cancel",
+                cancel,
+                ItemState::Cancelled(CancelCause::Receiver),
+            ),
+            ("revoke", revoke, ItemState::Cancelled(CancelCause::Revoked)),
+            (
+                "unknown downtime",
+                restart_with_unknown_downtime,
+                ItemState::Expired,
+            ),
+        ];
+        let checks: [(&str, Checking); 2] =
+            [("maintenance", by_maintenance), ("restart", by_restart)];
+        for (stop, stopping, expected) in stops {
+            for (check, checking) in checks {
+                let dir = private_dir("undone");
+                let inbox = dir.join("inbox");
+                let (state, id) = unsynced_rename(&dir);
+                // The rename did not survive: the file is back under its
+                // partial name, as after a crash.
+                let partial = inbox.join(partial_name(id, 0));
+                std::fs::rename(inbox.join("final.txt"), &partial).unwrap();
+                let state = stopping(state, &dir, id);
+                let before_check = items(&state, &id);
+                let mut state = checking(state, &dir);
+                clean(&mut state);
+                let charged = state.store().charged().unwrap();
+                let partial_left = partial.exists();
+                std::fs::remove_dir_all(&dir).unwrap();
+
+                let case = format!("{stop}, then {check}");
+                assert!(before_check[0].is_unconfirmed(), "{case}: {before_check:?}");
+                assert_eq!(items(&state, &id), [expected], "{case}");
+                assert_eq!(charged, (0, 0), "{case}");
+                assert!(!partial_left, "{case}");
+            }
+        }
     }
 
     fn file(attempts: u32, since: u64) -> OwnedFile {

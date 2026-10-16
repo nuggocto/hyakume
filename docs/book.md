@@ -1525,3 +1525,423 @@ turns echo back on. The place test for a stalled client unwrapped each
 retry's hello, but a refused client gets a busy reply and a socket closed
 without reading, so the write can fail with a broken pipe. That failure
 now counts as one more refusal.
+
+## 23. Two fixes from the twelfth review
+
+Like the last review, this one found defects between components that each
+looked right alone. The item state machine, the file ledger, cleanup, and
+startup recovery each followed their own rules, and the gaps sat between
+them.
+
+**An unconfirmed rename is its own state.** When the rename into the
+destination succeeds but the folder sync after it fails, nobody knows yet
+whether the new name survives a crash. The receiver never tells the sender
+`published` in that case. It used to pause the item and leave the decision
+to startup recovery, which counts the file as published only if a new sync
+succeeds.
+
+The trouble was that a paused item is ordinary resumable work, and
+everything that ends paused work ended this one too:
+
+```diagram
+before
+rename ok ─▶ sync ✗ ─▶ Paused ─▶ cancel / revoke / expire ─▶ Cancelled or Expired (terminal)
+                                                                │
+                                         ledger row ─▶ delete ─▶ cleanup removes the row
+                                                                │
+                                         restart ─▶ recovery skips finished transfers
+                                                                │
+                              the file sits under its final name; the transfer says cancelled
+```
+
+The review reproduced this for cancel, revocation, and expiry with a real
+file, a real rename, and a restarted database. A run with none of the three
+recovered the same file as published.
+
+`ItemState::Unconfirmed` now holds that case. It is not terminal and not
+active. `cancel`, `revoke`, `fail_rest`, `pause_all`, and `expire_all` skip
+it, because they only touch items that are `stoppable`. The transition table
+refuses every event from it. The only way out is
+`Transfer::found_on_disk`, which records what a check of the disk showed:
+published, still unconfirmed, paused again (the partial file is back, so
+the rename did not survive), or failed as lost.
+
+```diagram
+after
+rename ok ─▶ sync ✗ ─▶ Unconfirmed ─┬─ cancel / revoke / expire: no change, row stays live
+                                    │
+          maintenance (every 5 s) or startup recovery
+                                    │
+              recheck: same inode under the output name?
+                     ├─ yes, folder syncs now ─▶ Published (row removed with the record)
+                     ├─ yes, sync still fails ─▶ Unconfirmed
+                     ├─ no, partial is back ───▶ Paused
+                     └─ neither ──────────────▶ Failed: lost (row to delete)
+```
+
+Startup recovery and the running service share the check.
+`recovery::partial_evidence` now returns `Evidence::Unconfirmed` where it
+used to return `Kept`, and `recovery::record` turns evidence into a state
+change for both. The maintenance pass calls `recovery::unsettled` under the
+lock, runs `recheck` as a blocking job, and calls `settle` under the lock
+again, which ignores an item that changed in between. Before, a long-running
+service waited for a restart to settle the item, and expiry usually came
+first.
+
+Why not acknowledge the item once the rename succeeds? Because a rename
+that is not yet durable can vanish in a crash, and the sender would then
+believe in a file that does not exist. Why does revocation not cancel it?
+The rename happened under the state lock after `may_publish` checked
+trust, so it came before the revocation in the one order both share,
+exactly like an item that published cleanly.
+
+A few smaller rules follow from the new state. `is_paused` counts a
+transfer with only unconfirmed items left as paused, so it keeps its place
+among unfinished transfers. `State::expire` picks only transfers that still
+have a paused item, so an unconfirmed transfer is not reported as expiring
+on every pass. Status shows the outcome `unconfirmed`. `cancel` stops
+waiting as soon as nothing with a connection is left, instead of sitting
+out its 5 s for an end that only the disk can bring. The old transition
+from verifying to paused existed only for this case, so it is gone.
+
+**A finished transfer keeps no content.** The `transfers` table stored the
+encoded offer, and a text or link offer carries a preview of up to 4 KiB,
+which for short text is the whole payload. Declining, finishing, or
+cancelling changed the states and left the offer as it was. History drops a
+transfer only to make room for a new one, so a quiet installation kept the
+text forever. The review sent a short text through the release binary,
+declined it, waited for the spool to go, and found the whole text in a live
+row on both devices. That contradicts the rule in the plan that nothing of
+a payload is kept after a terminal outcome.
+
+```diagram
+offer received or made ─▶ saved: offer with preview, digest      (payload is on disk anyway)
+            │
+transfer finishes ─▶ settle ─▶ offer.forget_preview()
+                            └▶ finish_transfer: finished = n, offer = without preview (one write)
+                                                 secure_delete zeroes the old bytes
+```
+
+The preview stays while the transfer is unfinished, because a resume would
+check the received text against it, and the spool or partial file holds
+the payload for that long anyway. The rule is that the preview lives
+exactly as long as those files.
+
+The digest needed care. The acceptance names the digest of the whole
+offer, preview included, so recomputing it after the preview is gone would
+quietly give a different value under the same name. `Offer` now computes
+its digest once at validation and keeps it, and `forget_preview` leaves it
+alone. Storage saves it in a new `offer_digest` column. On load, an
+unfinished transfer's offer must hash to its saved digest. A finished one
+has no preview to hash, so it takes the saved digest as it is
+(`Offer::with_saved_digest`). Nothing reads the digest of a finished
+transfer today; the point is that nothing can read a wrong one later.
+
+Rewriting a row is not enough on its own. Without `secure_delete`, SQLite
+leaves the old bytes in a free page of the file, and the storage test found
+the declined text there. The pragma is now on for every connection.
+
+Schema 2 is the first migration. A schema 1 database gets the column, every
+offer's digest, and the preview of every finished transfer removed, in one
+transaction. Then `VACUUM` runs once, because schema 1 wrote without
+`secure_delete`, and transfers dropped from history long ago may still sit
+in free pages. A new database runs the schema 1 script and the same step,
+so there is one path to the current schema.
+
+**Tests.** The review asked for coverage past the point where the two
+components disagree, and each new test fails with its fix taken out:
+
+- `receive::tests::a_rename_whose_folder_cannot_be_synced_is_never_acknowledged`
+  used to end by expiring the paused item, which was the defect. It now
+  cancels, revokes, and expires, and checks that the item, its ledger row,
+  and its place among unfinished transfers survive all three.
+- `recovery::tests::an_unconfirmed_rename_survives_cancel_revocation_expiry_and_cleanup_until_recovery_publishes_it`
+  repeats the review's probe in the tree: a real folder, a real rename, a
+  database on disk, then each of the three actions, cleanup, a restart, and
+  recovery. The file must end up published with nothing charged.
+- `recovery::tests::maintenance_settles_an_unconfirmed_rename_from_the_disk`
+  settles the item without a restart, and as lost when the file was removed
+  first.
+- The transfer property test gained random unconfirmed items and
+  whole-transfer stops, and asserts that an unconfirmed item stays
+  unconfirmed. Requiring a verifying item first made the state too rare for
+  256 cases to find the break, so the property marks any unfinished item,
+  as recovery can.
+- `storage::tests::a_finished_transfer_keeps_no_content_in_the_database`
+  reads the database file itself: a declined text is gone, a paused one is
+  still there, and both digests survive a restart.
+- `storage::tests::a_schema_1_database_drops_the_previews_of_finished_transfers`
+  builds a schema 1 file with a finished row and a deleted one and checks
+  that neither text is left after the upgrade.
+- `declined_text_leaves_no_copy_in_either_database` declines a text through
+  the CLI and searches both devices' database files for it.
+
+Two older tests claimed more than they checked. The redaction test proves
+that a value wrapped in `Redacted` stays out of the log, not that every call
+site wraps its secrets, and the abort test proves that `tasks::observe`
+aborts on a panicked task, not that every task owner calls it. They are
+now `values_wrapped_in_redacted_never_reach_the_output` and
+`observing_a_panicked_task_stops_the_process`, with module notes that say
+what they leave out.
+
+## 24. Two gaps in those fixes
+
+A second pass over entry 23 found one gap in each fix. Both came from
+treating two different situations as one.
+
+**An unreadable folder is not a missing file.** The maintenance recheck
+reused `partial_evidence`, which turned every error into `Lost`: a folder
+it could not open, or a name it could not stat. The review made the
+destination unreadable after an unsynced rename. The file was still there,
+but the recheck marked it lost, cleanup removed its ledger row, and the
+restart could no longer find it.
+
+```diagram
+before                                   after
+reopen or stat fails ─▶ Lost             missing, replaced, linked ─▶ Lost
+                                         EACCES, EIO, ... ─────────▶ Unreadable: no change
+```
+
+`Evidence::Unreadable` now covers any error that says nothing about the
+file. `record` leaves the item as it is, so an unconfirmed item waits for
+the next pass and an ordinary item is paused at startup like kept work. A
+missing folder, one replaced by another directory, or a path that now runs
+through a link still counts as lost, since the recorded folder is no longer
+there to hold the file. `Recovered::unreadable` counts these items. If the
+folder stays unreadable, the item stays unconfirmed and keeps its slot,
+which is the cost of never discarding a file that may exist.
+
+**The purge runs before the version changes.** The migration committed
+schema 2 and only then ran `VACUUM`. A stop between the two left a schema 2
+database that would never vacuum again, with old offers still in free
+pages; the review showed this by killing the process right after the
+commit.
+
+```diagram
+before: tx { schema 2 rows, version 2 } ─▶ VACUUM      (stop between: purge skipped forever)
+after:  VACUUM ─▶ tx { schema 2 rows, version 2 }      (stop before commit: all redone)
+```
+
+`VACUUM` cannot run inside a transaction, so it now runs first, while the
+file still says schema 1. The transaction that follows rewrites rows with
+`secure_delete` on, so it leaves nothing in free pages itself. A durable
+"purge pending" marker would also work, but it needs a new column and a
+second code path, and the order alone closes the gap.
+
+**Tests.** `an_unreadable_folder_leaves_an_unconfirmed_rename_for_a_later_check`
+removes every permission from the destination after the rename. It runs a
+maintenance check and a restart while the folder is unreadable, then
+restores access and expects the file published with nothing charged. With
+the old mapping it fails with `Failed(Lost)`, as the review saw.
+`a_migration_stopped_once_recorded_leaves_no_old_text` reruns the test
+binary as a child that aborts at the `migrated` crash point, right after
+the commit, and then searches the file for the old texts. With the old
+order, the dropped transfer's text is still there.
+
+## 25. Unreadable at startup means unconfirmed
+
+Entry 24 left items alone when their folder could not be read. That
+protected items already saved as unconfirmed, but not the crash it was
+meant for. A crash right after the rename, before the record, leaves the
+item saved as queued. Recovery found the folder unreadable, left the item,
+and then paused it with the rest of the transfer. Maintenance checks only
+unconfirmed items, so it never looked again, and a later cancel deleted the
+ledger row. The review drove exactly this through the debug CLI.
+
+```diagram
+before
+crash after rename ─▶ saved Queued ─▶ restart, folder unreadable ─▶ Paused
+                                                    cancel ─▶ Cancelled, row deleted, file orphaned
+after
+crash after rename ─▶ saved Queued ─▶ restart, folder unreadable ─▶ Unconfirmed
+          cancel ─▶ skipped, request kept ─▶ access back ─▶ recheck ─┬─ final name ─▶ Published
+                                                                     └─ partial    ─▶ Paused ─▶ Cancelled
+```
+
+`record` now maps `Evidence::Unreadable` to `Unconfirmed`. Only a
+receiving item whose partial file was recorded can get that evidence, and
+any such item may have been renamed, so it waits for the disk like an
+unsynced rename. `ItemState::Unconfirmed` now covers both reasons.
+
+More items can now sit unconfirmed while someone cancels or revokes, so
+those requests must not just vanish. `State::request_cancel` keeps the
+request in `cancels` when an unconfirmed item survives the cancel. When a
+maintenance check finds the file back under its partial name, the rename
+did not happen, and `recovery::settle` applies the revocation or the kept
+cancel to the now paused item. Expiry needs nothing extra, since
+`State::expire` picks up paused items on its next pass. A kept cancel lives
+in memory only, so a restart in between forgets it, and the item then
+pauses and expires like any paused work.
+
+**Tests.** `a_crash_after_the_rename_is_recovered_as_published` now
+restarts with the folder unreadable, cancels, restores access, waits for
+maintenance to publish the file, and restarts again. With entry 24's
+handling it ends `paused`, as in the review.
+`a_cancel_or_revocation_waits_for_the_disk_and_applies_if_the_rename_was_undone`
+moves the file back to its partial name after an unsynced rename, cancels
+or revokes, and expects the next check to end the item that way and delete
+the partial file.
+
+## 26. Startup expiry waits for the disk too
+
+Entry 25 carried a cancel and a revocation past an unreadable folder, but
+not the third thing startup decides: expiry. Recovery expires paused work
+when the resume window is over or when it cannot measure how long the
+service was stopped, because the wall clock reads earlier than its last
+saved reading. An unconfirmed item skips that expiry. Once access came
+back and the check found only the partial file, the item became paused.
+`State::expire` checks the deadline, which had not passed, and knows
+nothing of the unmeasured downtime, so the item stayed paused with its
+bytes on disk. The review reproduced this through the CLI with a clock
+rollback.
+
+```diagram
+restart, downtime unknown ─▶ expire_all (skips Unconfirmed)
+                          └▶ close_window: expires_ms = now, saved
+access back ─▶ recheck ─▶ partial only ─▶ Paused ─▶ settle: window closed ─▶ Expired
+```
+
+Recovery now saves its decision as the deadline: `State::close_window`
+sets `expires_ms` to the restart time, in memory and in the store. It runs
+before the check that skips transfers with only unconfirmed items, so those
+get it too. `recovery::settle` applies an expiry along with a revocation or
+a kept cancel, and `State::expire` would catch the same item on its next
+pass. Only transfers recovery handled at that start get a closed window,
+so work that starts afterwards keeps its full 7 days. The deadline is saved,
+so another restart before access returns still finds the window closed.
+A kept cancel, by contrast, is still lost on restart.
+
+**Tests.** The deferred-request test is now
+`what_happened_while_the_disk_could_not_tell_applies_once_the_rename_proves_undone`,
+with a case per request: cancel, revocation, and a restart with the folder
+unreadable while the clock reads a day behind its saved value. Each moves
+the file back to its partial name and runs two maintenance passes. Without
+the saved deadline, the third case ends paused.
+
+## 27. Taking the carried-over requests back out
+
+Entries 25 and 26 made a cancel, a revocation, or a startup expiry that
+skipped an unconfirmed item apply later, if the disk showed the rename had
+never happened. That took a kept cancel in `cancels`, a saved deadline
+(`State::close_window` and `Store::save_expiry`), three extra branches in
+`recovery::settle`, and a three-case test. Looking at the whole change
+again, it was more machinery than the case is worth, so it is gone.
+
+The case needs a crash before the rename, a destination that cannot be
+read at that very restart, and a cancel, a revocation, or a clock set back
+while it stays unreadable. Without the extra code, what happens is this:
+
+```diagram
+unreadable at startup ─▶ Unconfirmed ─▶ cancel / revoke / expiry: skipped
+access back ─▶ recheck ─▶ partial only ─▶ Paused ─▶ expires when its window ends ─▶ partial deleted
+```
+
+No record is lost and nothing is reported as published, so the defects of
+entries 23 to 25 stay fixed. The cost is an unfinished partial file that
+waits up to the 7-day resume window instead of going at once, and stays
+charged until then. A revoked peer cannot use the paused item, because a
+resume checks trust first. The rule is simpler to hold in one's head: an
+item the disk cannot vouch for waits for the disk, and paused work expires
+on its schedule.
+
+What stays from entry 25 is the part that protects records:
+`Evidence::Unreadable` maps to `Unconfirmed`, and
+`a_crash_after_the_rename_is_recovered_as_published` still drives the
+crash, the unreadable restart, the cancel, and the publication.
+
+## 28. Unconfirmed items keep their stop, and blocking jobs supervise themselves
+
+**Entry 27 broke a promise of the plan.** It took out the code that carried
+a cancel, a revocation, or a startup expiry past an unconfirmed item, on
+the argument that the worst case was a cleanup delay. The next review
+pointed at `PROJECT.md`: revocation "cancels active and paused transfers",
+and every terminal outcome schedules cleanup. Once the disk showed only the
+partial file, the item became paused, nothing was scheduled for deletion,
+and its bytes stayed charged. The argument had not checked the plan.
+
+The fix is smaller than what entry 27 removed, and it survives a restart.
+The kept stop lives in the item state itself:
+
+```diagram
+Unconfirmed(None) ── cancel / revoke / expire ──▶ Unconfirmed(Some(stop))    first stop wins
+Unconfirmed(stop) ── disk: final file ──────────▶ Published                  stop dropped
+Unconfirmed(Some) ── disk: partial only ────────▶ the stop: Cancelled or Expired, partial deleted
+Unconfirmed(None) ── disk: partial only ────────▶ Paused
+```
+
+`ItemState::Unconfirmed` carries an `Option<Stop>`, where `Stop` is a cancel
+with its cause or an expiry. `Transfer::cancel`, `revoke`, and `expire_all`
+share `stop_all`, which ends stoppable items and lets an unconfirmed one
+keep the first stop it meets, the way a terminal state never changes.
+`found_on_disk` turns "paused" into the kept stop, and keeps the stop when
+the item stays unconfirmed. The state saves as its name, for example
+`unconfirmed:cancelled:revoked`, so no new column or in-memory set is
+needed, and status shows the pending stop. Startup recovery now runs its
+revocation and expiry checks for transfers whose only unfinished items are
+unconfirmed, so those keep the decision too; it still pauses only items
+that can pause.
+
+Runtime expiry needs nothing new. `State::expire` checks paused items
+against their deadline, and an item settled as paused after its window
+ended expires on the next pass.
+
+**A blocking job's panic no longer depends on its waiter.** Both blocking
+helpers awaited the job's handle and passed the result to
+`tasks::observe`. When the request awaiting a job was cancelled, as when
+its client disconnects, the handle went with it. The job kept running and
+kept its permit, but a later panic in it was caught by Tokio and seen by
+nobody, and the process went on with possibly half-changed state. The bug
+was there before these reviews.
+
+`tasks::spawn_blocking` runs the job under `catch_unwind` and calls `fatal`
+on a panic, on the job's own thread. Both helpers use it. The review
+suggested moving the handles into an owner set instead; that would also
+work, but every owner would then have to drain it, and checking at the
+source covers every waiter at once. The command line's terminal reads keep
+plain `spawn_blocking`: that process holds no shared state, and a panic
+there already becomes an error.
+
+**Tests.** `a_kept_stop_ends_the_item_once_the_disk_shows_no_rename` covers
+the case the review found, the disk showing only the partial file. Three
+stops (cancel, revocation, and a restart with the folder unreadable and the
+clock a day behind) are each settled two ways, by a maintenance pass and by
+a restart. Each must end the item as that stop and delete the partial file.
+Without the kept stop, the first case ends paused, as in the review. The
+crash journey covers the other case: it now expects
+`unconfirmed:cancelled:receiver` after its cancel and still ends published,
+because the final file is there. The transfer property gained a check that
+a kept stop never changes. In `tests/fatal.rs`,
+`a_blocking_job_that_panics_after_its_waiter_left_stops_the_process`
+starts a job, aborts the task awaiting it, then lets the job panic. With
+plain `spawn_blocking`, the child survives and prints its marker.
+
+## 29. The unused redaction wrapper is gone
+
+`diagnostics::Redacted<T>` printed any value as `[redacted]`, and the module
+note said secrets and payloads go through it. Nothing did: no production
+code used it, and its only test proved that a type printing a constant
+prints that constant. The secrets that exist are protected another way.
+`DeviceKey`, `KeyBundle`, and `InvitationSecret` print as `[redacted]` from
+their own `Debug`, which their own tests check, so logging one by mistake
+shows nothing.
+
+The wrapper and its test are removed, and the module note now says where
+redaction really happens. A wrapper that nothing calls only suggests a
+protection that is not there. If a payload ever needs logging, it should
+get a type of its own that cannot print its contents, as the keys have.
+
+## 30. Parsing a kept stop without recursion
+
+`ItemState::from_name` read `unconfirmed:<rest>` by parsing `<rest>` as a
+whole item state and then refusing anything but a cancel or an expiry. A
+damaged `items.state` value with many `unconfirmed:` prefixes recursed once
+per prefix before reaching that refusal, so a long enough value overflowed
+the stack and aborted startup instead of failing as a damaged database.
+Only local, already damaged state could trigger it.
+
+The parser now matches the two allowed suffixes directly, `cancelled:<cause>`
+or `expired`, and refuses everything else, nesting included.
+`unconfirmed_names_round_trip_and_nesting_is_refused` checks that every
+kept stop survives its own name and that bad suffixes, including a million
+nested prefixes, give `None`. With the recursive parser, that test
+overflows its stack.

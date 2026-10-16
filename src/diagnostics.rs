@@ -1,5 +1,5 @@
-//! Diagnostics, off unless `HYAKUME_LOG` names a level. Secrets and payloads
-//! go through [`Redacted`] before formatting, so they never reach a buffer.
+//! Diagnostics, off unless `HYAKUME_LOG` names a level. Secret types print
+//! as `[redacted]` in their own `Debug`, so logging one shows nothing.
 //! [`BoundedLines`] escapes control and hidden characters and cuts lines at
 //! [`MAX_LINE_BYTES`], so logged text cannot add lines or grow unbounded.
 
@@ -23,21 +23,6 @@ pub const MAX_LINE_BYTES: usize = 4 * 1024;
 pub const LEVEL_VAR: &str = "HYAKUME_LOG";
 
 const SHORTENED: &[u8] = b" [shortened]";
-
-/// A value diagnostics show only as `[redacted]`.
-pub struct Redacted<T>(pub T);
-
-impl<T> std::fmt::Debug for Redacted<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
-
-impl<T> std::fmt::Display for Redacted<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
 
 /// Parses a `HYAKUME_LOG` value. Unknown values turn diagnostics off.
 pub fn level(value: Option<&str>) -> LevelFilter {

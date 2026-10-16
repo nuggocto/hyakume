@@ -702,6 +702,30 @@ fn two_services_pair_and_exchange_every_kind_of_payload_through_the_cli() {
 }
 
 #[test]
+fn declined_text_leaves_no_copy_in_either_database() {
+    let p = pair();
+    let inbox = p.home.folder("inbox");
+    let mut rx = Tty::spawn(&p.b, &["receive", "--dir", inbox.to_str().unwrap()]);
+    rx.expect("Receiving into");
+    // Short enough that the offer's preview is the whole text.
+    let secret = "declined-note-0b6e93d1";
+    let (out, _) = offer(&p, &mut rx, &["--text", secret], b"", false);
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out));
+
+    // The sender finished when it heard the answer, and the receiver
+    // finished before it answered.
+    for side in [&p.a, &p.b] {
+        let db = std::fs::read(side.state.join("hyakume.db")).unwrap();
+        assert!(
+            !db.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            "the text is still in {}",
+            side.state.display()
+        );
+    }
+    assert!(names(&inbox).is_empty());
+}
+
+#[test]
 fn a_second_service_for_the_same_state_is_refused() {
     let home = Home::new();
     let mut first = Service::new(&home, "alpha");
@@ -877,12 +901,32 @@ fn a_crash_after_the_rename_is_recovered_as_published() {
     assert_ne!(out.status.code(), Some(0), "{}", text(&out));
     drop(rx);
 
+    // The folder cannot be read at the restart, so nobody can tell yet
+    // whether the rename happened. A cancel must not drop the record of it.
+    let mode = |m| std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
     b.start();
     let transfers = b.json(&["transfers"]);
     let id = transfers["transfers"][0]["transfer"]
         .as_str()
         .unwrap()
         .to_owned();
+    let waiting = b.json(&["inspect", &id]);
+    let out = b.run(&["cancel", &id], b"");
+    let after_cancel = b.json(&["inspect", &id]);
+    mode(0o700).unwrap();
+    assert_eq!(waiting["items"][0]["state"], "unconfirmed", "{waiting}");
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out));
+    assert_eq!(
+        after_cancel["items"][0]["state"],
+        "unconfirmed:cancelled:receiver"
+    );
+
+    // Maintenance checks again once the folder can be read. The final file
+    // is there, so the kept cancel never applies, and a restart keeps it.
+    b.wait_status(|s| s["partial_bytes"] == 0);
+    b.stop();
+    b.start();
     let inspected = b.json(&["inspect", &id]);
     // The file under its final name is the one Hyakume wrote, so the
     // transfer is recorded as complete, and nothing stays charged.

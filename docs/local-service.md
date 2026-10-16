@@ -95,6 +95,8 @@ version and its build flags.
   epoch, and counts are within their limits. A row that fails is an
   explicit error; nothing is repaired silently.
 - The database file is 0600 inside the 0700 state directory.
+- `secure_delete` is on, so SQLite zeroes the bytes a write replaces or
+  removes instead of leaving them in a free page.
 
 | Table | Holds |
 | --- | --- |
@@ -102,10 +104,36 @@ version and its build flags.
 | `counters` | the next trust epoch; it survives `reset`, so no epoch is ever reused |
 | `trust` | device, alias, declared name, epoch or revoked |
 | `offered` | the last 4,096 offered transfer IDs |
-| `transfers`, `items` | direction, peer and epoch, the encoded offer, offer and item states, receive folder, output names, source paths, created and expiry times |
+| `transfers`, `items` | direction, peer and epoch, the encoded offer (without its preview once finished) and its digest, offer and item states, receive folder, output names, source paths, created and expiry times |
 | `files` | the ledger of Hyakume's own files (below) |
 
 Nothing secret is stored: no key, passphrase, or invitation.
+
+**A finished transfer keeps no content: accepted.** A text or link offer
+carries a preview of up to 4 KiB, and for short text the preview is the
+whole payload. Schema 1 saved the whole offer and kept it for as long as
+the transfer stayed in history. Only new transfers push old ones out, so
+on a quiet installation that could be forever, which broke the rule that
+nothing of a payload is kept after a terminal outcome.
+
+The preview now lives as long as the files that hold the payload: while
+the transfer is unfinished, because a resume would check the text against
+it. The write that gives a finished transfer its finish order also
+replaces its saved offer with one that has no preview, and memory drops
+the preview at the same moment. The offer's digest, which the acceptance
+named, is saved in its own column (schema 2), and `Offer::digest` returns
+the digest computed at validation rather than one recomputed from what is
+left, so a finished offer still names what was accepted. Loading checks an
+unfinished transfer's offer against its saved digest. A finished one has
+lost its preview, so its saved digest is taken as it is.
+
+Moving a schema 1 database first runs `VACUUM`, because schema 1 wrote
+without `secure_delete` and free pages may still hold offers of transfers
+dropped long ago. Then one transaction adds the column and drops the
+previews of finished transfers, with `secure_delete` on, and records schema
+2. The version changes last, so a stop anywhere before it redoes the whole
+step at the next open, and once it is recorded nothing is left to purge. Item names, sizes, and output names stay, since status shows
+them.
 
 **Invitations are not stored: accepted, as a change to the plan.** The plan
 proposed saving invitations with their secrets encrypted under a vault key.
@@ -259,19 +287,44 @@ records it.
 
 If the rename succeeds but the directory sync fails, nobody can say yet
 whether the name survives a crash. The item is neither published nor
-failed: it pauses, keeping its ledger row with the file's inode, and the
-rest of the batch is cancelled. The sender is told `storage-failed`, never
-`published`. Startup recovery settles the item: the file under its output
-name counts as published only if a new sync of the folder succeeds then.
-On ext4, XFS, and btrfs a name is journaled metadata, and a failed commit
-aborts the journal and leaves the filesystem read-only, so a later sync
-that succeeds means the rename is on disk. Until then the item stays
-paused, and if it expires first, the file stays where it is. This needs a
-new transition, verifying to paused, which shutdown already made directly.
-The paused transfer outlives its session, so the session hands its place
-among the unfinished transfers to the state, which lets it go when the
-transfer ends. Before, the place went with the session, and paused
-transfers could pile up past the limit until the next unlock.
+failed: it becomes `unconfirmed`, keeping its ledger row with the file's
+inode, and the rest of the batch is cancelled. The sender is told
+`storage-failed`, never `published`. Only the disk settles an unconfirmed
+item. Startup recovery and every maintenance pass (each 5 s) check it the
+same way: the file under its output name counts as published only if a new
+sync of the folder succeeds. On ext4, XFS, and btrfs a name is journaled
+metadata, and a failed commit aborts the journal and leaves the filesystem
+read-only, so a later sync that succeeds means the rename is on disk.
+
+**An unconfirmed rename is its own item state: accepted.** The item used
+to pause, so anything that ends paused work ended it too. A cancel, a
+revocation, or expiry made it terminal, its ledger row went to `delete`,
+and startup recovery skips finished transfers. The file stayed under its
+final name while the transfer reported cancelled or expired for good. An
+outside review reproduced this for all three with a real rename and a
+restart. Cancelling, revoking, and expiring no longer end an unconfirmed
+item: it keeps the first such stop in its own state, saved as for example
+`unconfirmed:cancelled:revoked`, and the item table refuses every event
+from it. `Transfer::found_on_disk` is the only way out. If the disk shows
+the final file, the item is published and the kept stop is dropped:
+the rename happened under the state lock before trust changed, the same
+order that keeps any published item published. If it shows only the
+partial file, no rename happened, and the kept stop ends the item, so a
+revocation still cancels the work and cleanup deletes the partial file, as
+the plan requires. With no kept stop the item becomes paused work.
+
+The folder may also be unreadable at startup. A crash right after the
+rename leaves the item saved as queued, so recovery cannot rule the rename
+out, and the item becomes unconfirmed too, keeping any revocation or
+expiry that startup applies to its transfer.
+
+A transfer whose only unfinished items are unconfirmed has no connection,
+so it counts as paused for its place among the unfinished transfers. Its
+outcome shows as `unconfirmed`, it never expires, and `cancel` returns at
+once instead of waiting for an end only the disk can bring. The session
+hands that place to the state, which lets it go when the transfer ends.
+Before, the place went with the session, and paused transfers could pile
+up past the limit until the next unlock.
 
 The sender's spool goes as for any failed item. Keeping it would help only
 a resume, which this version does not have.
@@ -285,14 +338,15 @@ file keeps mode 0600 from its partial.
 | Saved state | Evidence | Result |
 | --- | --- | --- |
 | offer not answered | — | rejected: interrupted |
-| receiving item, partial recorded | the output name has the partial's inode, and the folder syncs | published |
-| | the output name has the partial's inode, but the folder does not sync | kept, paused |
+| receiving item, partial recorded (unconfirmed included) | the output name has the partial's inode, and the folder syncs | published |
+| | the output name has the partial's inode, but the folder does not sync | unconfirmed, checked again on each maintenance pass |
 | | the partial still has its inode | kept, paused |
-| | neither | failed: lost |
+| | the folder or a name in it cannot be read | unconfirmed, checked again on each maintenance pass |
+| | the folder is gone or replaced, or neither name has the inode | failed: lost |
 | sending item from a spool | spool present, same inode and size, read-only | kept, paused |
 | | otherwise | failed: lost |
-| peer revoked or re-paired | — | cancelled: revoked |
-| resume window over, clock behind, or time stopped unmeasurable | — | expired |
+| peer revoked or re-paired | — | cancelled: revoked; an unconfirmed item keeps it until the disk decides |
+| resume window over, clock behind, or time stopped unmeasurable | — | expired; an unconfirmed item keeps it until the disk decides |
 | a spool file no row records | named `<transfer>.spool`, a regular file of this user | recorded for deletion, charged until cleanup deletes it (input that never finished) |
 | | anything else in the spool folder | left alone, counted, and logged |
 | transfer ended but not given its finish order | — | given the next one |
@@ -569,8 +623,11 @@ A send recorded but still waiting for its task when the node stops never
 runs; its transfer is ended by a guard the send carries from the moment it
 is recorded, so nothing stays offered with no task behind it.
 
-Each blocking job holds a permit until it really ends, even if the task
-that started it is gone: file work holds one of the node's, and the
+Each blocking job runs through `tasks::spawn_blocking`, which stops the
+process if the job panics, from the job's own thread. The request awaiting
+a job can end first, as when its client disconnects, and its dropped handle
+would otherwise let the panic go unseen. Each blocking job also holds a
+permit until it really ends, even if the task that started it is gone: file work holds one of the node's, and the
 service's own jobs one of the service's. A drain therefore succeeds only
 after taking back every permit of both. The rename that publishes an item
 is the exception; it runs inside the state lock so revocation cannot slip
@@ -627,7 +684,14 @@ start recovers. A worker that panics still stops the process.
 | A Secret Service in an isolated keyring | `a_secret_service_key_unlocks_at_start_and_is_deleted_on_reset` (`mise run test-keyring`) |
 | A Secret Service that wants someone to confirm creating or deleting the key | `secrets::tests::a_secret_service_that_wants_confirmation_never_gets_to_ask` |
 | The session key exchange | `secrets::tests::both_sides_of_the_key_exchange_agree_and_trivial_values_are_refused` |
-| A folder sync failure after the rename, and the paused transfer's place | `receive::tests::a_rename_whose_folder_cannot_be_synced_is_never_acknowledged` |
+| A folder sync failure after the rename: cancel, revocation, and expiry leave the item, and the transfer keeps its place | `receive::tests::a_rename_whose_folder_cannot_be_synced_is_never_acknowledged` |
+| The same with a real rename, cleanup, and a restart; maintenance settling it while running | `recovery::tests::an_unconfirmed_rename_survives_cancel_revocation_expiry_and_cleanup_until_recovery_publishes_it`, `recovery::tests::maintenance_settles_an_unconfirmed_rename_from_the_disk` |
+| An unconfirmed rename in a folder that cannot be read | `recovery::tests::an_unreadable_folder_leaves_an_unconfirmed_rename_for_a_later_check` |
+| A cancel, revocation, or startup expiry kept by an unconfirmed item, settled by maintenance or a restart once only the partial file is found | `recovery::tests::a_kept_stop_ends_the_item_once_the_disk_shows_no_rename` |
+| A blocking job that panics after the request awaiting it is gone | `tests/fatal.rs` `a_blocking_job_that_panics_after_its_waiter_left_stops_the_process` |
+| A crash after the rename, then a restart with the folder unreadable and a cancel | `a_crash_after_the_rename_is_recovered_as_published` |
+| A schema 1 database upgraded, and an upgrade stopped right after it is recorded | `storage::tests::a_schema_1_database_drops_the_previews_of_finished_transfers`, `storage::tests::a_migration_stopped_once_recorded_leaves_no_old_text` |
+| Declined text in neither database file; previews of a schema 1 database | `declined_text_leaves_no_copy_in_either_database`, `storage::tests::a_finished_transfer_keeps_no_content_in_the_database`, `storage::tests::a_schema_1_database_drops_the_previews_of_finished_transfers` |
 | Making room when deleting the oldest transfer fails | `storage::tests::transfers_that_failed_to_make_room_still_make_room_later` |
 | Oversized frames, unknown operations, stale answers, the ninth client | `the_local_socket_refuses_bad_frames_stale_answers_and_extra_clients` |
 | A second service for the same state | `a_second_service_for_the_same_state_is_refused` |
