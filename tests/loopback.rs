@@ -12,11 +12,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyakume::files::destination::Destination;
+use hyakume::files::source::{PreparedItem, Source};
 use hyakume::identity::{DeviceId, DeviceKey};
 use hyakume::ids::TransferId;
 use hyakume::invitation::{InvitationToken, TOKEN_PREFIX};
-use hyakume::limits::{Limits, MAX_CHUNK_BYTES, MAX_CLAIMANTS, MIN_BUFFER_BYTES, Usage};
-use hyakume::node::{Node, NodeConfig, NodeError, PROMPT_QUEUE, Payload, Prompt, SendOptions};
+use hyakume::limits::{
+    Limits, MAX_CHUNK_BYTES, MAX_CLAIMANTS, MAX_PREVIEW_BYTES, MIN_BUFFER_BYTES, Usage,
+};
+use hyakume::node::{
+    Node, NodeConfig, NodeError, PROMPT_QUEUE, Prepared, Prompt, SendOptions, SendReport,
+};
+use hyakume::offer::PayloadKind;
 use hyakume::pairing::{PairingError, Verifier};
 use hyakume::protocol::{self, ErrorCode, Hello, Message, Purpose};
 use hyakume::state::State;
@@ -24,12 +30,79 @@ use hyakume::transfer::{
     BatchOutcome, CancelCause, FailCause, ItemState, OfferState, RejectCause, Unsuccessful,
 };
 use hyakume::trust::TrustError;
+use iroh::EndpointAddr;
 use rand_core::{OsRng, RngCore};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, sleep_until, timeout};
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const MIB: usize = 1024 * 1024;
+
+/// Content held in memory, for these tests to offer.
+enum Payload {
+    Text(String),
+    Url(String),
+    Files(Vec<(String, Vec<u8>)>),
+}
+
+impl Payload {
+    /// Prepares the content as a new transfer.
+    fn prepare(self) -> Prepared {
+        let memory = |name: Vec<u8>, bytes: Vec<u8>| PreparedItem {
+            name,
+            size: bytes.len() as u64,
+            digest: *blake3::hash(&bytes).as_bytes(),
+            source: Source::Memory(Arc::new(bytes)),
+        };
+        let text = |kind, text: String| {
+            let bytes = text.into_bytes();
+            let preview = bytes[..bytes.len().min(MAX_PREVIEW_BYTES)].to_vec();
+            (kind, vec![memory(Vec::new(), bytes)], preview)
+        };
+        let (kind, items, preview) = match self {
+            Payload::Text(t) => text(PayloadKind::Text, t),
+            Payload::Url(u) => text(PayloadKind::Url, u),
+            Payload::Files(files) => (
+                PayloadKind::Files,
+                files
+                    .into_iter()
+                    .map(|(name, bytes)| memory(name.into_bytes(), bytes))
+                    .collect(),
+                Vec::new(),
+            ),
+        };
+        let paths = vec![None; items.len()];
+        Prepared {
+            transfer: TransferId::random(&mut OsRng),
+            kind,
+            items,
+            preview,
+            paths,
+        }
+    }
+}
+
+/// Uses an invitation through the join the node owns, as the service does.
+async fn use_invitation(node: &Node, token: &str, alias: &str) -> Result<DeviceId, NodeError> {
+    node.start_join(token, alias)?
+        .await
+        .unwrap_or(Err(NodeError::Stopping))
+}
+
+/// Sends through the send the node owns, as the service does, and waits for
+/// its end. Only a failure before the offer arrived is an error; after
+/// that, the report tells.
+async fn send_prepared(
+    node: &Node,
+    to: DeviceId,
+    at: EndpointAddr,
+    prepared: Prepared,
+    options: SendOptions,
+) -> Result<SendReport, NodeError> {
+    let (transfer, done) = node.start_send(to, at, prepared, options)?;
+    done.await.unwrap_or(Err(NodeError::Stopping))?;
+    node.report(transfer).ok_or(NodeError::Unexpected)
+}
 
 struct Peer {
     node: Node,
@@ -127,7 +200,7 @@ async fn answer_offer(prompts: &mut mpsc::Receiver<Prompt>, accept: bool) -> Str
 /// verifier each side showed.
 async fn pair(a: &mut Peer, b: &mut Peer) -> (Verifier, Verifier) {
     let token = a.node.invite("b").unwrap().1;
-    let join = b.node.join(&token, "a");
+    let join = use_invitation(&b.node, &token, "a");
     let (joined, (_, va), (_, vb)) = timeout(DEADLINE, async {
         tokio::join!(
             join,
@@ -150,8 +223,9 @@ async fn send_and_answer(
     to: &mut Peer,
     payload: Payload,
     accept: bool,
-) -> (hyakume::node::SendReport, String) {
-    let send = from.node.send(
+) -> (SendReport, String) {
+    let send = send_prepared(
+        &from.node,
         to.node.device(),
         to.node.addr(),
         payload.prepare(),
@@ -166,7 +240,7 @@ async fn send_and_answer(
 }
 
 /// Waits until the receiving node reports the same final outcome.
-async fn settled(node: &Node, report: &hyakume::node::SendReport) {
+async fn settled(node: &Node, report: &SendReport) {
     let transfer = report.transfer;
     node.wait_until(DEADLINE, |s| {
         s.transfer(&transfer).is_some_and(|t| t.is_terminal())
@@ -196,7 +270,7 @@ async fn people_who_answer_after_the_handshake_deadline_still_pair_and_receive()
         peer_with("beta", quick).await,
     );
     let token = a.node.invite("b").unwrap().1;
-    let join = b.node.join(&token, "a");
+    let join = use_invitation(&b.node, &token, "a");
     let answer_late = async {
         let mut answers = Vec::new();
         for prompts in [&mut a.prompts, &mut b.prompts] {
@@ -215,7 +289,8 @@ async fn people_who_answer_after_the_handshake_deadline_still_pair_and_receive()
         .unwrap();
     assert_eq!(joined.unwrap(), a.node.device());
 
-    let send = b.node.send(
+    let send = send_prepared(
+        &b.node,
         a.node.device(),
         a.node.addr(),
         Payload::Text("slow yes".into()).prepare(),
@@ -305,7 +380,8 @@ async fn a_rejected_offer_creates_no_received_payload() {
 async fn a_question_dropped_without_an_answer_is_refused_as_busy_not_declined() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
     pair(&mut a, &mut b).await;
-    let send = a.node.send(
+    let send = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         Payload::Text("hi".into()).prepare(),
@@ -358,9 +434,13 @@ async fn cancelling_mid_transfer_ends_both_sides_and_releases_capacity() {
         gate: Some(Arc::new(Semaphore::new(1))),
     };
     let payload = Payload::Files(vec![("big".into(), vec![9u8; 64 * 1024])]);
-    let send = a
-        .node
-        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
+    let send = send_prepared(
+        &a.node,
+        b.node.device(),
+        b.node.addr(),
+        payload.prepare(),
+        options,
+    );
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
         // One chunk was allowed through; the receiver is now mid-item.
@@ -391,9 +471,13 @@ async fn the_receiver_can_cancel_mid_transfer_too() {
         gate: Some(Arc::new(Semaphore::new(1))),
     };
     let payload = Payload::Files(vec![("big".into(), vec![9u8; 64 * 1024])]);
-    let send = a
-        .node
-        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
+    let send = send_prepared(
+        &a.node,
+        b.node.device(),
+        b.node.addr(),
+        payload.prepare(),
+        options,
+    );
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
         b.node.wait_until(DEADLINE, mid_item).await.unwrap();
@@ -423,9 +507,13 @@ async fn revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_se
         gate: Some(gate.clone()),
     };
     let payload = Payload::Files(vec![("big".into(), vec![1u8; 32 * 1024])]);
-    let send = a
-        .node
-        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
+    let send = send_prepared(
+        &a.node,
+        b.node.device(),
+        b.node.addr(),
+        payload.prepare(),
+        options,
+    );
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
         b.node.wait_until(DEADLINE, mid_item).await.unwrap();
@@ -444,26 +532,24 @@ async fn revoking_the_sender_mid_transfer_publishes_nothing_and_refuses_later_se
     assert!(received(&b).is_empty());
 
     // The revoked device still trusts b, but b refuses the session.
-    let retry = a
-        .node
-        .send(
-            b.node.device(),
-            b.node.addr(),
-            Payload::Text("again".into()).prepare(),
-            SendOptions::default(),
-        )
-        .await;
+    let retry = send_prepared(
+        &a.node,
+        b.node.device(),
+        b.node.addr(),
+        Payload::Text("again".into()).prepare(),
+        SendOptions::default(),
+    )
+    .await;
     assert_eq!(retry.err(), Some(NodeError::Peer(ErrorCode::NotTrusted)));
     // b can no longer send to a either.
-    let back = b
-        .node
-        .send(
-            a.node.device(),
-            a.node.addr(),
-            Payload::Text("x".into()).prepare(),
-            SendOptions::default(),
-        )
-        .await;
+    let back = send_prepared(
+        &b.node,
+        a.node.device(),
+        a.node.addr(),
+        Payload::Text("x".into()).prepare(),
+        SendOptions::default(),
+    )
+    .await;
     assert_eq!(back.err(), Some(NodeError::Trust(TrustError::Revoked)));
     assert!(received(&b).is_empty());
 }
@@ -478,9 +564,13 @@ async fn fresh_pairing_after_revocation_allows_new_work_without_reviving_old_wor
         gate: Some(gate),
     };
     let payload = Payload::Files(vec![("old".into(), vec![2u8; 8 * 1024])]);
-    let send = a
-        .node
-        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
+    let send = send_prepared(
+        &a.node,
+        b.node.device(),
+        b.node.addr(),
+        payload.prepare(),
+        options,
+    );
     let drive = async {
         answer_offer(&mut b.prompts, true).await;
         // Accepted, and no chunk can pass the closed gate.
@@ -501,7 +591,7 @@ async fn fresh_pairing_after_revocation_allows_new_work_without_reviving_old_wor
 
     // Pair again: b invites this time, and both sides trust anew.
     let token = b.node.invite("a2").unwrap().1;
-    let join = a.node.join(&token, "b2");
+    let join = use_invitation(&a.node, &token, "b2");
     let (joined, _, _) = timeout(DEADLINE, async {
         tokio::join!(
             join,
@@ -541,7 +631,7 @@ async fn a_wrong_secret_fails_pairing_and_trusts_no_one() {
     parsed = InvitationToken::from_bytes(&wrong).unwrap();
     let wrong_text = parsed.to_text().unwrap();
     assert!(wrong_text.starts_with(TOKEN_PREFIX));
-    let result = timeout(DEADLINE, b.node.join(&wrong_text, "a"))
+    let result = timeout(DEADLINE, use_invitation(&b.node, &wrong_text, "a"))
         .await
         .unwrap();
     assert_eq!(
@@ -558,7 +648,7 @@ async fn a_wrong_secret_fails_pairing_and_trusts_no_one() {
 async fn a_declined_verifier_saves_no_trust_and_closes_the_invitation() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
     let token = a.node.invite("b").unwrap().1;
-    let join = b.node.join(&token, "a");
+    let join = use_invitation(&b.node, &token, "a");
     let (joined, _, _) = timeout(DEADLINE, async {
         tokio::join!(
             join,
@@ -580,7 +670,9 @@ async fn a_declined_verifier_saves_no_trust_and_closes_the_invitation() {
     assert!(b.node.trusted().is_empty());
 
     // The same invitation cannot be tried again.
-    let again = timeout(DEADLINE, b.node.join(&token, "a")).await.unwrap();
+    let again = timeout(DEADLINE, use_invitation(&b.node, &token, "a"))
+        .await
+        .unwrap();
     assert_eq!(
         again.err(),
         Some(NodeError::Peer(ErrorCode::InvitationUnavailable))
@@ -591,7 +683,7 @@ async fn a_declined_verifier_saves_no_trust_and_closes_the_invitation() {
 async fn a_used_invitation_cannot_pair_another_device() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
     let token = a.node.invite("b").unwrap().1;
-    let join = b.node.join(&token, "a");
+    let join = use_invitation(&b.node, &token, "a");
     let (joined, _, _) = timeout(DEADLINE, async {
         tokio::join!(
             join,
@@ -603,7 +695,9 @@ async fn a_used_invitation_cannot_pair_another_device() {
     .unwrap();
     joined.unwrap();
     let c = peer("gamma").await;
-    let reuse = timeout(DEADLINE, c.node.join(&token, "a")).await.unwrap();
+    let reuse = timeout(DEADLINE, use_invitation(&c.node, &token, "a"))
+        .await
+        .unwrap();
     assert_eq!(
         reuse.err(),
         Some(NodeError::Peer(ErrorCode::InvitationUnavailable))
@@ -617,7 +711,7 @@ async fn join_and_report(
     token: &str,
     done: mpsc::Sender<(DeviceId, Result<DeviceId, NodeError>)>,
 ) {
-    let result = node.join(token, "a").await;
+    let result = use_invitation(node, token, "a").await;
     done.send((node.device(), result)).await.unwrap();
 }
 
@@ -696,7 +790,7 @@ async fn an_unanswered_verifier_times_out_without_trust() {
         peer_with("beta", short).await,
     );
     let token = a.node.invite("b").unwrap().1;
-    let join = b.node.join(&token, "a");
+    let join = use_invitation(&b.node, &token, "a");
     // a answers; b's person never does.
     let (joined, _) = timeout(DEADLINE, async {
         tokio::join!(join, answer_verify(&mut a.prompts, true))
@@ -716,15 +810,14 @@ async fn an_unanswered_verifier_times_out_without_trust() {
 #[tokio::test]
 async fn an_unpaired_device_cannot_start_a_session() {
     let (a, b) = (peer("alpha").await, peer("beta").await);
-    let result = a
-        .node
-        .send(
-            b.node.device(),
-            b.node.addr(),
-            Payload::Text("hi".into()).prepare(),
-            SendOptions::default(),
-        )
-        .await;
+    let result = send_prepared(
+        &a.node,
+        b.node.device(),
+        b.node.addr(),
+        Payload::Text("hi".into()).prepare(),
+        SendOptions::default(),
+    )
+    .await;
     assert_eq!(result.err(), Some(NodeError::Trust(TrustError::NotTrusted)));
 }
 
@@ -740,7 +833,8 @@ async fn shutdown_stops_the_endpoint_within_its_deadline() {
     timeout(DEADLINE, a.node.shutdown()).await.unwrap().unwrap();
     let after = timeout(
         DEADLINE,
-        b.node.send(
+        send_prepared(
+            &b.node,
             device,
             addr,
             Payload::Text("x".into()).prepare(),
@@ -765,7 +859,8 @@ async fn connections_past_the_limit_are_refused_before_any_handshake() {
     target.node.wait_idle(DEADLINE).await.unwrap();
     // The target's own session holds a connection too. It waits for an
     // answer that never comes.
-    let holding = target.node.send(
+    let holding = send_prepared(
+        &target.node,
         other.node.device(),
         other.node.addr(),
         Payload::Text("hold".into()).prepare(),
@@ -869,7 +964,7 @@ async fn pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither() {
     let for_b = a.node.invite("phone").unwrap().1;
     let for_c = a.node.invite("phone").unwrap().1;
     let (b_device, c_device) = (b.node.device(), c.node.device());
-    let b_join = b.node.join(&for_b, "a");
+    let b_join = use_invitation(&b.node, &for_b, "a");
     let drive = async {
         // Let b's exchange reach the verifier on both sides, but hold a's answer.
         let held = match timeout(DEADLINE, a.prompts.recv()).await.unwrap().unwrap() {
@@ -881,7 +976,7 @@ async fn pairing_that_cannot_be_saved_on_one_side_is_saved_on_neither() {
         };
         answer_verify(&mut b.prompts, true).await;
         // Meanwhile c pairs completely and takes the alias.
-        let c_join = c.node.join(&for_c, "a");
+        let c_join = use_invitation(&c.node, &for_c, "a");
         let (joined, (peer, _), _) = tokio::join!(
             c_join,
             answer_verify(&mut a.prompts, true),
@@ -912,7 +1007,7 @@ async fn an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken() {
     let for_b = a.node.invite("phone").unwrap().1;
     let for_c = a.node.invite("phone").unwrap().1;
     let (b_device, c_device) = (b.node.device(), c.node.device());
-    let b_join = b.node.join(&for_b, "a");
+    let b_join = use_invitation(&b.node, &for_b, "a");
     let drive = async {
         // a's person says yes to b; b's person has not answered yet.
         let (peer, _) = answer_verify(&mut a.prompts, true).await;
@@ -923,7 +1018,7 @@ async fn an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken() {
         };
         // Meanwhile c wants the same alias. Both people say yes, but a
         // already promised "phone" to b.
-        let c_join = c.node.join(&for_c, "a");
+        let c_join = use_invitation(&c.node, &for_c, "a");
         let (joined, (peer, _), _) = tokio::join!(
             c_join,
             answer_verify(&mut a.prompts, true),
@@ -950,24 +1045,21 @@ async fn an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken() {
 
 #[tokio::test]
 async fn abandoning_a_pairing_after_the_verifier_is_shown_closes_the_invitation() {
-    let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
+    let (mut a, mut b, c) = (peer("alpha").await, peer("beta").await, peer("gamma").await);
     let token = a.node.invite("b").unwrap().1;
-    let join = b.node.join(&token, "a");
-    let shown = async {
-        let on_a = timeout(DEADLINE, a.prompts.recv()).await.unwrap().unwrap();
-        let on_b = timeout(DEADLINE, b.prompts.recv()).await.unwrap().unwrap();
-        (on_a, on_b)
-    };
-    // Both screens show the words, nobody answers, and b gives up: the
-    // join is dropped, which closes its connection.
-    let unanswered = tokio::select! {
-        _ = join => panic!("the join ended before anyone answered"),
-        prompts = shown => prompts,
-    };
+    let join = b.node.start_join(&token, "a").unwrap();
+    let on_a = timeout(DEADLINE, a.prompts.recv()).await.unwrap().unwrap();
+    let on_b = timeout(DEADLINE, b.prompts.recv()).await.unwrap().unwrap();
+    // Both screens show the words, nobody answers, and b stops, which
+    // closes its connection. a's question is still open.
+    b.node.shutdown().await.unwrap();
+    assert_eq!(join.await.unwrap(), Err(NodeError::ConnectionLost));
     a.node.wait_idle(DEADLINE).await.unwrap();
-    drop(unanswered);
+    drop((on_a, on_b));
 
-    let again = timeout(DEADLINE, b.node.join(&token, "a")).await.unwrap();
+    let again = timeout(DEADLINE, use_invitation(&c.node, &token, "a"))
+        .await
+        .unwrap();
     assert_eq!(
         again.err(),
         Some(NodeError::Peer(ErrorCode::InvitationUnavailable))
@@ -976,7 +1068,7 @@ async fn abandoning_a_pairing_after_the_verifier_is_shown_closes_the_invitation(
 }
 
 #[tokio::test]
-async fn a_sender_that_disappears_mid_transfer_leaves_nothing_unfinished() {
+async fn a_sender_that_stops_mid_transfer_leaves_nothing_unfinished_on_the_receiver() {
     let (mut a, mut b) = (peer("alpha").await, peer("beta").await);
     pair(&mut a, &mut b).await;
     let options = SendOptions {
@@ -984,32 +1076,30 @@ async fn a_sender_that_disappears_mid_transfer_leaves_nothing_unfinished() {
         gate: Some(Arc::new(Semaphore::new(1))),
     };
     let payload = Payload::Files(vec![("big".into(), vec![3u8; 64 * 1024])]);
-    let send = a
+    let (transfer, _done) = a
         .node
-        .send(b.node.device(), b.node.addr(), payload.prepare(), options);
-    let mid_transfer = async {
-        answer_offer(&mut b.prompts, true).await;
-        b.node.wait_until(DEADLINE, mid_item).await.unwrap();
-    };
-    // The caller abandons the send halfway: its future is dropped.
-    tokio::select! {
-        _ = send => panic!("the gated send cannot finish"),
-        () = mid_transfer => {}
-    }
-    let transfer = a.node.transfers()[0].transfer;
-    assert_eq!(
-        a.node.report(transfer).unwrap().items,
-        [ItemState::Cancelled(CancelCause::Sender)]
-    );
+        .start_send(b.node.device(), b.node.addr(), payload.prepare(), options)
+        .unwrap();
+    answer_offer(&mut b.prompts, true).await;
+    b.node.wait_until(DEADLINE, mid_item).await.unwrap();
+
+    // a's service stops halfway: its side pauses, so it can resume.
+    a.node.shutdown().await.unwrap();
+    assert_eq!(a.node.report(transfer).unwrap().items, [ItemState::Paused]);
+    assert_eq!(a.node.usage(), Usage::default());
     b.node
         .wait_until(DEADLINE, |s| {
             s.transfer(&transfer).is_some_and(|t| t.is_terminal())
         })
         .await
         .unwrap();
+    // The receiver is not stopping, so its side fails rather than pauses.
+    assert_eq!(
+        b.node.report(transfer).unwrap().items,
+        [ItemState::Failed(FailCause::Connection)]
+    );
     assert!(received(&b).is_empty());
     b.node.wait_idle(DEADLINE).await.unwrap();
-    assert_eq!(a.node.usage(), Usage::default());
 }
 
 #[tokio::test]
@@ -1034,7 +1124,8 @@ async fn a_receiver_that_stops_reading_cannot_hold_a_send_past_its_write_deadlin
     reads.forget_permits(reads.available_permits());
     reads.add_permits(3);
     let payload = Payload::Files(vec![("big".into(), vec![5u8; 3 * 1024 * 1024])]);
-    let send = a.node.send(
+    let send = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         payload.prepare(),
@@ -1062,7 +1153,8 @@ async fn an_unanswered_offer_times_out_even_while_the_receiver_is_busy_elsewhere
     };
     let (mut a, mut b) = (peer("alpha").await, peer_with("beta", quick).await);
     pair(&mut a, &mut b).await;
-    let send = a.node.send(
+    let send = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         Payload::Text("hi".into()).prepare(),
@@ -1119,7 +1211,8 @@ async fn a_sender_whose_reader_is_stuck_still_ends_when_the_receiver_closes() {
     // reader waiting for buffer room would.
     reads.forget_permits(reads.available_permits());
     reads.add_permits(2);
-    let send = a.node.send(
+    let send = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         Payload::Text("hi".into()).prepare(),
@@ -1163,7 +1256,8 @@ async fn cancelling_a_send_that_waits_for_buffer_room_ends_it_at_once() {
     // closed gate. The second needs a full chunk, which takes all the room
     // this budget has for sending, so it waits.
     let gate = Arc::new(Semaphore::new(0));
-    let first = a.node.send(
+    let first = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         Payload::Text("x".into()).prepare(),
@@ -1196,7 +1290,8 @@ async fn cancelling_a_send_that_waits_for_buffer_room_ends_it_at_once() {
         ("a".into(), vec![1u8; MAX_CHUNK_BYTES]),
         ("b".into(), vec![2u8; 4]),
     ];
-    let second = a.node.send(
+    let second = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         Payload::Files(batch).prepare(),
@@ -1272,7 +1367,8 @@ async fn a_partial_file_that_cannot_be_written_fails_the_item_and_publishes_noth
         .0
         .join(format!(".hyakume-{}-0.part", "5a".repeat(16)));
     std::fs::create_dir(&blocked).unwrap();
-    let send = a.node.send(
+    let send = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         prepared,
@@ -1314,14 +1410,14 @@ async fn a_full_question_queue_refuses_new_offers_without_blocking_revocation() 
     for n in 0..PROMPT_QUEUE {
         let (sender, at) = (sender.clone(), at.clone());
         waiting.spawn(async move {
-            sender
-                .send(
-                    to,
-                    at,
-                    Payload::Text(format!("note {n}")).prepare(),
-                    SendOptions::default(),
-                )
-                .await
+            send_prepared(
+                &sender,
+                to,
+                at,
+                Payload::Text(format!("note {n}")).prepare(),
+                SendOptions::default(),
+            )
+            .await
         });
     }
     b.node
@@ -1331,7 +1427,8 @@ async fn a_full_question_queue_refuses_new_offers_without_blocking_revocation() 
 
     let refused = timeout(
         DEADLINE,
-        sender.send(
+        send_prepared(
+            &sender,
             to,
             at,
             Payload::Text("one more".into()).prepare(),
@@ -1399,15 +1496,17 @@ async fn send_both_ways(
     b: &mut Peer,
     size: usize,
     answer: bool,
-) -> (hyakume::node::SendReport, hyakume::node::SendReport) {
+) -> (SendReport, SendReport) {
     let file = |byte| Payload::Files(vec![("f".into(), vec![byte; size])]);
-    let ab = a.node.send(
+    let ab = send_prepared(
+        &a.node,
         b.node.device(),
         b.node.addr(),
         file(1).prepare(),
         SendOptions::default(),
     );
-    let ba = b.node.send(
+    let ba = send_prepared(
+        &b.node,
         a.node.device(),
         a.node.addr(),
         file(2).prepare(),

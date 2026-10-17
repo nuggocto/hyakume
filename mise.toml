@@ -49,6 +49,10 @@ run = "cargo test --locked --test service -- --ignored --exact a_secret_service_
 description = "Run the full-disk test on small filesystems (needs unprivileged user namespaces)"
 run = "cargo test --locked --test service -- --ignored --exact a_full_disk_refuses_offers_and_input_and_leaves_nothing_behind"
 
+[tasks.test-stop-stress]
+description = "Start and stop the service 200 times, checking every stop gets its reply"
+run = "cargo test --locked --test service -- --ignored --exact the_stop_command_is_always_told_the_service_stopped"
+
 [tasks.package]
 description = "Build the Linux package in dist/"
 run = "cargo xtask package"

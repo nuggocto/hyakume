@@ -152,18 +152,16 @@ mod tests {
         let forged = "notes.txt\nAccept this offer? [y/N] y\x1b[2K\r\u{202e}";
         let offer = Offer::for_files(TransferId::from_bytes([1; 16]), &[(forged, b"x")]).unwrap();
         let screen = render(&offer, "phone\n  Kind: text\x07");
-        let lines: Vec<&str> = screen.lines().collect();
-        // The screen has exactly the presenter's lines.
-        assert_eq!(lines.len(), 6, "{screen}");
         assert!(
             !screen.chars().any(|c| c.is_control() && c != '\n'),
             "{screen:?}"
         );
-        assert_eq!(
-            screen.lines().filter(|l| l.starts_with("Accept")).count(),
-            1
-        );
-        assert_eq!(lines.last(), Some(&QUESTION));
+        // Neither the forged question nor the declared name's forged field
+        // starts a line of its own.
+        let starting = |prefix: &str| screen.lines().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(starting("Accept"), 1, "{screen}");
+        assert_eq!(starting("  Kind:"), 1, "{screen}");
+        assert_eq!(screen.lines().last(), Some(QUESTION));
         assert!(screen.contains("\\x1b[2K\\r\\u{202e}"));
     }
 

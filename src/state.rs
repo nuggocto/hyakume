@@ -5,7 +5,8 @@
 //! becomes a success, and recovery settles what was left unfinished.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::watch;
 
@@ -16,6 +17,7 @@ use crate::invitation::{Invitation, InvitationState};
 use crate::limits::{Budget, MAX_OPEN_INVITATIONS, RESUME_WINDOW, TransferSlot};
 use crate::offer::Offer;
 use crate::storage::{Loaded, NewFile, Store, StoreError, stored};
+use crate::tasks;
 use crate::transfer::{CancelCause, FailCause, ItemState, PublishError, Transfer, TransitionError};
 use crate::trust::{Authority, LocalAlias, Reservation, TrustError, TrustStore, VerifiedPeer};
 
@@ -135,7 +137,9 @@ pub struct State {
     /// them. A slot goes when its transfer ends.
     paused_slots: BTreeMap<TransferId, TransferSlot>,
     /// The node is stopping: interrupted work pauses instead of failing.
-    pausing: bool,
+    /// Shutdown sets it without the lock, so a stalled lock holder cannot
+    /// delay the start of its drain deadline.
+    pausing: Arc<AtomicBool>,
     /// A write to the store failed; no new work starts until a restart.
     store_failed: bool,
     clock: LifetimeClock,
@@ -174,7 +178,7 @@ impl State {
             offered: offered.into(),
             cancels: BTreeSet::new(),
             paused_slots: BTreeMap::new(),
-            pausing: false,
+            pausing: Arc::default(),
             store_failed: false,
             clock: resumed.0,
             clock_saved_ms: clock.lifetime_ms,
@@ -601,7 +605,7 @@ impl State {
     /// Ends a transfer whose connection broke. While the node stops, the
     /// work pauses instead, so it can resume later.
     pub(crate) fn interrupt(&mut self, id: &TransferId, cause: FailCause) {
-        let pausing = self.pausing;
+        let pausing = self.pausing();
         self.update_transfer(id, |t| {
             if pausing {
                 t.pause_all();
@@ -633,11 +637,12 @@ impl State {
     /// Whether the node is stopping, so broken connections pause their
     /// work instead of failing it.
     pub fn pausing(&self) -> bool {
-        self.pausing
+        self.pausing.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn set_pausing(&mut self, pausing: bool) {
-        self.pausing = pausing;
+    #[cfg(test)]
+    pub(crate) fn set_pausing(&self, pausing: bool) {
+        self.pausing.store(pausing, Ordering::SeqCst);
     }
 
     /// Asks the connection carrying `id` to cancel it. Paused work has no
@@ -754,6 +759,8 @@ pub fn is_paused(t: &Transfer) -> bool {
 pub struct StateCell {
     state: Mutex<State>,
     changes: watch::Sender<u64>,
+    /// The state's pausing flag, reachable without the lock.
+    pausing: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for StateCell {
@@ -765,12 +772,20 @@ impl std::fmt::Debug for StateCell {
 impl StateCell {
     pub fn new(state: State) -> Self {
         Self {
+            pausing: state.pausing.clone(),
             state: Mutex::new(state),
             changes: watch::Sender::new(0),
         }
     }
 
+    /// Waits for the lock. Its holder may be writing to the database or
+    /// renaming a file, so the wait is a blocking one; see
+    /// [`tasks::blocking_here`].
     pub fn lock(&self) -> MutexGuard<'_, State> {
+        tasks::blocking_here(|| self.guard())
+    }
+
+    fn guard(&self) -> MutexGuard<'_, State> {
         // A panic while holding the lock stops the process (see tasks), so a
         // poisoned lock is never observed by surviving code.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -778,7 +793,7 @@ impl StateCell {
 
     /// Runs `f` on the state and wakes everything waiting for changes.
     pub fn change<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let result = f(&mut self.lock());
+        let result = tasks::blocking_here(|| f(&mut self.guard()));
         self.notify();
         result
     }
@@ -787,11 +802,16 @@ impl StateCell {
     /// something; otherwise a task woken by its own notification would wake
     /// itself again and spin.
     pub fn wake<T>(&self, f: impl FnOnce(&mut State) -> Vec<T>) -> Vec<T> {
-        let outputs = f(&mut self.lock());
+        let outputs = tasks::blocking_here(|| f(&mut self.guard()));
         if !outputs.is_empty() {
             self.notify();
         }
         outputs
+    }
+
+    /// Sets the pausing flag without waiting for the lock.
+    pub(crate) fn set_pausing(&self, pausing: bool) {
+        self.pausing.store(pausing, Ordering::SeqCst);
     }
 
     pub fn notify(&self) {

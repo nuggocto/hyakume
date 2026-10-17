@@ -6,19 +6,38 @@
 // Test helpers may stop the test on unexpected failures.
 #![allow(clippy::unwrap_used, clippy::panic)]
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const CHILD: &str = "HYAKUME_FATAL_TEST_CHILD";
 const SURVIVED: &str = "survived the panic";
+/// A child that hangs instead of aborting is killed after this long.
+const DEADLINE: Duration = Duration::from_secs(60);
 
 /// Runs `test` again in a child process and checks that it aborted.
 fn assert_child_aborts(test: &str) {
-    let output = Command::new(std::env::current_exe().unwrap())
+    let child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
         .env_remove("HYAKUME_LOG")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    // Its output is read while it runs, so a full pipe cannot stall it.
+    let pid = rustix::process::Pid::from_child(&child);
+    let (done, finished) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    let Ok(output) = finished.recv_timeout(DEADLINE) else {
+        // Not reaped yet, so the PID still names the child.
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        waiter.join().unwrap();
+        panic!("the child neither aborted nor ended in time");
+    };
+    waiter.join().unwrap();
+    let output = output.unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         !output.status.success(),

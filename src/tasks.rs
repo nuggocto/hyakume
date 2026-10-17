@@ -35,6 +35,18 @@ pub fn spawn_blocking<T: Send + 'static>(
     })
 }
 
+/// Runs `f`, which may block, without holding up other tasks: on a
+/// multi-thread runtime its worker first hands its other tasks to another
+/// thread. Elsewhere, such as in a single-thread test runtime, it just runs.
+pub fn blocking_here<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Name of the variable that makes a debug build stop at a crash point.
 pub const CRASH_VAR: &str = "HYAKUME_CRASH_AT";
 

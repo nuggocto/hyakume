@@ -145,9 +145,11 @@ impl Service {
             }
             let _ = tx.send(String::from_utf8_lossy(&line).into_owned());
         });
+        // Owned before waiting, so a service that never gets ready is
+        // still killed when the test fails.
+        self.child = Some(child);
         let line = rx.recv_timeout(DEADLINE).unwrap();
         assert!(line.starts_with("listening "), "{line} {}", self.log_text());
-        self.child = Some(child);
     }
 
     fn log_text(&self) -> String {
@@ -840,20 +842,54 @@ fn an_identity_whose_endpoint_cannot_start_stays_locked_and_is_never_replaced() 
     a.stop();
 }
 
+/// A bus socket that accepts connections and never answers. Dropping it
+/// stops its thread, which closes every connection it took.
+struct SilentBus {
+    path: PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SilentBus {
+    fn new(path: PathBuf) -> Self {
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming().flatten() {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                held.push(conn);
+            }
+        });
+        Self {
+            path,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for SilentBus {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wakes the accept loop so it sees the stop. Without that wake it
+        // would never return, so it is joined only after one.
+        let woke = std::os::unix::net::UnixStream::connect(&self.path).is_ok();
+        if let Some(thread) = self.thread.take().filter(|_| woke) {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[test]
 fn an_unresponsive_secret_service_is_refused_quickly_instead_of_hanging() {
     let home = Home::new();
-    // A bus socket that accepts connections and never answers.
-    let socket = home.0.join("bus");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for conn in listener.incoming().flatten() {
-            held.push(conn);
-        }
-    });
+    let silent = SilentBus::new(home.0.join("bus"));
     let mut a = Service::new(&home, "alpha");
-    let bus = format!("unix:path={}", socket.display());
+    let bus = format!("unix:path={}", silent.path.display());
     a.start_with(&[("DBUS_SESSION_BUS_ADDRESS", &bus)], &[]);
     let start = Instant::now();
     let out = a.run(
@@ -1436,10 +1472,20 @@ fn the_local_socket_refuses_bad_frames_stale_answers_and_extra_clients() {
 }
 
 #[test]
+fn the_stop_command_is_told_the_service_stopped() {
+    let home = Home::new();
+    let mut a = Service::new(&home, "alpha");
+    a.start();
+    a.stop();
+}
+
+#[test]
+#[ignore = "repeats a start and stop 200 times; run with mise run test-stop-stress"]
 fn the_stop_command_is_always_told_the_service_stopped() {
     let home = Home::new();
     let mut a = Service::new(&home, "alpha");
-    // Shutdown raced the reply to `stop` and lost about once in a hundred.
+    // Shutdown once raced the reply to `stop` and lost about once in a
+    // hundred.
     for _ in 0..200 {
         a.start();
         a.stop();

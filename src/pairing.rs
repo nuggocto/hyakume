@@ -788,20 +788,33 @@ mod tests {
 
     #[test]
     fn identities_are_absent_from_every_message_before_both_confirmations() {
+        use crate::protocol::{Message, encode_payload};
         let (inv, joi, s) = (key(10), key(20), secret(1));
         let mut r = rng(3);
         let (j1, commit) = joiner_start(&s, &joi, &name("j"), permanent(7), &mut r).unwrap();
         let (i1, share) =
             inviter_on_commit(&s, &inv, &name("i"), permanent(7), commit.clone(), &mut r).unwrap();
-        let (_, reveal) = j1.on_share(share.clone()).unwrap();
+        let (j2, reveal) = j1.on_share(share.clone()).unwrap();
         let (_, confirm) = i1.on_reveal(reveal.clone()).unwrap();
-        let sent: Vec<Vec<u8>> = vec![
-            commit.0.to_vec(),
-            [share.share.as_slice(), &share.id_commit, &share.nonce].concat(),
-            [reveal.share.as_slice(), &reveal.id_commit, &reveal.nonce].concat(),
-            confirm.mac.to_vec(),
-        ];
-        for bytes in sent {
+        let (_, answer) = j2.on_confirm(&confirm).unwrap();
+        // The messages as they go on the wire, so a field added to any of
+        // them is checked too. Declared names travel with the shares by
+        // design; device keys must not.
+        let claim = Message::Claim {
+            invitation: InvitationId::from_bytes([4; 16]),
+            claim: ClaimId::from_bytes([5; 16]),
+            kind: InvitationKind::Permanent,
+        };
+        let sent = [
+            claim,
+            Message::PairCommit(commit),
+            Message::PairShare(share),
+            Message::PairReveal(reveal),
+            Message::PairConfirm(confirm),
+            Message::PairConfirm(answer),
+        ]
+        .map(|m| encode_payload(&m));
+        for bytes in &sent {
             for id in [inv.id(), joi.id()] {
                 assert!(!bytes.windows(32).any(|w| w == id.as_bytes()));
             }

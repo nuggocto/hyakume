@@ -1,9 +1,8 @@
 # Pairing, identity, sessions, and the wire protocol
 
-Status: implemented and tested on loopback. Two independent design reviews
-were done on 2026-10-13; every finding and its outcome is under "External
-review". A code review of the whole core followed the same day; see "Code
-review of the core". Recorded 2026-10-12, updated 2026-10-13.
+Status: implemented, and reviewed twice for design and once as code on
+2026-10-13; every finding has an outcome below. Recorded 2026-10-12,
+updated 2026-10-17.
 
 Hyakume composes existing primitives through maintained libraries. It
 defines no new primitive.
@@ -63,7 +62,7 @@ Iroh evidence, from the `iroh` 1.3.0 and `iroh-base` 1.3.0 sources pinned in
 | Strict signature checks for device keys | `PublicKey::verify` calls `verify_strict` | `key.rs:134` |
 | Device key wiped on drop | `SecretKey` derives `ZeroizeOnDrop` | `key.rs:260` |
 | No endpoint ID in TLS SNI | stopped after 1.0.3 | `iroh-1.3.0/src/tls/name.rs:3` |
-| No public relays or address publication | `presets::Minimal`, `RelayMode::Disabled`, `PortmapperConfig::Disabled` | `src/node.rs` |
+| No public relays or address publication | `presets::Minimal`, `RelayMode::Disabled`, `PortmapperConfig::Disabled` | `src/node/connections.rs` |
 
 The loopback journeys in `tests/loopback.rs` exercise these calls over real
 QUIC connections, so the binding is tested against the transport, not
@@ -130,7 +129,7 @@ one purpose is valid for another.
 | Property | How | Test |
 | --- | --- | --- |
 | Wrong secret fails before identities | `K` differs; the confirmation MAC fails | `pairing::a_wrong_secret_fails_before_any_identity_is_revealed`, loopback `a_wrong_secret_fails_pairing_and_trusts_no_one` |
-| No identity before both confirmations | device keys travel only after both MACs | `identities_are_absent_from_every_message_before_both_confirmations` |
+| No identity before both confirmations | device keys travel only after both MACs; declared names travel with the shares | `identities_are_absent_from_every_message_before_both_confirmations` searches every encoded message |
 | Bound to one connection | `E` differs per TLS session | `different_connections_fail_even_with_the_right_secret` |
 | Interceptor with the secret is visible | unrelated verifiers on the two sides | `an_interceptor_with_the_secret_produces_different_verifiers_on_each_side` |
 | No grinding of matching verifiers | the joiner commits first; the inviter sends before seeing the joiner's share; one guess per attempt, 2^-32 | `the_joiner_cannot_change_its_contribution_after_seeing_the_inviters` |
@@ -185,7 +184,7 @@ second layer of content encryption.**
 
 | Key | Lifetime | Destruction |
 | --- | --- | --- |
-| Device key | until reset; stored by the local service later | `ZeroizeOnDrop` |
+| Device key | until reset; stored by the local service | `ZeroizeOnDrop` |
 | Transport key | one process | dropped with the endpoint |
 | Invitation secret | until the invitation closes | `Zeroizing` |
 | `K` and derived keys | one exchange | `Zeroizing` in Hyakume's code; `spake2` 0.4.0 does not zeroize its own state |
@@ -264,7 +263,7 @@ to C-08; the same problem found by both is listed once.
 
 | Finding | Severity | Outcome |
 | --- | --- | --- |
-| F-1, C-05: the inviter used up the invitation before saving trust, so a failed save left it used up with no trust saved | should fix | **Fixed, then replaced.** The save was first checked before use. After the code review, a yes now reserves the alias and a trusted place, so the save cannot fail on a conflict; see R-2 |
+| F-1, C-05: the inviter used up the invitation before saving trust, so a failed save left it used up with no trust saved | should fix | **Fixed** by R-2: a yes reserves the alias and a trusted place, so the save cannot fail on a conflict |
 | F-2, C-03: the vectors could not check the pairing key schedule without porting `spake2`'s scalar step | should fix | **Fixed.** The vectors list the identities, blinding points, password and ephemeral scalars, `k`, the transcript, and the word list |
 | C-01: `spake2` 0.4.0 takes shares with a small-order part | note | **Fixed.** Such shares are refused before `finish` |
 | F-6: text that failed its content check was reported to the sender as a digest mismatch | note | **Fixed.** New wire result `ContentMismatch` (code 6) |
@@ -275,21 +274,22 @@ to C-08; the same problem found by both is listed once.
 | F-8, C-06: revocation stays final only if the epoch counter is saved with the trust store | note | **Accepted as a condition** for persistence; see below |
 | F-7: shutdown leaves claims in progress until the invitation expires | note | **Fixed** with R-1: an exchange stopped by shutdown settles its claim when its task is dropped |
 | C-07: silent connections can hold the 8 places without a session | note | **Accepted.** Bounded by one 30 s deadline per connection, listed in `docs/resource-estimate.md` |
-| C-08: a connection lost after verification closes the invitation | note | **Kept as is.** Each invitation allows one comparison of verifier words, which is what makes 32 bits enough. A retry would give someone holding the secret another try. R-1 found one path that broke this; it is fixed |
+| C-08: a connection lost after verification closes the invitation | note | **Kept as is.** One comparison of words per invitation is what makes 32 bits enough; a retry would give someone holding the secret another try |
 | C-04 (optional): a 40-bit verifier | note | **Not adopted.** One comparison per invitation keeps 32 bits enough; revisit only if short codes change that |
 
 Assumptions the reviewers stated, kept here so later work checks them:
 
-- Clients never send TLS 0-RTT data: `Node::dial` waits for the full
-  handshake. Check again whenever the iroh TLS setup changes.
+- Clients never send TLS 0-RTT data: `dial` in `src/node/connections.rs`
+  waits for the full handshake. Check again whenever the iroh TLS setup
+  changes.
 - Content protection relies on relays never terminating TLS. Restate this
   when relay work begins.
 
 ## Code review of the core
 
 A reviewer read all source, tests, vectors, and records at commit
-`27a5a5f` and reproduced four defects. Each now has a test that failed
-before its fix.
+`27a5a5f` and reproduced four defects. Each has a test that failed before
+its fix.
 
 | Finding | Severity | Outcome |
 | --- | --- | --- |
@@ -297,11 +297,6 @@ before its fix.
 | R-2: an alias checked before a yes could be taken by another pairing before the other side answered, leaving one side trusting a device that does not trust it back | medium | **Fixed.** A yes now takes a `Reservation` of the alias and one trusted place on both sides, held until the exchange ends. The inviting side also uses the invitation at its yes, so expiry while the other person decides cannot fail the save either. Loopback `an_alias_held_by_a_pairing_that_answered_yes_cannot_be_taken` |
 | R-3: repeated transfer IDs were detected through the status history, so dropping old history also forgot used IDs | medium | **Fixed.** A separate window of 4,096 offered IDs, with the policy under "Replay protection and attempt limits". `a_replayed_offer_identifier_is_refused_after_its_transfer_leaves_the_history` |
 | R-4: zero-width characters took no column, so a projection could grow with its input | low | **Fixed.** Each visible character keeps at most 4 zero-width characters; further ones show as escapes, which take columns. `combining_marks_cannot_grow_a_projection_past_its_limit` |
-
-The review also pointed out two unused items, `SessionId` and
-`Moment::saturating_add`; both are removed. Diagnostics now escape the same
-hidden formatting characters as peer-text projections instead of a smaller
-set.
 
 ## Conditions for later work
 
@@ -311,17 +306,13 @@ set.
   23 bits, such as 7 random decimal digits. Keep the same attempt
   accounting and the 120 s code lifetime.
 - **Persistence.** Save `TrustStore`'s next epoch in the same write as the
-  trust records, and never load a lower one. Done: `Store::save_trust`
-  writes both in one transaction, the counter lives in its own table that
-  `reset` keeps, and loading refuses a counter that is not past every saved
-  epoch ([local service](local-service.md), section 3).
-- **Persistence of invitations.** Not needed yet: invitations stay in
-  memory, because a token names a transport key that is new every run, so
-  no saved invitation could be reached after a restart. When discovery lets
-  a token outlive its endpoint, a claim saved while its exchange ran has no
-  owner after a restart; on load, settle each one as `PairingOwner` would:
-  in progress uses an attempt, verified closes the invitation. Reservations
-  belong to running exchanges and are never saved.
+  trust records, and never load a lower one. Met by `Store::save_trust` and
+  the checked load ([local service](local-service.md), section 3).
+- **Persistence of invitations.** Not needed while a token names a
+  transport key that is new every run. When discovery lets a token outlive
+  its endpoint, settle each saved claim on load as `PairingOwner` would: in
+  progress uses an attempt, verified closes the invitation. Reservations
+  are never saved.
 - **Resume.** The offered-ID window refuses repeated offers. Resuming a
   transfer must use its own authenticated path, never a second offer under
   the same transfer ID.

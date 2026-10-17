@@ -34,6 +34,10 @@ pub enum PrepareError {
     TooLarge(PathBuf),
     #[error("{0}: changed while it was being read")]
     Changed(PathBuf),
+    #[error(
+        "{0}: holds more bytes than its size says, as files under /proc do; send its content as standard input instead"
+    )]
+    SizeUnknown(PathBuf),
     #[error("{0}: its name cannot be offered: {1}")]
     Name(PathBuf, NameError),
     #[error("{0}: {1}")]
@@ -72,14 +76,14 @@ impl Source {
         }
     }
 
-    /// Whether the file still has the identity it had when prepared.
-    /// Blocking.
+    /// Whether the file still has the identity it had when prepared and
+    /// still ends where its size says. Blocking.
     pub fn unchanged(&self) -> io::Result<bool> {
         match self {
             Self::Memory(_) => Ok(true),
             Self::File { file, identity } => {
                 let st = rustix::fs::fstat(file.as_ref())?;
-                Ok(FileIdentity::of(&st) == *identity)
+                Ok(FileIdentity::of(&st) == *identity && ends_at(file, identity.size)?)
             }
         }
     }
@@ -125,9 +129,16 @@ pub fn prepare_file(path: &Path) -> Result<PreparedItem, PrepareError> {
     let digest = hash_file(&file, identity.size)
         .map_err(io)?
         .ok_or_else(|| PrepareError::Changed(path.to_owned()))?;
+    let ended = ends_at(&file, identity.size).map_err(io)?;
+    // A file written to meanwhile has a new identity. One that kept it and
+    // still has bytes past its size reports a wrong size, as files under
+    // /proc do; offered at that size, it would arrive cut short.
     let after = rustix::fs::fstat(&file).map_err(|e| io(e.into()))?;
     if FileIdentity::of(&after) != identity {
         return Err(PrepareError::Changed(path.to_owned()));
+    }
+    if !ended {
+        return Err(PrepareError::SizeUnknown(path.to_owned()));
     }
     Ok(PreparedItem {
         name: name.to_vec(),
@@ -156,6 +167,11 @@ fn hash_file(file: &File, size: u64) -> io::Result<Option<[u8; 32]>> {
         offset += read as u64;
     }
     Ok(Some(*hasher.finalize().as_bytes()))
+}
+
+/// Whether nothing can be read at `size`. Blocking.
+fn ends_at(file: &File, size: u64) -> io::Result<bool> {
+    Ok(file.read_at(&mut [0u8; 1], size)? == 0)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -413,6 +429,26 @@ mod tests {
         std::fs::write(&path, b"hello world").unwrap();
         assert!(!item.source.unchanged().unwrap());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_more_bytes_than_its_size_is_refused() {
+        // Linux reports a size of zero for this file, which is not empty.
+        let path = Path::new("/proc/self/status");
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        assert!(matches!(
+            prepare_file(path),
+            Err(PrepareError::SizeUnknown(_))
+        ));
+        // A source like it, opened some other way, fails the sender's
+        // check before its item is reported sent.
+        let file = File::open(path).unwrap();
+        let identity = FileIdentity::of(&rustix::fs::fstat(&file).unwrap());
+        let source = Source::File {
+            file: Arc::new(file),
+            identity,
+        };
+        assert!(!source.unchanged().unwrap());
     }
 
     #[test]

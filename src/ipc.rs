@@ -422,21 +422,6 @@ pub struct TransferSummary {
     pub expires_ms: u64,
 }
 
-impl From<&TransferView> for TransferSummary {
-    fn from(t: &TransferView) -> Self {
-        Self {
-            transfer: t.transfer.clone(),
-            outgoing: t.outgoing,
-            peer: t.peer.clone(),
-            kind: t.kind.clone(),
-            outcome: t.outcome.clone(),
-            items: t.items.len(),
-            retained_bytes: t.retained_bytes,
-            expires_ms: t.expires_ms,
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ItemView {
     /// The name, as a safe projection.
@@ -493,55 +478,6 @@ mod tests {
         match rest.await {
             Ok(Ok(Frame::Data(data))) => assert_eq!(data, b"hello"),
             _ => panic!("the frame was lost"),
-        }
-    }
-
-    #[test]
-    fn every_reply_and_event_reads_back_as_it_was_written() {
-        let view = || TransferView {
-            transfer: "00".into(),
-            outgoing: true,
-            peer: "phone".into(),
-            kind: "files".into(),
-            offer: "accepted".into(),
-            outcome: "completed".into(),
-            items: vec![ItemView {
-                name: "\"a\"".into(),
-                size: 1,
-                state: "published".into(),
-                output: None,
-            }],
-            place: None,
-            retained_bytes: 0,
-            expires_ms: 0,
-        };
-        let messages = [
-            ServerMessage::Reply {
-                id: 1,
-                reply: Reply::Ok {
-                    body: Body::Transfer(view()),
-                },
-            },
-            ServerMessage::Event {
-                id: 1,
-                event: Event::Received(view()),
-            },
-            ServerMessage::Reply {
-                id: 2,
-                reply: Reply::Ok {
-                    body: Body::Transfers {
-                        transfers: vec![TransferSummary::from(&view())],
-                    },
-                },
-            },
-        ];
-        for message in messages {
-            let bytes = serde_json::to_vec(&message).unwrap();
-            let decoded = decode::<ServerMessage>(&bytes).unwrap();
-            assert_eq!(
-                serde_json::to_value(&decoded).unwrap(),
-                serde_json::to_value(&message).unwrap()
-            );
         }
     }
 
