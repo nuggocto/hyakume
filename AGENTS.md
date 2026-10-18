@@ -27,14 +27,8 @@
   body. The body must explain why the change was needed instead of restating the
   diff.
 - Preserve user work and avoid unrelated edits.
-- Prioritize Linux and Windows. Android follows them and remains a v1 target.
-  macOS and iOS are post-v1 work; defer their implementation, CI, packaging,
-  signing, and distribution until after v1.
 - Keep the website in the separate `hyakume-front` repository, using static
   Astro, pnpm, and Cloudflare Pages at the acquired domain `hyakume.org`.
-  The public contact email is `vincent@sshmoi.com`. Keep project information and
-  downloads separate from device pairing and transfers; the website never
-  receives invitation secrets or payloads.
 - Do not edit `../hyakume-front` unless the current work or user request includes
   it.
 - Do not spawn sub-agents unless the current work or user request requires it.

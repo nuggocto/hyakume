@@ -1,3 +1,0 @@
-# Project tasks written in Rust: `cargo xtask package`, `cargo xtask qualify`.
-[alias]
-xtask = "run --locked --quiet --package xtask --"
