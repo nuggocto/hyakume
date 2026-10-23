@@ -1,1 +1,27 @@
-/target
+# Cargo build output
+/target/
+
+# rustfmt backups, cargo-mutants output, compiler crash dumps
+**/*.rs.bk
+**/mutants.out*/
+rustc-ice-*.txt
+
+# MSVC debug information
+*.pdb
+
+# Local overrides and secrets
+mise.local.toml
+.mise.local.toml
+.env
+.env.*
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Packages built by cargo xtask package
+/dist/
