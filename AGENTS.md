@@ -26,3 +26,4 @@
   changes and pass on real bugs, so leave them out.
 - Test actual implementation, do not duplicate logic into tests
 - Before adding complexity for a speculative or vanishingly unlikely race or security edge case, explain the concrete failure mode, likelihood, and complexity cost to the user and get their buy-in. Do not silently expand scope for theoretical robustness.
+- Do not spawn sub-agents unless the current work or user request requires it.
