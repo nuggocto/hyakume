@@ -1,0 +1,38 @@
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tasks.dev]
+description = "Run the application"
+run = "cargo run --locked"
+
+[tasks.build]
+description = "Build all workspace packages"
+run = "cargo build --workspace --locked"
+
+[tasks.build-release]
+description = "Build all workspace packages in release mode"
+run = "cargo build --workspace --release --locked"
+
+[tasks.check]
+description = "Check all workspace targets"
+run = "cargo check --workspace --all-targets --locked"
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check workspace formatting without changing files"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Lint all workspace targets"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks.test]
+description = "Run workspace tests and doctests"
+run = "cargo test --workspace --locked"
+
+[tasks.ci]
+description = "Run formatting, lint, and test checks"
+depends = ["fmt-check", "lint", "test"]
