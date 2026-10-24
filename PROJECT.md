@@ -374,6 +374,9 @@ from the native app and Rust collaboration server. Its purpose is to present
 the project, show screenshots, and explain how to install it, not host an account
 dashboard or the application backend.
 
+Develop the Astro website in the sibling directory `../hyakume-front`, not in
+this Rust project. Keep its source, dependencies, and build tasks there.
+
 Support command-line installation through:
 
 - General Linux: versioned prebuilt archives for x86_64 and ARM64, with checksums
