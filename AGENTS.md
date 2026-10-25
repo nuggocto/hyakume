@@ -21,6 +21,9 @@
   body. The body must explain why the change was needed instead of restating the
   diff.
 - Preserve user work and avoid unrelated edits.
+- Keep every comment to 4 lines or fewer, old comments included. Write them in
+  a relaxed tone while staying technical, and explain why the code is the way
+  it is instead of restating what it does.
 - Only add a test if its failure would tell you something is actually broken.
   Assertions on styling values, colors, or internal structure fail on harmless
   changes and pass on real bugs, so leave them out.
