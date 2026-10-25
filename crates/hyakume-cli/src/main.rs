@@ -13,7 +13,7 @@ use clap::Parser;
 use hyakume_client::ClientError;
 use serde_json::json;
 
-use crate::output::{error_kind, exit_code};
+use crate::output::{error_kind, exit_code, terminal_safe};
 
 const DESKTOP_BINARY: &str = "hyakume-desktop";
 /// Shell convention for "command not found".
@@ -84,11 +84,13 @@ fn report(err: &ClientError, json: bool) {
         eprintln!("{body}");
         return;
     }
-    eprintln!("error: {err}");
+    eprintln!("error: {}", terminal_safe(&err.to_string()));
     if let ClientError::Conflict { latest, .. } = err {
         eprintln!(
             "latest version {}: \"{}\". Review it with `hyakume task show {}` and retry.",
-            latest.version, latest.fields.title, latest.reference
+            latest.version,
+            terminal_safe(&latest.fields.title),
+            terminal_safe(&latest.reference)
         );
     }
 }

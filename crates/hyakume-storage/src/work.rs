@@ -11,8 +11,8 @@ use hyakume_core::ids::{
 };
 use hyakume_core::model::{
     BuiltinRelation, Comment, DEFAULT_STAGES, Priority, Project, ProjectKey, Relation,
-    RelationType, Stage, Task, TaskFields, TaskRef, ValidationError, Workspace, name_key,
-    relation_endpoints,
+    RelationType, Stage, Task, TaskFields, TaskRef, ValidationError, Workspace, check_text,
+    name_key, relation_endpoints,
 };
 use hyakume_core::permission::Preset;
 use sqlx::{Sqlite, SqliteConnection, Transaction};
@@ -250,6 +250,8 @@ impl Store {
                 "workspace slug and name must not be empty",
             ));
         }
+        check_text("workspace slug", &workspace.slug, false)?;
+        check_text("workspace name", &workspace.name, false)?;
         let mut tx = self.write().await?;
         sqlx::query("INSERT INTO workspaces (id, slug, name, created_at) VALUES (?, ?, ?, ?)")
             .bind(workspace.id.to_string())
@@ -376,6 +378,7 @@ impl Store {
         if project.name.is_empty() {
             return Err(StoreError::invalid("project name must not be empty"));
         }
+        check_text("project name", &project.name, false)?;
         let mut tx = self.write().await?;
         sqlx::query(
             "INSERT INTO projects (id, workspace_id, key, name, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -598,6 +601,7 @@ impl Store {
         if body.is_empty() {
             return Err(StoreError::invalid("comment must not be empty"));
         }
+        check_text("comment", body, true)?;
         let comment_id = CommentId::new();
         let now = now_ms();
         let result = sqlx::query(
@@ -659,6 +663,7 @@ impl Store {
         if name.is_empty() {
             return Err(StoreError::invalid("relation type name must not be empty"));
         }
+        check_text("relation type name", &name, false)?;
         let reverse_name = if input.directed {
             // Without a reverse label, the target's side would read "API-1
             // depends on WEB-1" when it's really WEB-1 that depends on API-1.
@@ -666,7 +671,9 @@ impl Store {
                 .reverse_name
                 .map(|r| r.trim().to_owned())
                 .filter(|r| !r.is_empty());
-            if reverse.is_none() {
+            if let Some(reverse) = &reverse {
+                check_text("reverse name", reverse, false)?;
+            } else {
                 return Err(StoreError::invalid(
                     "a directed relation type needs a reverse name, such as \"needed by\"",
                 ));

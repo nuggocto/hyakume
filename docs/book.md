@@ -289,3 +289,27 @@ read the same from both ends, so `WEB-1 depends on API-1` showed up on API-1 as
 the CLI asks for it before sending anything. Requiring it was simpler than
 inventing a generic "incoming" label for every view, the GUI included
 ([D7](decisions.md#d7-names-match-the-way-people-type-them-2026-10-25)).
+
+## Shared text can't drive your terminal
+
+A security review pointed out that the CLI printed titles, names, and comments
+exactly as stored. In a shared workspace, anyone could put an escape sequence
+in a task title, for example OSC 52, which asks the terminal to overwrite the
+clipboard. Whoever ran `task list` next would have it act on their terminal.
+
+Two layers now handle it, both using `is_unsafe_char` from core (C0/C1 control
+characters and bidi overrides):
+
+```diagram
+write ──→ check_text in core/storage ━━▶ ● refused, exit 2
+             titles, labels, names: no unsafe characters
+             descriptions, comments: newlines and tabs only
+
+read  ──→ CLI text output ──→ terminal_safe ━━▶ unsafe chars become �
+          (servers may be older, or not ours)
+          --json output ──→ serde_json already escapes them as \u001b
+```
+
+The write check keeps stored data clean. The output filter is the one that
+actually protects you, since the CLI also talks to servers it doesn't
+control. A planted `ESC ]0;pwned BEL` title printed as `Evil �]0;pwned� title`.

@@ -18,7 +18,7 @@ use time::macros::format_description;
 
 use crate::cli::*;
 use crate::output::{
-    Output, ProjectContext, TaskDetailView, TaskView, task_detail_text, task_line,
+    Output, ProjectContext, TaskDetailView, TaskView, task_detail_text, task_line, terminal_safe,
 };
 
 pub async fn run(cli: Cli) -> Result<(), ClientError> {
@@ -171,7 +171,7 @@ async fn workspace(
         WorkspaceCommand::List => {
             let (listings, failures) = client.list().await;
             for (source, err) in &failures {
-                eprintln!("warning: {source}: {err}");
+                eprintln!("warning: {source}: {}", terminal_safe(&err.to_string()));
             }
             let default = client
                 .config
@@ -359,7 +359,7 @@ fn confirm(question: &str, yes: bool) -> Result<(), ClientError> {
             "refusing to delete without --yes when not run from a terminal".into(),
         ));
     }
-    eprint!("{question} [y/N] ");
+    eprint!("{} [y/N] ", terminal_safe(question));
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
     std::io::stdin()

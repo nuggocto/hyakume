@@ -192,9 +192,12 @@ impl TaskFields {
         if self.title.chars().count() > MAX_TITLE_CHARS {
             return Err(ValidationError::TitleTooLong);
         }
+        check_text("title", &self.title, false)?;
+        check_text("description", &self.description, true)?;
         let mut labels: Vec<String> = Vec::with_capacity(self.labels.len());
         for label in self.labels {
             let label = label.trim().to_owned();
+            check_text("label", &label, false)?;
             if !label.is_empty() && !labels.contains(&label) {
                 labels.push(label);
             }
@@ -205,6 +208,22 @@ impl TaskFields {
 }
 
 pub const MAX_TITLE_CHARS: usize = 300;
+
+/// ESC, BEL, and friends let shared text drive whoever's terminal prints it,
+/// and bidi overrides make text display in a different order than it reads.
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{061C}')
+}
+
+/// Rejects unsafe characters in `field`. Multiline text such as a description
+/// may still hold newlines and tabs.
+pub fn check_text(field: &'static str, text: &str, multiline: bool) -> Result<(), ValidationError> {
+    let allowed = |c: char| multiline && matches!(c, '\n' | '\t');
+    if text.chars().any(|c| is_unsafe_char(c) && !allowed(c)) {
+        return Err(ValidationError::UnsafeText(field));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
@@ -299,6 +318,44 @@ pub enum ValidationError {
     TaskRef(String),
     #[error("{0:?} is not a priority (low, medium, high, urgent)")]
     Priority(String),
+    #[error("{0} must not contain control or text-direction characters")]
+    UnsafeText(&'static str),
     #[error("{0}")]
     Other(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields(title: &str, description: &str, label: &str) -> TaskFields {
+        TaskFields {
+            title: title.into(),
+            description: description.into(),
+            stage_id: StageId::new(),
+            assignee: None,
+            labels: vec![label.into()],
+            priority: None,
+            due_date: None,
+        }
+    }
+
+    #[test]
+    fn task_text_cannot_carry_terminal_escapes() {
+        // OSC 52 asks the terminal to overwrite the clipboard.
+        let osc = "\u{1b}]52;c;cm0gLXJmIH4=\u{7}";
+        for bad in [
+            fields(&format!("Fix {osc}"), "", "ui"),
+            fields("Fix", &format!("see\n{osc}"), "ui"),
+            fields("Fix", "", &format!("ui{osc}")),
+            fields("Fix \u{202E}gpj.exe", "", "ui"),
+        ] {
+            assert!(matches!(
+                bad.normalized(),
+                Err(ValidationError::UnsafeText(_))
+            ));
+        }
+        let ok = fields("Fix", "line one\n\tline two", "ui").normalized();
+        assert_eq!(ok.unwrap().description, "line one\n\tline two");
+    }
 }

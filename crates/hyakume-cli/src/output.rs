@@ -7,7 +7,7 @@ use hyakume_client::ClientError;
 use hyakume_core::api::{ProjectSnapshot, WorkspaceSummary};
 use hyakume_core::blocking::unfinished_blockers;
 use hyakume_core::ids::{IdentityId, TaskId};
-use hyakume_core::model::{BuiltinRelation, Comment, Task};
+use hyakume_core::model::{BuiltinRelation, Comment, Task, is_unsafe_char};
 use serde::Serialize;
 
 pub struct Output {
@@ -25,10 +25,23 @@ impl Output {
         } else {
             let text = text();
             if !text.is_empty() {
-                println!("{}", text.trim_end());
+                println!("{}", terminal_safe(text.trim_end()));
             }
         }
     }
+}
+
+/// Shared text reaches the terminal as is, and an older or hostile server
+/// may not have validated it, so swap anything that could steer the
+/// terminal for U+FFFD. JSON needs none of this: serde_json escapes it.
+pub fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if is_unsafe_char(c) => '\u{FFFD}',
+            c => c,
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -288,5 +301,19 @@ pub fn error_kind(err: &ClientError) -> &'static str {
         ClientError::Credentials(_) => "credentials",
         ClientError::Config(_) => "config",
         ClientError::Internal(_) => "internal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_text_loses_escapes_but_keeps_layout() {
+        let title = "Fix\u{1b}]52;c;cm0=\u{7} it\u{202E}\n\tnext";
+        assert_eq!(
+            terminal_safe(title),
+            "Fix\u{FFFD}]52;c;cm0=\u{FFFD} it\u{FFFD}\n\tnext"
+        );
     }
 }

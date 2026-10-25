@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use hyakume_core::api::{CreateRole, Member, Role};
 use hyakume_core::ids::{IdentityId, ProjectId, RoleId, WorkspaceId};
-use hyakume_core::model::{Identity, name_key};
+use hyakume_core::model::{Identity, check_text, name_key};
 use hyakume_core::permission::{Access, MembershipKind, Permission, Preset};
 
 use crate::convert::{id, now_ms};
@@ -43,6 +43,8 @@ impl Store {
         if identity.name.is_empty() {
             return Err(StoreError::invalid("identity name must not be empty"));
         }
+        check_text("identity name", &identity.name, false)?;
+        check_text("display name", &identity.display_name, false)?;
         sqlx::query(
             "INSERT INTO identities (id, name, display_name, created_at) VALUES (?, ?, ?, ?)",
         )
@@ -300,6 +302,7 @@ impl Store {
         if name.is_empty() {
             return Err(StoreError::invalid("role name must not be empty"));
         }
+        check_text("role name", &name, false)?;
         let permissions: BTreeSet<Permission> = input.permissions.into_iter().collect();
         let role = Role {
             id: RoleId::new(),
