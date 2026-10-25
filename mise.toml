@@ -49,6 +49,42 @@ echo
 echo "Ready. Try: mise run alice -- task list"
 '''
 
+[tasks.demo-data]
+description = "Fill the demo with the mockup's tasks and links (after `mise run demo-setup`)"
+run = '''
+set -e
+cargo build -q --locked -p hyakume-cli
+as() { who=$1; shift; HYAKUME_DATA_DIR="dev/data/profiles/$who" ./target/debug/hyakume "$@" > /dev/null; }
+# Alice's personal work, on her computer only.
+as alice -w local project create HOME Home
+as alice -w local task create --project HOME "Fix bike" --stage "To do"
+as alice -w local task create --project HOME "Book dentist"
+as alice -w local task create --project HOME "Renew passport" --stage Done
+# Acme on server a, shared by Alice, Bob, and Gwen.
+as alice task create --project WEB "Landing page" --stage "In progress" --assignee bob \
+  --label marketing --label launch --priority high --due 2026-11-14 \
+  --description "Hero, pricing teaser, and the signup form. The form needs the signup endpoint first."
+as alice task create --project WEB "Pricing table" --stage "To do"
+as alice task create --project WEB "Footer links" --stage Done
+as alice task create --project WEB "Hero illustration" --stage Review
+as alice task create --project WEB "Cookie banner"
+as alice task create --project WEB "404 page"
+as alice task create --project API "Signup endpoint" --stage Review --assignee alice
+as alice task create --project API "Rate limits" --stage "To do"
+as alice task create --project API "Auth tokens" --stage "In progress"
+as alice relation create API-1 blocks WEB-1
+as alice relation create WEB-1 blocks WEB-2
+as alice relation create WEB-4 related_to WEB-1
+as alice relation create API-3 related_to API-2
+as alice task comment WEB-1 "Copy is final. Waiting on the endpoint."
+as bob task comment WEB-1 "Layout is done, wiring the form next."
+# Studio on server b.
+as bob -w b/studio task create --project DOC "Install guide" --stage "In progress"
+as bob -w b/studio task create --project DOC "API reference" --stage "To do"
+as bob -w b/studio task create --project DOC "Changelog" --stage Done
+echo "Demo data ready. Open the app with: mise run alice"
+'''
+
 [tasks.alice]
 description = "Run a hyakume command as Alice, e.g. `mise run alice -- task list`"
 quiet = true

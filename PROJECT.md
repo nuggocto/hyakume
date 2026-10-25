@@ -42,6 +42,8 @@ The canvas is open, not bounded by Meme's body. Tasks look like small eyes,
 with meaningful connections between them. Meme sits in the header beside the
 workspace/project controls. Support light and dark palettes following the system
 theme and use the system UI font. The mascot's 100 eyes do not limit task count.
+Light and dark are the only built-in themes. Custom themes come later as TOML
+files that override the built-in colors; see decision D9.
 
 The overview combines local personal projects and projects from multiple
 self-hosted team servers in one canvas. Keep each project's workspace/server
@@ -363,8 +365,8 @@ once. The initial prototype focuses on functional correctness; broader load
 validation follows.
 
 The usable release adds production sign-in, invitations and recovery, optional
-SMTP and provider connections, the kanban board, profile customization,
-repository integrations, backups, and packaging. These remain requirements,
+SMTP and provider connections, the kanban board, profile customization
+(including custom theme files), repository integrations, backups, and packaging. These remain requirements,
 but are not prerequisites for the development-only collaboration prototype.
 
 ## Website and installation

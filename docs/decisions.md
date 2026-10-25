@@ -62,3 +62,40 @@ whose name matches an existing one that way, and the CLI refuses a lookup that
 matches two, so a typed name never quietly picks the wrong thing. A directed
 relation type must have a reverse label, so a link reads correctly from both
 ends. Snapshots and other multi-query reads run in one read transaction.
+
+## D8. A Tokio thread and a painted canvas (2026-10-25)
+
+All network, keyring, and SQLite work runs on one Tokio thread. The GPUI
+window talks to it through two Tokio channels, so neither executor runs the
+other's futures. The canvas is one `canvas()` element that paints everything
+and hit-tests by hand, which keeps thousands of eyes cheap. Rejected: one GPUI
+element per eye, and running GPUI work on Tokio. Meme is painted the same way,
+from the mockup's geometry, because GPUI 0.2.2 swaps red and blue in SVG
+images. Revisit SVG once GPUI converts SVG pixels to BGRA like other formats.
+
+## D9. Two built-in themes, custom ones from TOML later (2026-10-25)
+
+Hyakume ships only light and dark, following the system. Every color it draws,
+Meme's included, comes from the one `Theme` struct, and new code keeps it that
+way. Custom themes arrive with profile customization in the usable release:
+
+- A file in the profile's `themes/` folder names a base (`base = "dark"`) and
+  overrides only the colors it changes, so old themes survive new colors.
+- One file can hold a light and a dark variant, so following the system still works.
+- `client.toml` picks one (`theme = "kanagawa"`), and edits reload live.
+- Eye shapes carry status, so no palette can hide it; the app warns when text
+  or the blocked color is too close to the background. Meme's colors can
+  change, its shape can't.
+- Reading the current Omarchy palette is an optional extra, never a dependency.
+
+Rejected for now: more built-in themes. Each one is another full palette to
+check on every new screen while the palette is still settling.
+
+## D10. Event streams are pinged (2026-10-25)
+
+A WebSocket can die without a close frame, and a client waiting for events
+can't tell that from a quiet workspace. Clients ping every 20 s; axum answers
+pings on its own, so a stream that hears nothing for 60 s is treated as lost
+and reconnects. No wire change and no server work. Rejected: a heartbeat
+event in the `/v1` protocol, which every client would need to understand.
+

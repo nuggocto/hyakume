@@ -211,11 +211,12 @@ After    hyakume --json task create --project WEB   →  {"error":{"code":"inval
 
 ## Trying it with mise
 
-Trying the CLI used to take a dozen manual commands. Five mise tasks now cover it:
+Trying the CLI used to take a dozen manual commands. A few mise tasks now cover it:
 
 ```text
 mise run servers       build, run dev servers a (7878) and b (7879); Ctrl+C stops both
 mise run demo-setup    recreate the alice, bob, gwen profiles and sign each one in
+mise run demo-data     add the mockup's tasks, links, and comments
 mise run alice -- …    any hyakume command as Alice (also bob, gwen)
 mise run reset         delete dev/data: both server databases and all profiles
 ```
@@ -313,3 +314,264 @@ read  ──→ CLI text output ──→ terminal_safe ━━▶ unsafe chars b
 The write check keeps stored data clean. The output filter is the one that
 actually protects you, since the CLI also talks to servers it doesn't
 control. A planted `ESC ]0;pwned BEL` title printed as `Evil �]0;pwned� title`.
+
+## Step 6: the canvas
+
+The placeholder window is now the canvas from the approved mockups. Local work
+and every configured server's workspaces sit side by side, one column per
+workspace. Each project is a spider web, each task an eye on it, and links are
+silk threads. It's read-only for now; editing arrives in step 8.
+
+```text
+crates/hyakume-desktop/src/
+    ├── main.rs        # opens the window, starts the I/O thread
+    ├── runtime.rs     # Tokio thread, commands in, updates out
+    ├── sources.rs     # local work + one loop per server
+    ├── scene.rs       # what to draw, rebuilt per update (no GPUI)
+    ├── layout.rs      # where it goes; positions stick (no GPUI)
+    ├── app.rs         # root view: state, input, header, overlays
+    ├── canvas.rs      # camera, painting, hit testing
+    ├── glyphs.rs      # eyes, webs, threads, text
+    ├── meme.rs        # Meme, painted from the mockup's geometry
+    ├── inspector.rs   # side panel for one task
+    └── theme.rs       # light and dark palettes
+```
+
+**Two executors, two channels.** reqwest and SQLx need Tokio; GPUI runs its
+own executor on the main thread. All network, keyring, and SQLite work lives on
+one Tokio thread, and the window only talks to it through two unbounded Tokio
+channels, which work from any executor
+([D8](decisions.md#d8-a-tokio-thread-and-a-painted-canvas-2026-10-25)).
+
+```diagram
+ GPUI main thread                       hyakume-io thread (Tokio)
+┌──────────────────┐   Command        ┌─────────────────────────────┐
+│ Hyakume (app.rs) │━━━━━━━━━━━━━━━━━▶│ run()                       │
+│  Scene, Layout,  │  Retry, Detail   │  ├─ run_local  ─→ local.db  │
+│  camera, focus   │                  │  ├─ run_server a ─→ :7878   │
+│                  │◀━━━━━━━━━━━━━━━━━│  └─ run_server b ─→ :7879   │
+└──────────────────┘   Update         └─────────────────────────────┘
+                       Source(state), Detail, Fatal
+```
+
+Closing the window drops the command sender, which ends `run()`, and dropping
+the runtime cancels every source task.
+
+**Staying current.** Each server loop subscribes first, waits for `subscribed`,
+and only then loads, the same ordering the CLI's live test checks. After that
+it refetches only what an event names:
+
+```text
+project_changed   → that project's snapshot (unknown project → its workspace)
+workspace_changed → that workspace's summary and snapshots
+resync            → everything
+stream ends       → offline: keep the data on screen, retry in 1, 2, 4 … 30 s
+401 / no session  → not signed in: wait for "Retry now"
+```
+
+Local work has no server to send events, and the CLI writes to `local.db`
+from another process. `ChangeWatcher` (in `hyakume-storage`) holds one
+dedicated read-only connection and checks `PRAGMA data_version` every 500 ms.
+That number only moves when a *different* connection commits, so the check
+has to use the same connection every time, never one borrowed from the pool.
+
+**Scene, then layout, then paint.** Every update rebuilds `Scene` from all
+sources: columns, clusters, eyes, threads, and each eye's blockers (core's
+`unfinished_blockers`, looking up the finished flag across every project in the
+workspace). A cross-project link appears in both projects' snapshots, so threads
+are deduplicated by relation id. Stages map to eye shapes by name; a custom
+stage takes the shape for its place in the workflow, and a finished stage is
+always closed.
+
+`Layout` keeps positions keyed by source plus id and only places what's new:
+
+```text
+place(scene)
+  web radius   = stored radius, unless the web got crowded (then grow, with slack)
+  column x     = stored, but never over the previous column
+  web center   = stored (relative to the column's left edge), or below the last web
+  eye position = stored (relative to the web's center), or a golden-angle slot,
+                 then 160 rounds of push-apart / pull-along-links, moving only new eyes
+```
+
+A web's radius used to follow its task count directly. The first layout test
+caught the result: adding one task grew the web, moved its center, and shifted
+every eye on it a few pixels. Webs now keep their radius until they're
+noticeably crowded. "Re-layout" forgets everything and starts over. The force
+layout is O(n²) per web, so projects over 1,000 tasks keep their spiral for now.
+
+**Drawing.** One `canvas()` element paints the whole world: dot grid, column
+headers, webs, threads, eyes, labels. Hit testing is done by hand against the
+same positions. Detail depends on zoom: below 45% eyes are dots and a click
+focuses the web; from 95% eyes carry their reference, title, stage, and
+"Blocked by". The eye shapes are the mockup's SVG paths redrawn with GPUI's
+`PathBuilder` and rounded quads. Text painted on the canvas passes through
+`is_unsafe_char` first, the same rule as the CLI, and gets a one-pixel halo in
+the page color instead of a box behind it.
+
+**Views.** Clicking a web focuses it: the camera fits that project, and tasks
+it links to in other projects appear on small torn webs outside it, in the
+direction of their own project. Breadcrumbs and Escape go back to the overview
+camera exactly as it was. Clicking an eye opens the inspector, which fetches
+comments through the same runtime. A refresh keeps the camera, selection,
+focus, and positions; only things that vanished are dropped.
+
+**Trying it.**
+
+```text
+mise run servers        # terminal 1
+mise run demo-setup     # terminal 2: profiles for alice, bob, gwen
+mise run demo-data      # the mockup's tasks, links, and comments
+mise run alice          # opens the app as Alice; also bob, gwen
+```
+
+The app prints one line per source update to stderr, such as
+`hyakume: a (127.0.0.1:7878) live · 1 workspaces, 2 projects, 9 tasks`, so a
+terminal run shows what it's doing.
+
+### Verified so far
+
+- `mise run ci` passes. New tests: the watcher sees another process's commit
+  exactly once, a blocker in another project blocks until its stage is
+  finished, a cross-project link is one thread, custom stages get the right
+  eye, old eyes stay put while new ones find room, the same data lays out the
+  same way, a growing web pushes the next one down, and zooming keeps the
+  point under the pointer still. The watcher test fails with the watcher
+  broken, and the layout test failed on the first version.
+- With the demo running, from the app's log: all three sources load with the
+  right counts; Bob's `task move` and a local `task create` from the CLI each
+  show up within a second; stopping both servers turns them offline with
+  backoff while their data stays; restarting reconnects both; a profile that
+  never signed in shows "not signed in" for its server.
+- Screenshots, light and dark: the theme follows the system both live and
+  after a restart. Dragging, focusing, and the inspector were tried by hand
+  with the demo data.
+
+### Meme, painted instead of shipped as SVG
+
+Meme first shipped as two SVG files exported from the mockup, and came out
+blue. GPUI 0.2.2 converts every image format from RGBA to the BGRA its
+renderer expects, except SVG, so red and blue were swapped: the gold eye
+turned blue, and both themes' Meme looked the same. GPUI also hands the
+shader premultiplied pixels for SVG, which darkens soft edges.
+
+```diagram
+Before                                  After
+
+meme-{light,dark}.svg                   meme.rs, the mockup's geometry
+      │ img()                                 │ PathBuilder + quads
+      ▼                                       ▼
+GPUI SVG rasterizer                     theme.meme colors
+      ┃ RGBA, no swap to BGRA                 │ same painter as the canvas
+      ▼                                       ▼
+● gold eye shows up blue                gold eye, follows light/dark
+```
+
+`meme.rs` paints Meme with the same `PathBuilder` and rounded quads as the
+eyes, in the mockup's 200×200 coordinates, and its colors live in the theme
+next to everything else. The mockup's radial shading becomes a linear
+gradient on the body and stacked translucent shapes for the blush and iris.
+A test pins the PROJECT.md rule of exactly 99 small eyes, all on the body and
+clear of the big one. Meme now hangs on its thread from the window's top edge.
+
+The same screenshots showed three smaller problems, now fixed:
+
+- The first fit used the window size before the compositor tiled it, leaving
+  everything in a corner. The view now keeps fitting (new data, window resizes)
+  until you pan, zoom, focus, or select; "Fit all" hands it back.
+- With no projects, the placeholder web sat half off-screen. It now counts
+  toward the fitted area.
+- Labels collided and the legend covered a web's task count. Eyes sit further
+  apart, and fitting leaves room for the bottom bar.
+
+### After the first hands-on test
+
+Three requests and one bug found while checking them:
+
+- **Comment times.** Comments show when they were posted, in local time:
+  "Oct 24, 2:34 PM". The time crate only reads the local UTC offset while a
+  process has a single thread (anything else isn't safe on Linux), so `main`
+  reads it before starting the I/O thread. A daylight-saving change while the
+  app runs isn't picked up until the next start.
+- **Related links read better.** One `thread_style` now feeds both the canvas
+  and the legend. "Related" is the link ink at 75% with longer dashes, not the
+  pale silk color that melted into the web.
+- **Focus swaps between projects.** While a project is focused, clicking a
+  linked task from another project, or the small torn web it sits on, focuses
+  that project and selects the task. Before, the click selected the task but
+  the view stayed put.
+
+```diagram
+Before                                   After
+
+focus API ──click WEB-1 stub──→ API      focus API ──click WEB-1 stub━━▶ ● focus WEB
+            (inspector opens,                                             WEB-1 selected,
+             view doesn't move)                                           API-1 is now the stub
+```
+
+- **Labels ran into each other when zoomed out.** Text keeps its size at
+  any zoom while the space between webs shrinks. Below about 68%, a column
+  header sat on the first web's name, and a web's task count on the name of
+  the web below. The header now moves up to stay clear, and a count is
+  skipped when there's no room for it.
+- **The workspace breadcrumb works.** In `All workspaces › a / Acme › WEB`,
+  the middle part was plain text. It now leaves the project and frames the
+  whole Acme column on the overview; "All workspaces" still frames everything.
+
+### Checked at seven window sizes
+
+A blocked box with a long title ran past its border: the text column had no
+width limit, so GPUI never wrapped it. The title next to the big eye had the
+same flaw. Both now take the remaining width and wrap.
+
+Then a sweep, run with a temporary hook (since removed) that opened the app at
+an exact size, already focused or with a task selected: 640×480, 800×600,
+1024×768, 1366×768, 1920×1080, 2400×1300, and a tall 700×1200, each as the
+overview, a focused project, and with the inspector open. What it found:
+
+| Problem | Fix |
+|---|---|
+| The legend and the focus hint sat on top of the zoom controls in narrow canvases | Under 1100 px (820 for the hint) they move to their own wrapping row above the controls, and fitting leaves room for it |
+| Zoomed far out, column headers and web names piled into each other | Header titles and status lines are cut short with "…" to the column's width; a web name falls back to its key, or hides when it would sit under the header |
+| A focused project kept the zoom it got at the window's first size | Auto-fit now runs in a focused project too, until you pan, zoom, or select |
+| Opening the inspector hid the selected task behind it | On any canvas resize the view keeps its middle, then pans just enough to show the selected eye |
+| A 400 px inspector left almost no canvas in small windows | It takes 42% of the window, between 300 and 400 px |
+
+```text
+who owns the camera
+  auto-fit (overview or focused project)  ← start, "Fit", Escape back to an auto overview
+      │ pan, zoom, select a task, workspace breadcrumb
+      ▼
+  the person: resizes keep the middle; the selected eye stays in view
+```
+
+## Review fixes after step 6
+
+Three reviews of the uncommitted step 6 found six problems. All three found
+the first one.
+
+| Problem | Fix |
+|---|---|
+| Creating API next to an existing WEB put both webs at the same spot, since API sorts first and the overlap check only looked downward | New webs start below everything already in the column; then one pass from the top pushes down any web that overlaps the one above, whatever order their centers are in |
+| Two detail requests for the same task could finish out of order, and the older answer replaced newer comments | Each request carries a number; only the newest one's answer is kept |
+| A server's error text went into the terminal log unfiltered | The log line goes through `is_unsafe_char`, like CLI output; the window's notes do too |
+| While a project was focused, its server going offline showed nothing but dimmer lines | The focused source's offline or signed-out note shows in the canvas corner |
+| Comment times used today's UTC offset, so summer comments read an hour off in winter | `clock.rs` samples the local offset at startup, five years back and one ahead, and binary-searches each change; every comment uses the offset of its own date |
+| A connection that dies without closing (laptop asleep, dropped NAT entry) stayed "live" forever | The client pings the event stream every 20 s; 60 s without hearing anything, not even a pong, ends it and the normal reconnect takes over ([D10](decisions.md#d10-event-streams-are-pinged-2026-10-25)) |
+
+```diagram
+event stream, after
+  ──text──→ event                      (heard)
+  ──pong──→ nothing to deliver         (heard)
+  ━━ 60 s of silence ━━▶ ● Unreachable → offline, retry 1, 2, 4 … 30 s
+```
+
+An idle workspace still answers pings, so quiet isn't mistaken for dead; a
+test checks both sides against a bare WebSocket server, one that reads (and so
+answers pings) and one that doesn't. The time crate only reads local offsets
+while the process has one thread, which is why the sampling happens at
+startup instead of per comment.
+
+The repository also gets a GitHub Actions workflow running the same checks as
+`mise run ci`: format, Clippy with `-D warnings`, and every test.
+
