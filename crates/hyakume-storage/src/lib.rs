@@ -4,6 +4,7 @@
 mod access;
 mod convert;
 mod layout;
+mod watch;
 mod work;
 
 use std::path::Path;
@@ -12,6 +13,8 @@ use std::time::Duration;
 use hyakume_core::model::{Task, ValidationError};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{SqlitePool, migrate::Migrator};
+
+pub use watch::ChangeWatcher;
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/work");
 

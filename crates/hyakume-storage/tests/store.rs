@@ -1,7 +1,7 @@
 use hyakume_core::api::{CreateRelation, CreateRelationType, CreateRole, CreateTask, UpdateTask};
 use hyakume_core::model::{BuiltinRelation, ProjectKey, Workspace};
 use hyakume_core::permission::{MembershipKind, Permission};
-use hyakume_storage::{Store, StoreError};
+use hyakume_storage::{ChangeWatcher, Store, StoreError};
 
 async fn open() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -281,4 +281,25 @@ async fn relation_type_names_cannot_shadow_each_other_as_typed() {
         .create_relation_type(ws.id, custom("depends on", Some("needed by")))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn watcher_sees_commits_from_another_process_once() {
+    let (dir, desktop) = open().await;
+    let path = dir.path().join("work.db");
+    let mut watcher = ChangeWatcher::open(&path).await.unwrap();
+    // A second pool on the same file stands in for the CLI in another process.
+    let cli = Store::open(&path).await.unwrap();
+
+    assert!(!watcher.changed().await.unwrap(), "nothing committed yet");
+    workspace(&cli).await;
+    assert!(
+        watcher.changed().await.unwrap(),
+        "the CLI's commit is noticed"
+    );
+    assert!(!watcher.changed().await.unwrap(), "and reported only once");
+
+    // Reads don't count as changes, so a reload can't trigger another reload.
+    desktop.workspace_by_slug("acme").await.unwrap();
+    assert!(!watcher.changed().await.unwrap());
 }
