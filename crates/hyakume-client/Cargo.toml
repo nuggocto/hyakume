@@ -1,0 +1,31 @@
+[package]
+name = "hyakume-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+directories = "6.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+hyakume-core = { path = "../hyakume-core" }
+hyakume-storage = { path = "../hyakume-storage" }
+keyring-core = "1.0.1"
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+
+[dev-dependencies]
+hyakume-server = { path = "../hyakume-server" }
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "net"] }
+
+[lints]
+workspace = true
