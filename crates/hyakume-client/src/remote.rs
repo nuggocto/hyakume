@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use futures_util::{Stream, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use hyakume_core::api::{
     ApiError, CreateComment, CreateProject, CreateRelation, CreateRelationType, CreateRole,
     CreateTask, DevLoginRequest, Event, Layout, LoginResponse, ProjectSnapshot, Role, ServerInfo,
@@ -13,7 +13,10 @@ use hyakume_core::model::{Comment, Identity, Project, Relation, RelationType, Ta
 use reqwest::{Method, RequestBuilder, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, http::HeaderValue};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{self, Bytes, client::IntoClientRequest, http::HeaderValue};
 
 use crate::ClientError;
 
@@ -286,28 +289,67 @@ impl Remote {
                     reason: other.to_string(),
                 },
             })?;
-        let server = self.base.clone();
-        Ok(socket.filter_map(move |message| {
-            let server = server.clone();
-            async move {
-                match message {
-                    Ok(tungstenite::Message::Text(text)) => Some(
-                        serde_json::from_str::<Event>(&text)
-                            .map_err(|e| ClientError::Internal(format!("bad event: {e}"))),
-                    ),
-                    Ok(tungstenite::Message::Close(_)) => Some(Err(ClientError::Unreachable {
-                        server,
-                        reason: "the server closed the event stream".into(),
-                    })),
-                    Ok(_) => None,
-                    Err(e) => Some(Err(ClientError::Unreachable {
-                        server,
-                        reason: e.to_string(),
-                    })),
+        Ok(events(socket, self.base.clone(), PING_EVERY, SILENT_LIMIT))
+    }
+}
+
+/// How often an open event stream is pinged.
+const PING_EVERY: Duration = Duration::from_secs(20);
+/// A stream that hears nothing back for this long, not even a pong, is gone.
+const SILENT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Turns the socket into events. A connection can die without closing (a
+/// laptop asleep, a dropped NAT entry), so it gets pinged: an idle server
+/// still answers, a dead link doesn't, and silence ends the stream.
+fn events<S>(
+    socket: WebSocketStream<S>,
+    server: String,
+    ping_every: Duration,
+    silent_limit: Duration,
+) -> impl Stream<Item = Result<Event, ClientError>> + use<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let ping = tokio::time::interval_at(Instant::now() + ping_every, ping_every);
+    let open = Some((socket, ping, Instant::now()));
+    futures_util::stream::unfold(open, move |open| {
+        let server = server.clone();
+        async move {
+            let (mut socket, mut ping, mut heard) = open?;
+            let lost = |reason: String| {
+                let err = ClientError::Unreachable {
+                    server: server.clone(),
+                    reason,
+                };
+                Some((Err(err), None))
+            };
+            loop {
+                tokio::select! {
+                    message = socket.next() => match message {
+                        Some(Ok(tungstenite::Message::Text(text))) => {
+                            let event = serde_json::from_str::<Event>(&text)
+                                .map_err(|e| ClientError::Internal(format!("bad event: {e}")));
+                            return Some((event, Some((socket, ping, Instant::now()))));
+                        }
+                        Some(Ok(tungstenite::Message::Close(_))) | None => {
+                            return lost("the server closed the event stream".into());
+                        }
+                        // Pongs and pings count as signs of life.
+                        Some(Ok(_)) => heard = Instant::now(),
+                        Some(Err(e)) => return lost(e.to_string()),
+                    },
+                    _ = ping.tick() => {
+                        if let Err(e) = socket.send(tungstenite::Message::Ping(Bytes::new())).await {
+                            return lost(e.to_string());
+                        }
+                    }
+                    () = tokio::time::sleep_until(heard + silent_limit) => {
+                        return lost(format!("no answer for {} s", silent_limit.as_secs()));
+                    }
                 }
             }
-        }))
-    }
+        }
+    })
 }
 
 /// reqwest's top-level message is just "error sending request"; the cause,
@@ -321,4 +363,70 @@ fn error_chain(err: &dyn std::error::Error) -> String {
         source = cause.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A bare WebSocket server that sends `subscribed`, then hands the socket
+    /// to `then`, and a client stream on it with short ping timings.
+    async fn connect<F, Fut>(then: F) -> impl Stream<Item = Result<Event, ClientError>>
+    where
+        F: FnOnce(WebSocketStream<tokio::net::TcpStream>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let hello = serde_json::to_string(&Event::Subscribed).unwrap();
+            ws.send(tungstenite::Message::Text(hello.into()))
+                .await
+                .unwrap();
+            then(ws).await;
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let ping = Duration::from_millis(50);
+        events(socket, addr.to_string(), ping, Duration::from_millis(300))
+    }
+
+    #[tokio::test]
+    async fn a_link_that_goes_silent_ends_the_stream() {
+        // The server keeps the socket open but never reads it, so no pong comes back.
+        let events = connect(|ws| async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(ws);
+        })
+        .await;
+        let mut events = Box::pin(events);
+        assert_eq!(events.next().await.unwrap().unwrap(), Event::Subscribed);
+        let ended = tokio::time::timeout(Duration::from_secs(3), events.next())
+            .await
+            .expect("silence is noticed well within 3 s");
+        assert!(
+            matches!(ended, Some(Err(ClientError::Unreachable { .. }))),
+            "{ended:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_server_that_answers_pings_stays_connected() {
+        // Reading is enough for tungstenite to answer pings; no events are sent.
+        let events = connect(|mut ws| async move { while ws.next().await.is_some() {} }).await;
+        let mut events = Box::pin(events);
+        assert_eq!(events.next().await.unwrap().unwrap(), Event::Subscribed);
+        let quiet = tokio::time::timeout(Duration::from_secs(1), events.next()).await;
+        assert!(
+            quiet.is_err(),
+            "an idle but answering link stays open: {quiet:?}"
+        );
+    }
 }
