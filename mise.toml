@@ -2,8 +2,71 @@
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tasks.dev]
-description = "Run the application"
-run = "cargo run --locked"
+description = "Build the CLI and desktop app, then open the desktop app through the launcher"
+run = "cargo build --locked -p hyakume-cli -p hyakume-desktop && ./target/debug/hyakume"
+
+[tasks.servers]
+description = "Build everything, then run both dev servers until Ctrl+C"
+shell = "bash -c"
+run = '''
+set -e
+cargo build --locked -p hyakume-server -p hyakume-cli -p hyakume-desktop
+trap 'kill $(jobs -p) 2>/dev/null' EXIT
+./target/debug/hyakume-server --config dev/server-a.toml &
+./target/debug/hyakume-server --config dev/server-b.toml &
+# If either server stops (a port in use, a bad config), stop the other too.
+wait -n
+'''
+
+[tasks.demo-setup]
+description = "Create the Alice, Bob, and Gwen profiles and sign them in (needs `mise run servers`)"
+run = '''
+set -e
+cargo build -q --locked -p hyakume-cli
+rm -rf dev/data/profiles
+for who in alice bob gwen; do
+  dir="dev/data/profiles/$who"
+  mkdir -p "$dir"
+  # Plain token files instead of the OS keyring, so test sign-ins stay in dev/data.
+  echo 'credential_store = "dev-file"' > "$dir/client.toml"
+done
+as() { who=$1; shift; HYAKUME_DATA_DIR="dev/data/profiles/$who" ./target/debug/hyakume "$@"; }
+as alice server add a http://127.0.0.1:7878
+as alice auth dev-login alice --server a \
+  || { echo "Is \`mise run servers\` running in another terminal?" >&2; exit 1; }
+as alice server add b http://127.0.0.1:7879
+as alice auth dev-login alice --server b
+as alice workspace use a/acme
+as bob server add a http://127.0.0.1:7878
+as bob auth dev-login bob --server a
+as bob server add b http://127.0.0.1:7879
+as bob auth dev-login bob --server b
+as bob workspace use a/acme
+as gwen server add a http://127.0.0.1:7878
+as gwen auth dev-login gwen --server a
+as gwen workspace use a/acme
+echo
+echo "Ready. Try: mise run alice -- task list"
+'''
+
+[tasks.alice]
+description = "Run a hyakume command as Alice, e.g. `mise run alice -- task list`"
+quiet = true
+run = "cargo build -q --locked -p hyakume-cli && HYAKUME_DATA_DIR=dev/data/profiles/alice ./target/debug/hyakume"
+
+[tasks.bob]
+description = "Run a hyakume command as Bob"
+quiet = true
+run = "cargo build -q --locked -p hyakume-cli && HYAKUME_DATA_DIR=dev/data/profiles/bob ./target/debug/hyakume"
+
+[tasks.gwen]
+description = "Run a hyakume command as Gwen, a guest who only sees WEB"
+quiet = true
+run = "cargo build -q --locked -p hyakume-cli && HYAKUME_DATA_DIR=dev/data/profiles/gwen ./target/debug/hyakume"
+
+[tasks.reset]
+description = "Delete the dev server databases and profiles (stop `mise run servers` first)"
+run = "rm -rf dev/data"
 
 [tasks.build]
 description = "Build all workspace packages"
