@@ -546,7 +546,7 @@ impl Render for Hyakume {
                     .child(
                         div()
                             .text_color(t.muted)
-                            .child(SharedString::from(reason.clone())),
+                            .child(inspector::clean(reason, false)),
                     ),
             );
         }
@@ -673,7 +673,7 @@ impl Hyakume {
                                 this.show_workspace(&workspace);
                                 cx.notify();
                             }))
-                            .child(SharedString::from(place)),
+                            .child(inspector::clean(&place, false)),
                     )
                     .child(div().text_color(t.muted).child("›"))
                     .child(
@@ -683,12 +683,12 @@ impl Hyakume {
                             .child(
                                 div()
                                     .font_weight(FontWeight::BOLD)
-                                    .child(SharedString::from(cluster.project_key.clone())),
+                                    .child(inspector::clean(&cluster.project_key, false)),
                             )
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child(SharedString::from(cluster.name.clone())),
+                                    .child(inspector::clean(&cluster.name, false)),
                             ),
                     );
             }
