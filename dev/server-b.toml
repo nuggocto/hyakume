@@ -1,0 +1,19 @@
+# Development server B: a second team, to test the combined overview.
+bind = "127.0.0.1:7879"
+database = "data/server-b.db"
+dev_mode = true
+
+[[dev.identities]]
+name = "alice"
+display_name = "Alice"
+
+[[dev.identities]]
+name = "bob"
+display_name = "Bob"
+
+[[dev.workspaces]]
+slug = "studio"
+name = "Studio"
+owner = "bob"
+projects = [{ key = "DOC", name = "Documentation" }]
+members = [{ identity = "alice", roles = ["Member"] }]

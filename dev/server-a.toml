@@ -1,0 +1,30 @@
+# Development server A with synthetic data. Never use dev_mode with real data:
+# dev login lets anyone who reaches the port act as any identity below.
+bind = "127.0.0.1:7878"
+database = "data/server-a.db"
+dev_mode = true
+
+[[dev.identities]]
+name = "alice"
+display_name = "Alice"
+
+[[dev.identities]]
+name = "bob"
+display_name = "Bob"
+
+[[dev.identities]]
+name = "gwen"
+display_name = "Gwen (guest)"
+
+[[dev.workspaces]]
+slug = "acme"
+name = "Acme"
+owner = "alice"
+projects = [
+  { key = "WEB", name = "Website" },
+  { key = "API", name = "Public API" },
+]
+members = [
+  { identity = "bob", roles = ["Member"] },
+  { identity = "gwen", roles = ["Guest"], guest_projects = ["WEB"] },
+]

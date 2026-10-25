@@ -1,0 +1,31 @@
+[package]
+name = "hyakume-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws", "query"] }
+getrandom = "0.4.3"
+hyakume-core = { path = "../hyakume-core" }
+hyakume-storage = { path = "../hyakume-storage" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "net", "sync"] }
+toml = "1.1.8"
+tower-http = { version = "0.7.1", features = ["limit", "timeout", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uuid = "1.29.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1"
+
+[lints]
+workspace = true
