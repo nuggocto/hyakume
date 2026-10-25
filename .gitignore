@@ -25,3 +25,12 @@ Thumbs.db
 
 # Packages built by cargo xtask package
 /dist/
+
+# Development server databases
+/dev/data/
+
+# SQLite files and dev-file tokens, in case a run points somewhere in the repo
+*.db
+*.db-wal
+*.db-shm
+*.token

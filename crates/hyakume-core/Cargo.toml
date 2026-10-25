@@ -1,0 +1,16 @@
+[package]
+name = "hyakume-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["serde-human-readable", "formatting", "parsing", "macros"] }
+uuid = { version = "1.29.0", features = ["v7", "serde"] }
+
+[lints]
+workspace = true
