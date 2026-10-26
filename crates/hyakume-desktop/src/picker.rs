@@ -36,6 +36,8 @@ pub enum Pick {
     Workspace(NodeKey),
     Retry(SourceKey),
     Task(NodeKey),
+    /// Hides or shows every task in the stage with this name key.
+    Stage(String),
 }
 
 pub struct Item {
@@ -120,12 +122,15 @@ pub fn filter(items: &[Item], query: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Every task in `scope` (one project, or all of them), for Find.
-pub fn task_items(scene: &Scene, scope: Option<usize>) -> Vec<Item> {
+/// Every task in `scope` (one project, or all of them) that a stage filter
+/// leaves `shown`, for Find.
+pub fn task_items(scene: &Scene, scope: Option<usize>, shown: impl Fn(usize) -> bool) -> Vec<Item> {
     scene
         .eyes
         .iter()
-        .filter(|eye| scope.is_none_or(|c| eye.cluster == c))
+        .enumerate()
+        .filter(|&(i, eye)| scope.is_none_or(|c| eye.cluster == c) && shown(i))
+        .map(|(_, eye)| eye)
         .map(|eye| {
             let cluster = &scene.clusters[eye.cluster];
             let column = &scene.columns[cluster.column];
@@ -152,10 +157,11 @@ pub fn task_items(scene: &Scene, scope: Option<usize>) -> Vec<Item> {
 }
 
 /// The links leaving (or arriving at) one task, for following.
-pub fn link_items(scene: &Scene, eye: usize, dir: Dir) -> Vec<Item> {
+pub fn link_items(scene: &Scene, eye: usize, dir: Dir, shown: impl Fn(usize) -> bool) -> Vec<Item> {
     scene
         .links(eye, dir)
         .into_iter()
+        .filter(|&(_, other)| shown(other))
         .map(|(name, other)| {
             let task = &scene.eyes[other].task;
             let cluster = &scene.clusters[scene.eyes[other].cluster];
@@ -318,7 +324,7 @@ mod tests {
         ws.project("API", &[("Signup endpoint", 3)]);
         ws.snapshots[0].tasks[1].fields.labels = vec!["launch".into()];
         let scene = Scene::build(&[ws.source()]);
-        let items = task_items(&scene, None);
+        let items = task_items(&scene, None, |_| true);
         let found = |q: &str| -> Vec<String> {
             filter(&items, q)
                 .into_iter()
@@ -336,7 +342,7 @@ mod tests {
 
         // Scoped to one project, the other project's tasks aren't offered.
         let api = scene.clusters.iter().position(|c| c.project_key == "API");
-        let scoped = task_items(&scene, api);
+        let scoped = task_items(&scene, api, |_| true);
         assert_eq!(scoped.len(), 1);
         assert!(filter(&scoped, "web").is_empty());
     }

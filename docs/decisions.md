@@ -242,3 +242,15 @@ the profile change there was no frame time left for it to save, and its
 invalidation (zoom, data, highlight, pinned headers) would be a new place
 for stale drawings to come from.
 
+## D17. Stage filters go by name (2026-10-26)
+
+A stage filter hides tasks by stage name across every project on screen,
+compared with `name_key`, so hiding Done hides every project's Done. Most
+projects keep the default stages, and someone hiding finished work wants
+it gone everywhere, not one project at a time. The palette offers one entry
+per stage name in use; a stage nobody's tasks are in has nothing to hide.
+
+Rejected: filtering by eye shape (a custom "QA" stage would hide with
+Review, under a name the person never typed), per-project filters (more
+state for no gain while stages are mostly shared), and saving filters
+across restarts (a forgotten filter makes work look missing).

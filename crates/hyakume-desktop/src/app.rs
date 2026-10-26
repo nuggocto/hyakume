@@ -2,7 +2,7 @@
 //! focused or selected, and turns pointer and key input into changes.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -113,6 +113,10 @@ pub struct Hyakume {
     before_find: Option<(Camera, bool)>,
     /// While Find is open: which eyes match the query.
     matches: Option<Rc<Vec<bool>>>,
+    /// Name keys of the stages filtered out, and the eyes that hides. Only
+    /// what's drawn changes; every position stays where it was.
+    hidden_stages: BTreeSet<String>,
+    hidden: Option<Rc<Vec<bool>>>,
     _picker_input: Option<Subscription>,
     /// A short message and when it goes away.
     notice: Option<(SharedString, Instant)>,
@@ -231,6 +235,8 @@ impl Hyakume {
             picker_return: None,
             before_find: None,
             matches: None,
+            hidden_stages: BTreeSet::new(),
+            hidden: None,
             _picker_input: None,
             notice: None,
             keys_file,
@@ -302,6 +308,7 @@ impl Hyakume {
         let scene = Scene::build(&self.sources);
         self.placement = Rc::new(self.layout.place(&scene));
         self.scene = Rc::new(scene);
+        self.apply_stage_filter();
         // It's indices into the old scene; the next pointer move sets it again.
         self.hovered = None;
         if self
@@ -326,6 +333,36 @@ impl Hyakume {
             None if self.focus.is_some() => self.back_to_overview(),
             None => {}
         }
+    }
+
+    /// Recomputes which eyes the stage filter hides. A hidden task can't
+    /// stay selected: its ring and details would point at nothing drawn.
+    fn apply_stage_filter(&mut self) {
+        self.hidden = (!self.hidden_stages.is_empty())
+            .then(|| Rc::new(self.scene.hidden_by(&self.hidden_stages)));
+        let selected = self.selected.as_ref().and_then(|k| self.scene.eye(k));
+        if selected.is_some_and(|e| self.is_hidden(e)) {
+            self.selected = None;
+            self.inspecting = false;
+        }
+    }
+
+    fn is_hidden(&self, eye: usize) -> bool {
+        self.hidden
+            .as_ref()
+            .is_some_and(|h| h.get(eye).copied().unwrap_or(false))
+    }
+
+    fn toggle_stage(&mut self, key: String) {
+        if !self.hidden_stages.remove(&key) {
+            self.hidden_stages.insert(key);
+        }
+        self.apply_stage_filter();
+    }
+
+    fn show_every_stage(&mut self) {
+        self.hidden_stages.clear();
+        self.apply_stage_filter();
     }
 
     fn relayout(&mut self) {
@@ -639,6 +676,17 @@ impl Hyakume {
                 Some(Pick::Task(key)) => self.scene.eye(key),
                 _ => None,
             });
+        // Hidden stubs go too, small web and all.
+        let stubs = match self.hidden {
+            Some(_) => Rc::new(
+                self.stubs
+                    .iter()
+                    .filter(|(e, _)| !self.is_hidden(*e))
+                    .copied()
+                    .collect(),
+            ),
+            None => self.stubs.clone(),
+        };
         Frame {
             scene: self.scene.clone(),
             placement: self.placement.clone(),
@@ -646,7 +694,7 @@ impl Hyakume {
             theme: self.theme,
             focus: self.focus.as_ref().and_then(|k| self.scene.cluster(k)),
             selected: self.selected.as_ref().and_then(|k| self.scene.eye(k)),
-            stubs: self.stubs.clone(),
+            stubs,
             web_cursor: self
                 .web_cursor
                 .as_ref()
@@ -654,6 +702,7 @@ impl Hyakume {
                 .and_then(|k| self.scene.cluster(k)),
             preview,
             matches: self.matches.clone(),
+            hidden: self.hidden.clone(),
             ring: None,
             spot: self.spot(),
         }
@@ -929,7 +978,8 @@ impl Hyakume {
             self.note("Select a task first; its links are what O and I follow");
             return;
         };
-        let links = self.scene.links(eye, dir);
+        let mut links = self.scene.links(eye, dir);
+        links.retain(|&(_, other)| !self.is_hidden(other));
         match links.as_slice() {
             [] => {
                 let way = match dir {
@@ -959,12 +1009,12 @@ impl Hyakume {
         let focused = self.focus.as_ref().and_then(|k| self.scene.cluster(k));
         match mode {
             Mode::Commands => self.command_items(cx),
-            Mode::Find => picker::task_items(&self.scene, focused),
+            Mode::Find => picker::task_items(&self.scene, focused, |e| !self.is_hidden(e)),
             Mode::Follow(dir) => self
                 .selected
                 .as_ref()
                 .and_then(|k| self.scene.eye(k))
-                .map(|eye| picker::link_items(&self.scene, eye, dir))
+                .map(|eye| picker::link_items(&self.scene, eye, dir, |e| !self.is_hidden(e)))
                 .unwrap_or_default(),
         }
     }
@@ -1000,6 +1050,21 @@ impl Hyakume {
             command("Fit the overview", Box::new(Fit));
         }
         command("Re-layout", Box::new(Relayout));
+        if !self.hidden_stages.is_empty() {
+            command("Show every stage", Box::new(ShowAllStages));
+        }
+        for (key, name) in self.scene.stage_names() {
+            let verb = match self.hidden_stages.contains(&key) {
+                true => "Show",
+                false => "Hide",
+            };
+            items.push(Item::new(
+                format!("{verb} tasks in {name}"),
+                "Stage filter".into(),
+                "stage filter",
+                Pick::Stage(key),
+            ));
+        }
         if let Some(file) = &self.keys_file {
             items.push(Item::new(
                 "Reload keyboard shortcuts".into(),
@@ -1166,6 +1231,7 @@ impl Hyakume {
             }
             Pick::Workspace(key) => self.show_workspace(&key),
             Pick::Retry(source) => self.runtime.send(Command::Retry(source)),
+            Pick::Stage(key) => self.toggle_stage(key),
             Pick::Task(key) => {
                 if let Some(eye) = self.scene.eye(&key) {
                     match mode {
@@ -1310,6 +1376,10 @@ impl Render for Hyakume {
             }))
             .on_action(cx.listener(|this, _: &Relayout, _, cx| {
                 this.relayout();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ShowAllStages, _, cx| {
+                this.show_every_stage();
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ShowOverview, window, cx| {
@@ -1695,6 +1765,39 @@ impl Hyakume {
                 .child(label)
                 .children(hint.map(|h| div().text_color(t.muted).child(h)))
         };
+        // While a stage filter is on, say so where it can't be missed, and
+        // let one click (or Enter on it) bring everything back.
+        let filter = (!self.hidden_stages.is_empty()).then(|| {
+            let names: Vec<String> = self
+                .scene
+                .stage_names()
+                .into_iter()
+                .filter(|(key, _)| self.hidden_stages.contains(key))
+                .map(|(_, name)| name)
+                .collect();
+            let what = match names.is_empty() {
+                true => "Hiding some stages".to_owned(),
+                false => format!("Hiding {}", names.join(", ")),
+            };
+            button(&t, "show-all-stages", ring)
+                .flex_shrink_0()
+                .max_w(px(260.0))
+                .gap(px(8.0))
+                .border_1()
+                .border_color(t.accent)
+                .on_click(cx.listener(|this, e: &ClickEvent, window, cx| {
+                    this.show_every_stage();
+                    this.after_click(e, window);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(inspector::clean(&what, false)),
+                )
+                .child(div().text_color(t.muted).child("Show all"))
+        });
         div()
             .h(px(HEADER_H))
             .flex_shrink_0()
@@ -1740,6 +1843,7 @@ impl Hyakume {
                     ),
             )
             .child(crumbs)
+            .children(filter)
             .child(
                 div()
                     .flex()

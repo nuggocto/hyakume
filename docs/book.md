@@ -408,6 +408,29 @@ reports the caret to the input method whenever the caret moves, empty field
 included, because otherwise Japanese candidates open in a corner of the
 screen.
 
+### Stage filters
+
+The palette lists "Hide tasks in Done", "Hide tasks in Backlog", and so on,
+one entry per stage name. Picking one hides those tasks everywhere: every
+project's Done goes together, and "done" or "DONE" counts as the same stage
+([D17](decisions.md#d17-stage-filters-go-by-name-2026-10-26)). The header
+then shows what's hidden, with a Show all button, so a filtered view is
+never mistaken for an emptier workspace.
+
+Hiding only changes what's drawn. Positions don't move, so the rest of the
+web doesn't shuffle and a task comes back where it was:
+
+```text
+hidden[eye] = name_key(eye.stage) ∈ hidden stages
+frame.eye_at(eye) = None if hidden[eye]      # one check, and then:
+  not painted, not hit, not an arrow target, not in Find or Follow
+  links and bundles count only links with both ends shown
+  a web's count reads "5 of 6 tasks"
+```
+
+A hidden task can't stay selected, since its ring and details would point
+at nothing on screen, so hiding its stage lets go of it.
+
 ### Your own shortcuts
 
 A `keys.toml` next to `client.toml` adds to the defaults, and `false` removes

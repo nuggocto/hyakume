@@ -1,7 +1,7 @@
 //! What the canvas shows, rebuilt from every source after each update. No
 //! positions and no GPUI here: `layout` places things, `canvas` draws them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 
 use hyakume_core::blocking::unfinished_blockers;
@@ -29,7 +29,8 @@ impl NodeKey {
 }
 
 /// The eye drawn for a stage. The stage name is always printed next to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Declared in workflow order, which is how stage lists sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Shape {
     Backlog,
     Todo,
@@ -309,6 +310,32 @@ impl Scene {
                     _ => None,
                 }
             })
+            .collect()
+    }
+
+    /// Every stage some task is in, once per name as people type it, in
+    /// workflow order: the name key, then the name as first seen.
+    pub fn stage_names(&self) -> Vec<(String, String)> {
+        let mut stages: Vec<(Shape, String, String)> = Vec::new();
+        for eye in &self.eyes {
+            let key = name_key(&eye.stage);
+            if !stages.iter().any(|(_, k, _)| *k == key) {
+                stages.push((eye.shape, key, eye.stage.clone()));
+            }
+        }
+        stages.sort();
+        stages
+            .into_iter()
+            .map(|(_, key, name)| (key, name))
+            .collect()
+    }
+
+    /// Which eyes a stage filter hides, by the name keys of hidden stages.
+    /// Every project's "Done" goes together, however each one spells it.
+    pub fn hidden_by(&self, stages: &BTreeSet<String>) -> Vec<bool> {
+        self.eyes
+            .iter()
+            .map(|eye| stages.contains(&name_key(&eye.stage)))
             .collect()
     }
 

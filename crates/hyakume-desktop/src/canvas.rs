@@ -139,6 +139,9 @@ pub struct Frame {
     pub preview: Option<usize>,
     /// While Find is open: which eyes match. The rest are faded.
     pub matches: Option<Rc<Vec<bool>>>,
+    /// Eyes whose stage is filtered out. They keep their spot but aren't
+    /// drawn, hit, or reachable with the arrows.
+    pub hidden: Option<Rc<Vec<bool>>>,
     /// Drawn around the canvas while it has keyboard focus.
     pub ring: Option<Hsla>,
     /// What's hovered, or else selected: lit with its links, the rest faded.
@@ -148,6 +151,9 @@ pub struct Frame {
 impl Frame {
     /// Where an eye is drawn in this view, if it is drawn at all.
     pub fn eye_at(&self, eye: usize) -> Option<Vec2> {
+        if self.is_hidden(eye) {
+            return None;
+        }
         match self.focus {
             Some(c) if self.scene.eyes[eye].cluster != c => self
                 .stubs
@@ -162,6 +168,12 @@ impl Frame {
     /// the overview; the project's own plus its stubs while focused.
     pub fn drawn_eyes(&self) -> impl Iterator<Item = (usize, Vec2)> + '_ {
         (0..self.scene.eyes.len()).filter_map(|eye| self.eye_at(eye).map(|at| (eye, at)))
+    }
+
+    pub fn is_hidden(&self, eye: usize) -> bool {
+        self.hidden
+            .as_ref()
+            .is_some_and(|h| h.get(eye).copied().unwrap_or(false))
     }
 
     fn shows_cluster(&self, cluster: usize) -> bool {
@@ -860,7 +872,15 @@ fn web_text<'a>(
         });
     let count = (!crowded).then(|| {
         let n = cluster.eyes.len();
-        let mut text = format!("{n} task{}", if n == 1 { "" } else { "s" });
+        let shown = cluster
+            .eyes
+            .clone()
+            .filter(|&e| !frame.is_hidden(e))
+            .count();
+        let mut text = match shown == n {
+            true => format!("{n} task{}", if n == 1 { "" } else { "s" }),
+            false => format!("{shown} of {n} tasks"),
+        };
         if cluster.blocked > 0 {
             text.push_str(&format!(" · {} blocked", cluster.blocked));
         }
@@ -1232,9 +1252,14 @@ struct Bundle {
     links: usize,
 }
 
-fn bundles(scene: &Scene) -> Vec<Bundle> {
+/// Only links with both ends `shown` count, so a stage filter thins them too.
+fn bundles(scene: &Scene, shown: impl Fn(usize) -> bool) -> Vec<Bundle> {
     let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
-    for t in &scene.threads {
+    for t in scene
+        .threads
+        .iter()
+        .filter(|t| shown(t.from) && shown(t.to))
+    {
         let (a, b) = (scene.eyes[t.from].cluster, scene.eyes[t.to].cluster);
         if a != b {
             *counts.entry((a.min(b), a.max(b))).or_default() += 1;
@@ -1464,7 +1489,10 @@ fn bundle_threads(
     let spotlit = lit.is_some();
     let webs = web_circles(bounds, frame);
     let mut tops = Vec::new();
-    for (n, bundle) in bundles(&frame.scene).into_iter().enumerate() {
+    for (n, bundle) in bundles(&frame.scene, |e| !frame.is_hidden(e))
+        .into_iter()
+        .enumerate()
+    {
         let (a, b) = bundle.webs;
         let ((ca, ra), (cb, rb)) = (webs[a], webs[b]);
         let d = (cb.0 - ca.0).hypot(cb.1 - ca.1);
@@ -1939,6 +1967,7 @@ mod tests {
             web_cursor: None,
             preview: None,
             matches: None,
+            hidden: None,
             ring: None,
             spot: None,
         };
@@ -1949,6 +1978,43 @@ mod tests {
         // Its eye, and the empty part of its small web, both count.
         assert!(matches!(hit(&frame, at), Hit::Stub(e) if e == eye));
         assert!(matches!(hit(&frame, at + Vec2::new(30.0, 0.0)), Hit::Stub(e) if e == eye));
+    }
+
+    #[test]
+    fn a_hidden_stage_drops_its_tasks_from_hits_and_arrows() {
+        let mut ws = Fixture::new();
+        // Stage 4 is Done, stage 2 In progress.
+        ws.project("WEB", &[("Shipped", 4), ("Building", 2)]);
+        ws.project("API", &[("Also shipped", 4)]);
+        // One project spells it differently; the filter treats it as the same stage.
+        ws.snapshots[1].stages[4].name = "done".into();
+        let scene = Scene::build(&[ws.source()]);
+        let placement = Layout::default().place(&scene);
+        let hidden = scene.hidden_by(&["done".to_owned()].into());
+        assert_eq!(hidden, [true, false, true]);
+        let frame = Frame {
+            scene: Rc::new(scene),
+            placement: Rc::new(placement),
+            camera: Camera {
+                origin: Vec2::default(),
+                zoom: 1.0,
+            },
+            theme: Theme::light(),
+            focus: Some(0),
+            selected: None,
+            stubs: Rc::default(),
+            web_cursor: None,
+            preview: None,
+            matches: None,
+            hidden: Some(Rc::new(hidden)),
+            ring: None,
+            spot: None,
+        };
+
+        let shipped = frame.placement.eyes[0];
+        assert!(!matches!(hit(&frame, shipped), Hit::Eye(_)));
+        let reachable: Vec<usize> = frame.drawn_eyes().map(|(e, _)| e).collect();
+        assert_eq!(reachable, [1], "only WEB-2 is left to land on");
     }
 
     #[test]
@@ -2065,7 +2131,7 @@ mod tests {
         };
         let (w, a) = (cluster("WEB"), cluster("API"));
         assert_eq!(
-            bundles(&scene),
+            bundles(&scene, |_| true),
             [Bundle {
                 webs: (w.min(a), w.max(a)),
                 links: 2
