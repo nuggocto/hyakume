@@ -683,8 +683,11 @@ impl Hyakume {
         self.note_for(text, NOTICE_FOR);
     }
 
+    /// Notices quote task references, which come from servers as plain
+    /// strings, so they get the same filtering as every other server text.
     fn note_for(&mut self, text: impl Into<SharedString>, how_long: Duration) {
-        self.notice = Some((text.into(), Instant::now() + how_long));
+        let text = inspector::clean(&text.into(), false);
+        self.notice = Some((text, Instant::now() + how_long));
     }
 
     /// Every problem goes to the terminal, but only the first fits in the
