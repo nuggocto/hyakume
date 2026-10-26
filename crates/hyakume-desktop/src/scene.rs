@@ -103,6 +103,13 @@ pub enum ThreadKind {
     Undirected,
 }
 
+/// Which way a link is followed: along its direction, or back against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dir {
+    Out,
+    In,
+}
+
 impl Scene {
     pub fn build(sources: &[SourceState]) -> Self {
         let mut scene = Self::default();
@@ -284,6 +291,25 @@ impl Scene {
 
     pub fn cluster(&self, key: &NodeKey) -> Option<usize> {
         self.cluster_index.get(key).copied()
+    }
+
+    /// The links to follow from `eye`, each named as read from its side
+    /// ("blocks" going out, "blocked by" coming in) with the eye at the other
+    /// end. An undirected link has no direction, so it counts both ways.
+    pub fn links(&self, eye: usize, dir: Dir) -> Vec<(String, usize)> {
+        self.threads
+            .iter()
+            .filter_map(|t| {
+                let both = t.kind == ThreadKind::Undirected;
+                match dir {
+                    Dir::Out if t.from == eye => Some((t.name.clone(), t.to)),
+                    Dir::Out if both && t.to == eye => Some((t.reverse.clone(), t.from)),
+                    Dir::In if t.to == eye => Some((t.reverse.clone(), t.from)),
+                    Dir::In if both && t.from == eye => Some((t.name.clone(), t.to)),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     /// Threads from other projects that end in this cluster: the other end is
@@ -568,6 +594,42 @@ pub(crate) mod tests {
         assert_eq!(scene.threads.len(), 1);
         assert_eq!(scene.threads[0].kind, ThreadKind::Undirected);
         assert_eq!(scene.outside_ends(0), [1], "API-1 is WEB's stub");
+    }
+
+    #[test]
+    fn links_are_followed_from_either_end() {
+        let mut ws = Fixture::new();
+        let web = ws.project("WEB", &[("Landing page", 0), ("Pricing", 0)]);
+        let api = ws.project("API", &[("Signup endpoint", 0)]);
+        ws.link(0, api[0], web[0]);
+        ws.link(1, web[0], web[1]);
+        let scene = Scene::build(&[ws.source()]);
+        let eye = |reference: &str| {
+            scene
+                .eyes
+                .iter()
+                .position(|e| e.task.reference == reference)
+                .unwrap()
+        };
+        let follow = |from: &str, dir| -> Vec<(String, String)> {
+            scene
+                .links(eye(from), dir)
+                .into_iter()
+                .map(|(name, to)| (name, scene.eyes[to].task.reference.clone()))
+                .collect()
+        };
+        let pair = |name: &str, to: &str| (name.to_owned(), to.to_owned());
+
+        assert_eq!(follow("API-1", Dir::Out), [pair("blocks", "WEB-1")]);
+        assert!(follow("API-1", Dir::In).is_empty());
+        // "Related to" has no direction, so it's there both ways.
+        assert_eq!(
+            follow("WEB-1", Dir::In),
+            [pair("blocked by", "API-1"), pair("related to", "WEB-2")]
+        );
+        assert_eq!(follow("WEB-1", Dir::Out), [pair("related to", "WEB-2")]);
+        assert_eq!(follow("WEB-2", Dir::Out), [pair("related to", "WEB-1")]);
+        assert_eq!(follow("WEB-2", Dir::In), [pair("related to", "WEB-1")]);
     }
 
     #[test]

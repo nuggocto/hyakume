@@ -6,11 +6,14 @@ mod canvas;
 mod clock;
 mod glyphs;
 mod inspector;
+mod keys;
 mod layout;
 mod meme;
+mod picker;
 mod runtime;
 mod scene;
 mod sources;
+mod text_input;
 mod theme;
 
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
@@ -18,6 +21,8 @@ use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, prelude::*, px
 use std::rc::Rc;
 
 use time::OffsetDateTime;
+
+use hyakume_client::DataDir;
 
 use crate::app::Hyakume;
 use crate::clock::LocalTime;
@@ -36,7 +41,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // The background thread reports a missing profile; here it only means
+    // there's no keys.toml to read.
+    let keys_file = DataDir::resolve().ok().map(|d| d.path().join(keys::FILE));
     Application::new().run(move |cx: &mut App| {
+        let key_problems = keys::install(cx, keys_file.as_deref());
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -46,7 +55,7 @@ fn main() {
         let opened = cx.open_window(options, |window, cx| {
             // GPUI 0.2.2 ignores TitlebarOptions::title on Wayland, so set it here.
             window.set_window_title("Hyakume");
-            cx.new(|cx| Hyakume::new(runtime, updates, local, window, cx))
+            cx.new(|cx| Hyakume::new(runtime, updates, local, keys_file, key_problems, window, cx))
         });
         if let Err(err) = opened {
             eprintln!("error: cannot open a window: {err:#}");

@@ -70,6 +70,28 @@ impl Theme {
         }
     }
 
+    /// The colors an eye and its label are drawn with, at `alpha`. Find uses
+    /// it to fade the tasks that don't match.
+    pub fn faded(&self, alpha: f32) -> Self {
+        let mut t = *self;
+        for c in [
+            &mut t.ink,
+            &mut t.muted,
+            &mut t.blocked,
+            &mut t.on_blocked,
+            &mut t.accent,
+            &mut t.eye.bead,
+            &mut t.eye.gold,
+            &mut t.eye.gold_rim,
+            &mut t.eye.pupil,
+            &mut t.eye.glint,
+        ] {
+            *c = c.opacity(alpha);
+        }
+        t.eye.rim = t.eye.rim.map(|c| c.opacity(alpha));
+        t
+    }
+
     pub fn light() -> Self {
         Self {
             bg: c(0xF6F4EF),

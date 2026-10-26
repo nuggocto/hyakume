@@ -1,8 +1,11 @@
 //! The side panel for one selected task. Read-only until editing arrives.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, App, ClickEvent, FontWeight, Hsla, IntoElement, ParentElement, SharedString,
-    Styled, Window, canvas, div, prelude::*, px,
+    AnyElement, App, Bounds, ClickEvent, FocusHandle, FontWeight, Hsla, IntoElement, ParentElement,
+    Pixels, ScrollHandle, SharedString, Styled, Window, canvas, div, point, prelude::*, px,
 };
 use hyakume_core::api::TaskDetail;
 use hyakume_core::model::is_unsafe_char;
@@ -48,6 +51,96 @@ pub fn clean(text: &str, multiline: bool) -> SharedString {
         .into()
 }
 
+type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+type OnEye = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// The panel's keyboard stops: its close button, then one per thread row.
+/// The window keeps them so Tab can scroll the one it lands on into view,
+/// since GPUI moves focus without scrolling.
+#[derive(Clone, Default)]
+pub struct Stops {
+    handles: Vec<FocusHandle>,
+    /// Where each thread row was last painted.
+    rows: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+}
+
+impl Stops {
+    /// Makes sure there are enough stops for the panel on `eye`.
+    pub fn prepare(&mut self, scene: &Scene, eye: usize, cx: &mut App) {
+        let needed = 1 + links(scene, eye).len();
+        while self.handles.len() < needed {
+            self.handles.push(cx.focus_handle().tab_stop(true));
+        }
+    }
+
+    /// Scrolls the panel just enough to show the focused stop, if one is.
+    pub fn reveal(&self, scroll: &ScrollHandle, window: &Window) {
+        let Some(i) = self.handles.iter().position(|h| h.is_focused(window)) else {
+            return;
+        };
+        let y = match i {
+            // The close button sits at the very top.
+            0 => 0.0,
+            _ => {
+                let Some(row) = self.rows.borrow().get(i - 1).copied() else {
+                    return;
+                };
+                let view = scroll.bounds();
+                reveal_offset(
+                    f32::from(scroll.offset().y),
+                    (f32::from(view.top()), f32::from(view.bottom())),
+                    (f32::from(row.top()), f32::from(row.bottom())),
+                    -f32::from(scroll.max_offset().height),
+                )
+            }
+        };
+        scroll.set_offset(point(scroll.offset().x, px(y)));
+    }
+}
+
+/// The scroll offset that brings `item` (top and bottom on screen) inside
+/// `view` with a little room, moving as little as possible. Offsets go
+/// negative as the content scrolls down, as GPUI counts them.
+fn reveal_offset(offset: f32, view: (f32, f32), item: (f32, f32), lowest: f32) -> f32 {
+    const ROOM: f32 = 16.0;
+    let shift = if item.0 < view.0 + ROOM {
+        view.0 + ROOM - item.0
+    } else if item.1 > view.1 - ROOM {
+        view.1 - ROOM - item.1
+    } else {
+        0.0
+    };
+    (offset + shift).clamp(lowest.min(0.0), 0.0)
+}
+
+/// Every link touching `eye`, named from its side, with the eye at the other end.
+fn links(scene: &Scene, eye: usize) -> Vec<(String, usize)> {
+    scene
+        .threads
+        .iter()
+        .filter_map(|th| {
+            if th.from == eye {
+                Some((th.name.clone(), th.to))
+            } else if th.to == eye {
+                Some((th.reverse.clone(), th.from))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// What the panel needs from the window around it.
+pub struct Hooks {
+    pub scroll: ScrollHandle,
+    pub stops: Stops,
+    /// The focus ring color, while the keyboard is in use.
+    pub ring: Option<Hsla>,
+    pub on_close: OnClick,
+    /// Go to the eye at the other end of a link.
+    pub on_follow: OnEye,
+}
+
 pub fn panel(
     scene: &Scene,
     eye: usize,
@@ -55,9 +148,10 @@ pub fn panel(
     theme: &Theme,
     local: &LocalTime,
     width: f32,
-    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    hooks: Hooks,
 ) -> impl IntoElement {
     let t = *theme;
+    let ring = hooks.ring;
     let e = &scene.eyes[eye];
     let task = &e.task;
     let column = &scene.columns[scene.clusters[e.cluster].column];
@@ -88,7 +182,11 @@ pub fn panel(
                 .text_size(px(18.0))
                 .cursor_pointer()
                 .hover(move |s| s.bg(t.raised))
-                .on_click(on_close)
+                .track_focus(&hooks.stops.handles[0])
+                .border_2()
+                .border_color(gpui::transparent_black())
+                .when_some(ring, |b, ring| b.focus(move |s| s.border_color(ring)))
+                .on_click(hooks.on_close)
                 .child("×"),
         );
 
@@ -177,6 +275,7 @@ pub fn panel(
         .h_full()
         .flex_shrink_0()
         .overflow_y_scroll()
+        .track_scroll(&hooks.scroll)
         .flex()
         .flex_col()
         .gap(px(18.0))
@@ -239,26 +338,27 @@ pub fn panel(
         ));
     }
 
-    let threads: Vec<_> = scene
-        .threads
-        .iter()
-        .filter_map(|th| {
-            if th.from == eye {
-                Some((th.name.clone(), th.to))
-            } else if th.to == eye {
-                Some((th.reverse.clone(), th.from))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let threads = links(scene, eye);
     if !threads.is_empty() {
-        let rows = threads.into_iter().map(|(name, other)| {
-            let other = &scene.eyes[other].task;
+        let rows = threads.into_iter().enumerate().map(|(i, (name, at))| {
+            let other = &scene.eyes[at].task;
+            let follow = hooks.on_follow.clone();
             div()
+                .id(("thread", i))
                 .flex()
                 .gap(px(12.0))
+                .mx(px(-8.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .rounded(px(8.0))
+                .border_2()
+                .border_color(gpui::transparent_black())
                 .text_size(px(13.0))
+                .cursor_pointer()
+                .hover(move |s| s.bg(t.raised))
+                .track_focus(&hooks.stops.handles[i + 1])
+                .when_some(ring, |row, ring| row.focus(move |s| s.border_color(ring)))
+                .on_click(move |_, window, cx| follow(at, window, cx))
                 .child(
                     div()
                         .w(px(84.0))
@@ -280,9 +380,15 @@ pub fn panel(
                         .child(clean(&other.fields.title, false)),
                 )
         });
+        let painted = hooks.stops.rows.clone();
         body = body.child(section(
             "Threads",
-            div().flex().flex_col().gap(px(8.0)).children(rows),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .on_children_prepainted(move |bounds, _, _| *painted.borrow_mut() = bounds)
+                .children(rows),
             &t,
         ));
     }
@@ -404,6 +510,21 @@ mod tests {
     use time::macros::{datetime, offset};
 
     use super::*;
+
+    #[test]
+    fn tabbing_to_a_row_out_of_view_scrolls_just_enough_to_show_it() {
+        // A 600 px panel from y 100, scrollable 800 px further down.
+        let (view, lowest) = ((100.0, 700.0), -800.0);
+        // Below the fold: up until it sits 16 px over the bottom edge.
+        assert_eq!(reveal_offset(0.0, view, (900.0, 930.0), lowest), -246.0);
+        // Above the top edge after scrolling down: back until 16 px under it.
+        assert_eq!(reveal_offset(-400.0, view, (40.0, 70.0), lowest), -324.0);
+        // Already in view: nothing moves.
+        assert_eq!(reveal_offset(-120.0, view, (300.0, 330.0), lowest), -120.0);
+        // Never past either end of the content.
+        assert_eq!(reveal_offset(-790.0, view, (720.0, 750.0), lowest), -800.0);
+        assert_eq!(reveal_offset(-10.0, view, (95.0, 125.0), lowest), 0.0);
+    }
 
     #[test]
     fn comment_times_use_the_offset_of_their_own_date() {

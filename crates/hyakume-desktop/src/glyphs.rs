@@ -14,6 +14,60 @@ use crate::theme::{EyeColors, Theme};
 /// Eyes are drawn in a 28×20 box, like the mockup's SVG viewBox.
 const EYE_BOX_W: f32 = 28.0;
 pub const EYE_ASPECT: f32 = 20.0 / 28.0;
+/// How far an eye's drawing reaches from its center, as a share of its
+/// box's width: the body is 7.4 units across the 28-unit box, a review's
+/// side beads 11.6. Badges, rings, and thread ends hug these, not the box.
+pub const EYE_BODY: f32 = 7.4 / EYE_BOX_W;
+pub const EYE_REACH: f32 = 11.6 / EYE_BOX_W;
+
+/// A review's side beads, the spider's other eyes: center and radius in the
+/// eye box's units.
+const REVIEW_BEADS: [(f32, f32, f32); 4] = [
+    (5.0, 6.2, 2.6),
+    (23.0, 6.2, 2.6),
+    (3.0, 12.0, 1.7),
+    (25.0, 12.0, 1.7),
+];
+
+/// How far an eye drawn `w` wide reaches from its center toward `dir`, in
+/// pixels, so a thread can end right at its outline. It walks in from past
+/// the widest reach to the first point on the drawing: a done crescent sits
+/// below the middle, a review's beads only stick out to the sides.
+pub fn eye_edge(shape: Shape, w: f32, dir: (f32, f32)) -> f32 {
+    if w < 9.0 {
+        return (w * 0.3).max(1.5);
+    }
+    let len = dir.0.hypot(dir.1);
+    if len < 1e-3 {
+        return 0.0;
+    }
+    let (ux, uy) = (dir.0 / len, dir.1 / len);
+    let units = (0..=52)
+        .map(|k| 13.0 - k as f32 * 0.25)
+        .find(|&t| on_eye(shape, (14.0 + ux * t, 10.5 + uy * t)))
+        .unwrap_or(0.0);
+    units * w / EYE_BOX_W
+}
+
+/// Whether a point, in the eye box's units, is on the drawing `eye` makes.
+fn on_eye(shape: Shape, (x, y): (f32, f32)) -> bool {
+    let disc = |cx: f32, cy: f32, r: f32| (x - cx).hypot(y - cy) <= r;
+    match shape {
+        Shape::Backlog => disc(14.0, 10.5, 6.8),
+        Shape::Todo => disc(14.0, 10.5, 7.0),
+        Shape::Doing => disc(14.0, 10.5, 7.4),
+        Shape::Review => {
+            disc(14.0, 11.0, 6.1) || REVIEW_BEADS.iter().any(|&(cx, cy, r)| disc(cx, cy, r))
+        }
+        Shape::Done => {
+            // Both edges run from (5.6, 8.4) to (22.4, 8.4) with their control
+            // points in the middle, so x moves evenly along them.
+            let t = (x - 5.6) / 16.8;
+            let edge = |mid: f32| (1.0 - t).powi(2) * 8.4 + 2.0 * t * (1.0 - t) * mid + t * t * 8.4;
+            (0.0..=1.0).contains(&t) && (edge(14.2)..=edge(19.0)).contains(&y)
+        }
+    }
+}
 
 pub fn circle(
     window: &mut Window,
@@ -81,12 +135,7 @@ pub fn eye(window: &mut Window, shape: Shape, center: Point<Pixels>, w: f32, the
         Shape::Review => {
             lantern(window, &c, at(14.0, 11.0), 6.1 * s, s, false);
             // The spider's side eyes: more eyes looking at the work.
-            for (x, y, r) in [
-                (5.0, 6.2, 2.6),
-                (23.0, 6.2, 2.6),
-                (3.0, 12.0, 1.7),
-                (25.0, 12.0, 1.7),
-            ] {
+            for (x, y, r) in REVIEW_BEADS {
                 bead(window, &c, at(x, y), r * s, s * 0.6);
             }
         }
@@ -168,7 +217,10 @@ pub fn web(
     alpha: f32,
     theme: &Theme,
 ) {
-    circle(window, center, r, theme.web_fill.opacity(alpha), None);
+    // Opaque, in the color the see-through fill gives over the background,
+    // so a thread passing behind a web is hidden rather than showing through.
+    let fill = theme.bg.blend(theme.web_fill.opacity(alpha));
+    circle(window, center, r, fill, None);
     const SPOKES: usize = 12;
     let angles: Vec<f32> = (0..SPOKES)
         .map(|i| i as f32 / SPOKES as f32 * std::f32::consts::TAU + 0.13)
@@ -219,58 +271,96 @@ pub struct ThreadStyle {
     pub arrow: bool,
 }
 
-/// A link as a silk thread that sags under its own weight. `gap` keeps the
-/// ends off the eyes. Directed threads get an arrowhead at `to`.
-pub fn thread(
-    window: &mut Window,
-    from: Point<Pixels>,
-    to: Point<Pixels>,
-    gap: f32,
-    style: ThreadStyle,
-) -> Option<Point<Pixels>> {
-    let ThreadStyle {
-        color,
-        width,
-        dash,
-        arrow,
-    } = style;
-    let (fx, fy, tx, ty) = (
-        f32::from(from.x),
-        f32::from(from.y),
-        f32::from(to.x),
-        f32::from(to.y),
-    );
-    let d = (tx - fx).hypot(ty - fy);
-    if d < gap * 2.0 + 4.0 {
-        return None;
+/// A thread's shape: one quadratic curve in screen pixels. Painting and
+/// routing both go through this, so a route that clears a label is exactly
+/// the curve that gets drawn.
+#[derive(Clone, Copy, Debug)]
+pub struct Curve {
+    pub start: (f32, f32),
+    pub control: (f32, f32),
+    pub end: (f32, f32),
+}
+
+impl Curve {
+    /// The thread from `from` to `to`, its ends kept `gap` off the eyes. It
+    /// sags under its own weight, and `bend` pulls its middle sideways, which
+    /// is how a thread steers around a label. `None` when the eyes nearly touch.
+    pub fn new(from: (f32, f32), to: (f32, f32), gap: f32, bend: f32) -> Option<Self> {
+        Self::between(from, to, (gap, gap), bend)
     }
-    let (ux, uy) = ((tx - fx) / d, (ty - fy) / d);
-    let (sx, sy) = (fx + ux * gap, fy + uy * gap);
-    let (ex, ey) = (tx - ux * gap, ty - uy * gap);
-    let (cx, cy) = ((sx + ex) / 2.0, (sy + ey) / 2.0 + (d * 0.14).min(60.0));
-    let mut line = PathBuilder::stroke(px(width));
-    if let Some((on, off)) = dash {
+
+    /// Like `new`, with each end kept its own distance off its eye.
+    pub fn between(
+        from: (f32, f32),
+        to: (f32, f32),
+        (gap_from, gap_to): (f32, f32),
+        bend: f32,
+    ) -> Option<Self> {
+        let (fx, fy) = from;
+        let (tx, ty) = to;
+        let d = (tx - fx).hypot(ty - fy);
+        if d < gap_from + gap_to + 4.0 {
+            return None;
+        }
+        let (ux, uy) = ((tx - fx) / d, (ty - fy) / d);
+        let start = (fx + ux * gap_from, fy + uy * gap_from);
+        let end = (tx - ux * gap_to, ty - uy * gap_to);
+        let sag = (d * 0.14).min(60.0);
+        let control = (
+            (start.0 + end.0) / 2.0 - uy * bend,
+            (start.1 + end.1) / 2.0 + sag + ux * bend,
+        );
+        Some(Self {
+            start,
+            control,
+            end,
+        })
+    }
+
+    /// The same curve cut short at `t`, for an arrowhead that has to stop
+    /// before the end.
+    pub fn until(&self, t: f32) -> Self {
+        let lerp = |a: (f32, f32), b: (f32, f32)| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+        Self {
+            start: self.start,
+            control: lerp(self.start, self.control),
+            end: self.at(t),
+        }
+    }
+
+    pub fn at(&self, t: f32) -> (f32, f32) {
+        let (a, b, c) = ((1.0 - t) * (1.0 - t), 2.0 * t * (1.0 - t), t * t);
+        (
+            a * self.start.0 + b * self.control.0 + c * self.end.0,
+            a * self.start.1 + b * self.control.1 + c * self.end.1,
+        )
+    }
+}
+
+/// Paints `curve` as a silk thread. A directed link's arrowhead is painted
+/// separately by `arrowhead`, so it can go over labels the thread passes under.
+pub fn thread(window: &mut Window, curve: Curve, style: ThreadStyle) {
+    let p = |(x, y): (f32, f32)| point(px(x), px(y));
+    let mut line = PathBuilder::stroke(px(style.width));
+    if let Some((on, off)) = style.dash {
         line = line.dash_array(&[px(on), px(off)]);
     }
-    line.move_to(point(px(sx), px(sy)));
-    line.curve_to(point(px(ex), px(ey)), point(px(cx), px(cy)));
-    paint(window, line, color);
-    if arrow {
-        let tl = (ex - cx).hypot(ey - cy).max(0.01);
-        let (dx, dy) = ((ex - cx) / tl, (ey - cy) / tl);
-        let (bx, by) = (ex - dx * 9.0, ey - dy * 9.0);
-        let mut head = PathBuilder::fill();
-        head.move_to(point(px(ex), px(ey)));
-        head.line_to(point(px(bx - dy * 4.5), px(by + dx * 4.5)));
-        head.line_to(point(px(bx + dy * 4.5), px(by - dx * 4.5)));
-        head.close();
-        paint(window, head, color);
-    }
-    // The curve's midpoint, for a label.
-    Some(point(
-        px(0.25 * sx + 0.5 * cx + 0.25 * ex),
-        px(0.25 * sy + 0.5 * cy + 0.25 * ey),
-    ))
+    line.move_to(p(curve.start));
+    line.curve_to(p(curve.end), p(curve.control));
+    paint(window, line, style.color);
+}
+
+pub fn arrowhead(window: &mut Window, curve: Curve, color: Hsla) {
+    let ((ex, ey), (cx, cy)) = (curve.end, curve.control);
+    let tl = (ex - cx).hypot(ey - cy).max(0.01);
+    let (dx, dy) = ((ex - cx) / tl, (ey - cy) / tl);
+    let (bx, by) = (ex - dx * 9.0, ey - dy * 9.0);
+    let mut head = PathBuilder::fill();
+    head.move_to(point(px(ex), px(ey)));
+    head.line_to(point(px(bx - dy * 4.5), px(by + dx * 4.5)));
+    head.line_to(point(px(bx + dy * 4.5), px(by - dx * 4.5)));
+    head.close();
+    paint(window, head, color);
 }
 
 #[derive(Clone, Copy)]
@@ -342,4 +432,24 @@ pub fn shorten(text: &str, max: usize) -> String {
     let mut cut: String = text.chars().take(max - 1).collect();
     cut.push('…');
     cut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_thread_ends_at_the_drawn_outline_not_a_circle_around_it() {
+        // One pixel per unit of the eye box.
+        let edge = |shape, dir| eye_edge(shape, EYE_BOX_W, dir);
+        let (up, down, side) = ((0.0, -1.0), (0.0, 1.0), (1.0, 0.0));
+        // A done crescent hangs below the middle: from above a thread comes
+        // right in, from below it stops at the crescent's lower edge.
+        assert!(edge(Shape::Done, up) < 0.5, "{}", edge(Shape::Done, up));
+        assert!((edge(Shape::Done, down) - 3.2).abs() < 0.3);
+        // A review's side beads count from the side only.
+        assert!(edge(Shape::Review, side) > edge(Shape::Review, up) + 3.0);
+        // A round eye reaches as far every way.
+        assert_eq!(edge(Shape::Doing, up), edge(Shape::Doing, side));
+    }
 }

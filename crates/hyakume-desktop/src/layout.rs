@@ -12,8 +12,10 @@ pub const EYE_W: f32 = 24.0;
 /// Space under a column header before its first web.
 pub const COLUMN_HEAD: f32 = 150.0;
 const COLUMN_MIN_W: f32 = 380.0;
-/// Between one web's edge and the next: its count below, the next name above.
-const CLUSTER_GAP: f32 = 110.0;
+/// Between one web's edge and the next: its count below, the next name
+/// above. Wide enough that the name still fits when a big workspace beside
+/// it zooms the overview out to about 20%.
+const CLUSTER_GAP: f32 = 240.0;
 /// How much bigger than it needs to be a web may get before it grows. A web
 /// that grew would move every eye on it, so it waits until it's crowded.
 const GROWTH_SLACK: f32 = 24.0;
@@ -21,6 +23,8 @@ const GROWTH_SLACK: f32 = 24.0;
 const EYE_SPACING: f32 = 104.0;
 const LINK_LENGTH: f32 = 96.0;
 const GOLDEN_ANGLE: f32 = 2.399_963;
+/// The most a web sits off its column's middle, for the zigzag.
+const ZIGZAG: f32 = 60.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec2 {
@@ -118,13 +122,44 @@ pub struct Layout {
     clusters: HashMap<NodeKey, (Vec2, f32)>,
     /// Eye position relative to its web's center.
     eyes: HashMap<NodeKey, Vec2>,
+    /// How wide each column must be for its names; text keeps its size
+    /// while the canvas zooms, so only the painter can measure this.
+    min_widths: HashMap<NodeKey, f32>,
+    /// How wide each column came out last time, so `widen` knows how far
+    /// to slide its webs to keep them in the middle.
+    widths: HashMap<NodeKey, f32>,
 }
 
 impl Layout {
-    /// Forgets every position, then places everything fresh.
+    /// Forgets every position, then places everything fresh. The widths the
+    /// names need are measurements, not positions, so they stay.
     pub fn relayout(&mut self, scene: &Scene) -> Placement {
-        *self = Self::default();
+        let min_widths = std::mem::take(&mut self.min_widths);
+        *self = Self {
+            min_widths,
+            ..Self::default()
+        };
         self.place(scene)
+    }
+
+    /// Asks for column `column` of `scene` to be at least `width` wide from
+    /// the next `place`. True if that's wider than before. Its webs slide by
+    /// half the growth, so they stay mid-column without being placed afresh.
+    pub fn widen(&mut self, scene: &Scene, column: usize, width: f32) -> bool {
+        let column = &scene.columns[column];
+        let known = self.min_widths.get(&column.key).copied().unwrap_or(0.0);
+        if width <= known + 0.5 {
+            return false;
+        }
+        self.min_widths.insert(column.key.clone(), width);
+        let drawn = self.widths.get(&column.key).copied().unwrap_or(width);
+        let slide = ((width - drawn) / 2.0).max(0.0);
+        for c in column.clusters.clone() {
+            if let Some((at, _)) = self.clusters.get_mut(&scene.clusters[c].key) {
+                at.x += slide;
+            }
+        }
+        true
     }
 
     /// Keeps known positions and finds room for anything new.
@@ -149,11 +184,12 @@ impl Layout {
 
         let mut right = 0.0_f32;
         for column in &scene.columns {
+            let named = self.min_widths.get(&column.key).copied().unwrap_or(0.0);
             let widest = column
                 .clusters
                 .clone()
                 .map(|c| 2.0 * radii[c] + 120.0)
-                .fold(COLUMN_MIN_W, f32::max);
+                .fold(COLUMN_MIN_W.max(named), f32::max);
             // A column that grew pushes the ones after it right, never over them.
             let x = self
                 .columns
@@ -162,6 +198,7 @@ impl Layout {
                 .unwrap_or(right)
                 .max(right);
             self.columns.insert(column.key.clone(), x);
+            self.widths.insert(column.key.clone(), widest);
             placement.columns.push((x, widest));
             right = x + widest;
 
@@ -178,16 +215,19 @@ impl Layout {
                 let r = radii[c];
                 let room = (widest / 2.0 - r - 30.0).max(0.0);
                 let at = match self.clusters.get(&scene.clusters[c].key) {
-                    // Anchored to the left edge, so a column that widens leaves it alone.
+                    // Anchored to the left edge, so a web that grows doesn't drag
+                    // its neighbours; only `widen` slides them, for names.
                     Some(&(at, _)) => {
                         Vec2::new(at.x.clamp(widest / 2.0 - room, widest / 2.0 + room), at.y)
                     }
-                    // Zigzag a little so a long column doesn't read as a list.
+                    // Zigzag a little so a long column doesn't read as a list,
+                    // but only a little: a column widened for its names
+                    // would otherwise push its webs out to the edges.
                     None => {
                         let side = if n % 2 == 0 { -1.0 } else { 1.0 };
                         let y = lowest + CLUSTER_GAP + r;
                         lowest = y + r;
-                        Vec2::new(widest / 2.0 + side * room * 0.6, y)
+                        Vec2::new(widest / 2.0 + side * (room * 0.6).min(ZIGZAG), y)
                     }
                 };
                 wanted.push((c, at));
@@ -331,6 +371,40 @@ mod tests {
             nearest > EYE_W * 1.5,
             "the new eye doesn't sit on an old one ({nearest})"
         );
+    }
+
+    #[test]
+    fn a_column_widened_for_its_names_keeps_its_webs_in_the_middle_and_its_eyes_still() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "API", 4);
+        project(&mut ws, "WEB", 3);
+        let mut layout = Layout::default();
+        layout.place(&Scene::build(&[ws.source()]));
+        // An eye added by a refresh sits where it found room, which a
+        // layout started from scratch wouldn't reproduce.
+        ws.add_task(1, "New task", 1);
+        let scene = Scene::build(&[ws.source()]);
+        let before = layout.place(&scene);
+        let narrow = before.columns[0].1;
+        assert!(layout.widen(&scene, 0, narrow + 600.0));
+        assert!(!layout.widen(&scene, 0, narrow), "never narrows");
+
+        let after = layout.place(&scene);
+        let (x, w) = after.columns[0];
+        assert!(w >= narrow + 600.0);
+        for (c, &(center, _)) in after.clusters.iter().enumerate() {
+            let off_middle = center.x - (x + w / 2.0);
+            assert!(
+                off_middle.abs() <= ZIGZAG + 0.5,
+                "web {c} is {off_middle} off the middle"
+            );
+            assert_eq!(center.y, before.clusters[c].0.y, "web {c} kept its height");
+        }
+        for (e, eye) in scene.eyes.iter().enumerate() {
+            let on_web = |p: &Placement| p.eyes[e] - p.clusters[eye.cluster].0;
+            let drift = (on_web(&after) - on_web(&before)).len();
+            assert!(drift < 0.01, "eye {e} moved {drift} on its web");
+        }
     }
 
     #[test]

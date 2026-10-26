@@ -14,3 +14,10 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Debug builds compile the libraries (GPUI's text shaping and rendering
+# above all) optimized, and our own crates as usual. Frames in `mise run
+# alice` get close to release speed; only a library's internals lose
+# debugger stepping.
+[profile.dev.package."*"]
+opt-level = 2
