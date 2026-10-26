@@ -14,9 +14,10 @@ use reqwest::{Method, RequestBuilder, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 use tokio::time::Instant;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Bytes, client::IntoClientRequest, http::HeaderValue};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::ClientError;
 
@@ -277,20 +278,36 @@ impl Remote {
                 .map_err(|_| ClientError::Credentials("saved token is malformed".into()))?;
             request.headers_mut().insert("authorization", value);
         }
-        let server = self.base.clone();
-        let (socket, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| match e {
-                tungstenite::Error::Http(response) if response.status() == 401 => {
-                    ClientError::Unauthorized(format!("session for {server} is not valid"))
-                }
-                other => ClientError::Unreachable {
-                    server: server.clone(),
-                    reason: other.to_string(),
-                },
-            })?;
+        let socket = handshake(request, &self.base, HANDSHAKE_LIMIT).await?;
         Ok(events(socket, self.base.clone(), PING_EVERY, SILENT_LIMIT))
     }
+}
+
+/// How long opening the event stream may take, like an HTTP request.
+const HANDSHAKE_LIMIT: Duration = Duration::from_secs(30);
+
+/// Opens the socket. Neither the HTTP client's timeout nor the pings cover
+/// this part, so a server that accepts the connection and then never
+/// answers would leave the source stuck instead of offline and retrying.
+async fn handshake(
+    request: tungstenite::handshake::client::Request,
+    server: &str,
+    limit: Duration,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ClientError> {
+    let unreachable = |reason: String| ClientError::Unreachable {
+        server: server.to_owned(),
+        reason,
+    };
+    let connected = tokio::time::timeout(limit, tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| unreachable(format!("no answer within {} s", limit.as_secs())))?;
+    let (socket, _) = connected.map_err(|e| match e {
+        tungstenite::Error::Http(response) if response.status() == 401 => {
+            ClientError::Unauthorized(format!("session for {server} is not valid"))
+        }
+        other => unreachable(other.to_string()),
+    })?;
+    Ok(socket)
 }
 
 /// How often an open event stream is pinged.
@@ -414,6 +431,29 @@ mod tests {
         assert!(
             matches!(ended, Some(Err(ClientError::Unreachable { .. }))),
             "{ended:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_finishes_the_handshake_counts_as_unreachable() {
+        // Accepts the connection, then says nothing at all.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let request = format!("ws://{addr}").into_client_request().unwrap();
+        let opened = tokio::time::timeout(
+            Duration::from_secs(3),
+            handshake(request, "test", Duration::from_millis(200)),
+        )
+        .await
+        .expect("the handshake gives up well within 3 s");
+        assert!(
+            matches!(opened, Err(ClientError::Unreachable { .. })),
+            "{:?}",
+            opened.map(|_| ())
         );
     }
 
