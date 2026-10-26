@@ -83,7 +83,7 @@ as bob -w b/studio task create --project DOC "Install guide" --stage "In progres
 as bob -w b/studio task create --project DOC "API reference" --stage "To do"
 as bob -w b/studio task create --project DOC "Changelog" --stage Done
 # A workspace the size of a real team's tracker, also on server b.
-dev/scale-data.sh
+cargo run -q --locked -p hyakume-cli --example scale_data
 echo "Demo data ready. Open the app with: mise run alice"
 '''
 

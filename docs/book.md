@@ -189,8 +189,10 @@ mise run reset         delete dev/data (stop the servers first)
 Profiles use the `dev-file` credential store, so test sign-ins never touch the
 OS keyring and `reset` removes every trace. **Scale** (projects APP, SRV, and
 OPS, 50 tasks each, 86 links) is declared in `dev/server-b.toml` and filled by
-`dev/scale-data.sh`. Its links follow fixed patterns rather than random picks,
-so every run builds the same workspace. It exists to check that a real team's
+the `scale_data` example of the CLI crate, which runs the CLI as Alice. It's
+Rust rather than a shell script so the repository stays one language and CI
+builds it. Its links follow fixed patterns rather than random picks, so every
+run builds the same workspace. It exists to check that a real team's
 tracker stays readable and fast.
 
 ## The desktop app
