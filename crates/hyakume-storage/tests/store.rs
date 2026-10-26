@@ -1,4 +1,6 @@
-use hyakume_core::api::{CreateRelation, CreateRelationType, CreateRole, CreateTask, UpdateTask};
+use hyakume_core::api::{
+    CreateRelation, CreateRelationType, CreateRole, CreateTask, LayoutNode, NodeKind, UpdateTask,
+};
 use hyakume_core::model::{BuiltinRelation, ProjectKey, Workspace};
 use hyakume_core::permission::{MembershipKind, Permission};
 use hyakume_storage::{ChangeWatcher, Store, StoreError};
@@ -126,6 +128,51 @@ async fn a_task_cannot_move_to_another_projects_stage() {
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::Invalid(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_deleted_task_takes_its_saved_position_with_it() {
+    let (_dir, store) = open().await;
+    let ws = workspace(&store).await;
+    let me = store.identity_by_name("owner").await.unwrap();
+    let web = store
+        .create_project(ws.id, &key("WEB"), "Website")
+        .await
+        .unwrap();
+    let gone = store
+        .create_task(web.id, titled("Gone"), None)
+        .await
+        .unwrap();
+    let kept = store
+        .create_task(web.id, titled("Kept"), None)
+        .await
+        .unwrap();
+    let node = |kind, id| LayoutNode {
+        kind,
+        id,
+        x: 1.0,
+        y: 2.0,
+        pinned: true,
+    };
+    let nodes = [
+        node(NodeKind::Project, web.id.0),
+        node(NodeKind::Task, gone.id.0),
+        node(NodeKind::Task, kept.id.0),
+    ];
+    store.put_layout(me.id, ws.id, &nodes).await.unwrap();
+
+    store.delete_task(gone.id).await.unwrap();
+
+    let left: Vec<_> = store
+        .layout(me.id, ws.id)
+        .await
+        .unwrap()
+        .nodes
+        .into_iter()
+        .map(|n| n.id)
+        .collect();
+    assert!(!left.contains(&gone.id.0), "the deleted task's spot stayed");
+    assert!(left.contains(&kept.id.0) && left.contains(&web.id.0));
 }
 
 #[tokio::test]

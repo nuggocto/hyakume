@@ -115,6 +115,18 @@ snapshot. It used to: five separate queries raced deletes 145 times in 269
 stress rounds. A relation leading into a project the reader can't see is
 dropped, so a guest never learns the task exists.
 
+**Positions go when their task goes.** A saved canvas position names a
+task or a project, and one column can't be a foreign key into two tables,
+so at first nothing removed it. Deleted tasks left their positions behind,
+and every layout read sent them back. Migration 0002 clears the leftovers
+and adds two triggers:
+
+```text
+DELETE task     → layouts_forget_task    → its position goes
+DELETE project  → layouts_forget_project → its position goes
+                  (its tasks cascade, and each fires the trigger above)
+```
+
 ## The server
 
 ```text
