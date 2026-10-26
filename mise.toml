@@ -50,7 +50,7 @@ echo "Ready. Try: mise run alice -- task list"
 '''
 
 [tasks.demo-data]
-description = "Fill the demo with the mockup's tasks and links (after `mise run demo-setup`)"
+description = "Fill the demo with the mockup's tasks and links, plus a 150-task workspace (after `mise run demo-setup`)"
 run = '''
 set -e
 cargo build -q --locked -p hyakume-cli
@@ -82,6 +82,8 @@ as bob task comment WEB-1 "Layout is done, wiring the form next."
 as bob -w b/studio task create --project DOC "Install guide" --stage "In progress"
 as bob -w b/studio task create --project DOC "API reference" --stage "To do"
 as bob -w b/studio task create --project DOC "Changelog" --stage Done
+# A workspace the size of a real team's tracker, also on server b.
+dev/scale-data.sh
 echo "Demo data ready. Open the app with: mise run alice"
 '''
 

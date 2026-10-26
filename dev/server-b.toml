@@ -17,3 +17,16 @@ name = "Studio"
 owner = "bob"
 projects = [{ key = "DOC", name = "Documentation" }]
 members = [{ identity = "alice", roles = ["Member"] }]
+
+# Filled by `mise run demo-data` with 150 tasks and about 90 links, the size
+# of a real team's tracker, to check the canvas stays readable and quick.
+[[dev.workspaces]]
+slug = "scale"
+name = "Scale"
+owner = "alice"
+projects = [
+  { key = "APP", name = "Mobile app" },
+  { key = "SRV", name = "Backend services" },
+  { key = "OPS", name = "Operations" },
+]
+members = [{ identity = "bob", roles = ["Member"] }]
