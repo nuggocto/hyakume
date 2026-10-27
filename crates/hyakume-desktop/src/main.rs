@@ -4,6 +4,7 @@
 mod app;
 mod canvas;
 mod clock;
+mod edit;
 mod glyphs;
 mod inspector;
 mod keys;

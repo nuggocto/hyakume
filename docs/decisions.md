@@ -54,6 +54,15 @@ overview, live on that server under the person's identity, so they follow the
 person across devices. Local project layouts stay on one device. That misses
 the cross-device requirement and must be closed before the usable release.
 
+Update 2026-10-26: the desktop app now saves and follows these layouts
+([D20](#d20-hand-placed-nodes-are-pinned-2026-10-26)). Local layouts still
+stay on one device, so the gap above remains open.
+
+Closed 2026-10-27: local work itself lives on one device, so its layout
+can only go where the work goes. `hyakume local export` and `import` carry
+both together ([D21](#d21-local-work-moves-by-file-2026-10-27)). Nothing
+is published anywhere: the person moves the file.
+
 ## D7. Names match the way people type them (2026-10-25)
 
 Stages, relation types, and roles are looked up with `name_key`: case, `-`,
@@ -254,3 +263,129 @@ Rejected: filtering by eye shape (a custom "QA" stage would hide with
 Review, under a name the person never typed), per-project filters (more
 state for no gain while stages are mostly shared), and saving filters
 across restarts (a forgotten filter makes work look missing).
+
+## D18. The window edits through the CLI's calls (2026-10-26)
+
+The desktop app changes work through the same `OpenWorkspace` and `Remote`
+calls as the CLI, sent to the I/O thread as `Command::Write` and answered
+with `Update::Wrote`, matched by request number. A saved task goes on screen
+from the answer straight away; the change event that follows refetches the
+rest, so nothing is merged by hand on the client.
+
+- Stage, assignee, and priority are picked in the palette. Picked while the
+  form is on screen, they go into the draft; otherwise they save at once
+  against the version on screen, and a conflict opens the same review as the
+  form. A draft left open on another task is never the target.
+- A refused save keeps the draft. The review shows the latest version and the
+  draft, marks differing fields, and offers "Keep editing my draft", which
+  bases the draft on the latest. Escape keeps the draft too, so Discard has no
+  key.
+- The window checks offline state and permissions before sending, to explain
+  a refusal instead of failing. The server checks again regardless.
+- Links are made in two picks: how it reads from this task ("blocks" or
+  "blocked by"), then the other task. Local work has no roles to make or give.
+- Forms stay editable while saving. The answer is matched against what was
+  sent: a form typed into since stays open on top of the saved version, and
+  a refused save takes the live form into the review. Dialogs and comment
+  boxes only react to their own request.
+- Labels are edited one per line, since a label may hold a comma but never
+  a newline.
+- Del asks before deleting, and Escape answers "keep it". The server can't
+  bring a task back, so one key must never be enough.
+- Roles are given and taken one at a time from the palette. The server
+  replaces a person's whole set, built from what was last loaded; two
+  admins at the same instant could undo each other, which the change event
+  shows straight away. A versioned set would fix it, at a cost the
+  5–30-person target doesn't justify yet.
+
+Rejected: drop-downs for stage and assignee (a second list widget to build,
+and the palette already searches), a field-by-field merge on conflict
+(PROJECT.md asks for review, not merging), and optimistic local edits before
+the server answers (an edit the server refuses would have to be undone on
+screen).
+
+## D19. Offline copies in cache.db (2026-10-26)
+
+Each server's workspaces are stored as JSON in `cache.db`, one row per
+workspace, keyed by server URL plus signed-in identity, and replaced whole
+after every load. The key is the one the connection signed in with, read
+together with its token rather than again at save time. A restart while the
+server is unreachable shows that copy, greyed and read-only. A row that no
+longer parses after an upgrade is skipped and replaced by the next load.
+
+It's a separate file from local.db, so personal work and team copies never
+share a table, and deleting it only loses the copies.
+
+Update 2026-10-27: comments are kept for the tasks a person opened, one
+row per task with the server's whole answer, under the same key. Offline,
+that answer stands in with its age. Only an unreachable server falls back
+to it, never a refusal. Replacing the workspace copy drops the comments
+of tasks it no longer holds. A refusal also takes the workspace copy off
+the screen: signed out, or failing for any reason other than not reaching
+the server, the column shows that and nothing else. Rejected: fetching every comment with each
+load, which would make a big workspace's refresh much heavier for a copy
+that's rarely read.
+
+Rejected: mirroring the server schema in a cache database (every schema
+change would need two migrations for a copy that's only ever read whole),
+keeping the copy in memory only (PROJECT.md wants offline work readable after
+a restart), and allowing edits offline to sync later (that's a merge design
+the milestone leaves out: offline shared work is read-only).
+
+## D20. Hand-placed nodes are pinned (2026-10-26)
+
+Dragging or nudging an eye or a web pins it where it lands. Re-layout places
+everything else again and leaves pinned nodes alone. P pins or unpins
+without moving. Positions save per node: a task's relative to its web's
+center, a web's relative to its column's left edge, so a web that moves
+carries its eyes along.
+
+A device applies a saved position only when it differs from the last saved
+value it applied for that node. A refresh fetched before this device's own
+save lands carries the old value, and treating that as news would drag the
+node back.
+
+A pinned web also never moves for placement: unpinned webs are pushed past
+it, its column grows to hold it, and widening a column for names slides
+only unpinned webs.
+
+On the overview, a plain drag pans wherever it starts and Ctrl+drag moves
+the web or eye under the pointer. Webs cover most of the overview, so when a
+drag on a web moved it, panning by hand meant hunting for empty canvas.
+Inside a project a plain drag on an eye moves it, since eyes are small.
+Rejected: moving a web by dragging its name (a small target nobody finds).
+
+Update 2026-10-27, after review:
+- Saves to a source run one at a time, and what piles up meanwhile goes as
+  one batch with the latest spot per node. Two saves in flight could land
+  swapped, and the server keeps the last one to land.
+- The layout remembers what it last sent per node and skips any other
+  saved value until that one comes back. Without that, the echo of an
+  earlier nudge undid a later one, and a drag could save that older spot.
+- Accepted gap: if the same person moves the same node on another device
+  before this device's echo comes back, this device keeps its own spot
+  until the next move or restart. Fixing it needs a version per node.
+- Re-layout saves the new spots of nodes saved unpinned, and a web keeps
+  room for its pinned eyes, so neither a restart nor a smaller web moves
+  something it shouldn't.
+
+
+## D21. Local work moves by file (2026-10-27)
+
+`hyakume local export FILE` writes all of local work and the person's
+positions as JSON with a format number; `hyakume local import FILE` puts
+it in another computer's local.db. Ids travel, so links and positions
+still match. Whoever the file names becomes this computer's "me", and
+built-in link types map to this database's own.
+
+An import replaces and never merges. Into empty local work it just goes
+in; otherwise it needs `--replace`, which confirms first. It runs as one
+transaction and checks every field like a normal save, so a bad file
+changes nothing. The file is written 0600, since it's someone's own work,
+also when it replaces an existing file.
+
+Rejected: merging (two copies edited apart would need the conflict review
+for every task, offline, with no server to say which is newer); a sync
+folder pointed at local.db (SQLite in a folder synced by another tool can
+corrupt if both computers run at once); and sending local work through a
+team server (PROJECT.md forbids publishing personal work automatically).

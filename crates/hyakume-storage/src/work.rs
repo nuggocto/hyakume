@@ -20,6 +20,8 @@ use sqlx::{Sqlite, SqliteConnection, Transaction};
 use crate::convert::{date_from_text, date_to_text, from_millis, id, now_ms, opt_id};
 use crate::{Store, StoreError, unique_violation};
 
+mod transfer;
+
 #[derive(sqlx::FromRow)]
 struct WorkspaceRow {
     id: String,
@@ -659,83 +661,9 @@ impl Store {
         workspace: WorkspaceId,
         input: CreateRelationType,
     ) -> Result<RelationType, StoreError> {
-        let name = input.name.trim().to_owned();
-        if name.is_empty() {
-            return Err(StoreError::invalid("relation type name must not be empty"));
-        }
-        check_text("relation type name", &name, false)?;
-        let reverse_name = if input.directed {
-            // Without a reverse label, the target's side would read "API-1
-            // depends on WEB-1" when it's really WEB-1 that depends on API-1.
-            let reverse = input
-                .reverse_name
-                .map(|r| r.trim().to_owned())
-                .filter(|r| !r.is_empty());
-            if let Some(reverse) = &reverse {
-                check_text("reverse name", reverse, false)?;
-            } else {
-                return Err(StoreError::invalid(
-                    "a directed relation type needs a reverse name, such as \"needed by\"",
-                ));
-            }
-            reverse
-        } else if input.reverse_name.is_some() {
-            return Err(StoreError::invalid(
-                "only directed relation types have a reverse name",
-            ));
-        } else {
-            None
-        };
-        let relation_type = RelationType {
-            id: RelationTypeId::new(),
-            workspace_id: workspace,
-            name,
-            reverse_name,
-            directed: input.directed,
-            builtin: None,
-        };
-
-        // Every name and reverse name must be unambiguous as people type it,
-        // or "Blocks" could silently resolve to the built-in "blocks".
+        let relation_type = relation_type(RelationTypeId::new(), workspace, input)?;
         let mut tx = self.write().await?;
-        let existing: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT name, reverse_name FROM relation_types WHERE workspace_id = ?")
-                .bind(workspace.to_string())
-                .fetch_all(&mut *tx)
-                .await?;
-        let taken: HashSet<String> = existing
-            .iter()
-            .flat_map(|(name, reverse)| std::iter::once(name).chain(reverse))
-            .map(|n| name_key(n))
-            .collect();
-        let new_names = std::iter::once(&relation_type.name).chain(&relation_type.reverse_name);
-        for candidate in new_names {
-            if taken.contains(&name_key(candidate)) {
-                return Err(StoreError::Duplicate(format!(
-                    "a relation type already uses the name {candidate:?}"
-                )));
-            }
-        }
-        if relation_type
-            .reverse_name
-            .as_ref()
-            .is_some_and(|r| name_key(r) == name_key(&relation_type.name))
-        {
-            return Err(StoreError::invalid(
-                "a relation type's reverse name must differ from its name",
-            ));
-        }
-        sqlx::query(
-            "INSERT INTO relation_types (id, workspace_id, name, reverse_name, directed) \
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(relation_type.id.to_string())
-        .bind(workspace.to_string())
-        .bind(&relation_type.name)
-        .bind(&relation_type.reverse_name)
-        .bind(relation_type.directed)
-        .execute(&mut *tx)
-        .await?;
+        insert_relation_type(&mut tx, &relation_type).await?;
         tx.commit().await?;
         Ok(relation_type)
     }
@@ -1025,6 +953,97 @@ async fn check_fields(
             return Err(ValidationError::Other("assignee is not in this workspace".into()).into());
         }
     }
+    Ok(())
+}
+
+/// A custom relation type as `input` asks for it, checked on its own.
+fn relation_type(
+    id: RelationTypeId,
+    workspace: WorkspaceId,
+    input: CreateRelationType,
+) -> Result<RelationType, StoreError> {
+    let name = input.name.trim().to_owned();
+    if name.is_empty() {
+        return Err(StoreError::invalid("relation type name must not be empty"));
+    }
+    check_text("relation type name", &name, false)?;
+    let reverse_name = if input.directed {
+        // Without a reverse label, the target's side would read "API-1
+        // depends on WEB-1" when it's really WEB-1 that depends on API-1.
+        let reverse = input
+            .reverse_name
+            .map(|r| r.trim().to_owned())
+            .filter(|r| !r.is_empty());
+        if let Some(reverse) = &reverse {
+            check_text("reverse name", reverse, false)?;
+        } else {
+            return Err(StoreError::invalid(
+                "a directed relation type needs a reverse name, such as \"needed by\"",
+            ));
+        }
+        reverse
+    } else if input.reverse_name.is_some() {
+        return Err(StoreError::invalid(
+            "only directed relation types have a reverse name",
+        ));
+    } else {
+        None
+    };
+    Ok(RelationType {
+        id,
+        workspace_id: workspace,
+        name,
+        reverse_name,
+        directed: input.directed,
+        builtin: None,
+    })
+}
+
+/// Adds a custom type once its names are clear of the workspace's others.
+async fn insert_relation_type(
+    tx: &mut Transaction<'static, Sqlite>,
+    relation_type: &RelationType,
+) -> Result<(), StoreError> {
+    // Every name and reverse name must be unambiguous as people type it,
+    // or "Blocks" could silently resolve to the built-in "blocks".
+    let existing: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, reverse_name FROM relation_types WHERE workspace_id = ?")
+            .bind(relation_type.workspace_id.to_string())
+            .fetch_all(&mut **tx)
+            .await?;
+    let taken: HashSet<String> = existing
+        .iter()
+        .flat_map(|(name, reverse)| std::iter::once(name).chain(reverse))
+        .map(|n| name_key(n))
+        .collect();
+    let new_names = std::iter::once(&relation_type.name).chain(&relation_type.reverse_name);
+    for candidate in new_names {
+        if taken.contains(&name_key(candidate)) {
+            return Err(StoreError::Duplicate(format!(
+                "a relation type already uses the name {candidate:?}"
+            )));
+        }
+    }
+    if relation_type
+        .reverse_name
+        .as_ref()
+        .is_some_and(|r| name_key(r) == name_key(&relation_type.name))
+    {
+        return Err(StoreError::invalid(
+            "a relation type's reverse name must differ from its name",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO relation_types (id, workspace_id, name, reverse_name, directed) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(relation_type.id.to_string())
+    .bind(relation_type.workspace_id.to_string())
+    .bind(&relation_type.name)
+    .bind(&relation_type.reverse_name)
+    .bind(relation_type.directed)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

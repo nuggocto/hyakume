@@ -53,6 +53,11 @@ impl DataDir {
         self.0.join("local.db")
     }
 
+    /// Copies of shared workspaces for showing them offline. Never local work.
+    pub fn cache_db(&self) -> PathBuf {
+        self.0.join("cache.db")
+    }
+
     pub fn credentials_dir(&self) -> PathBuf {
         self.0.join("credentials")
     }

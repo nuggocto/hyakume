@@ -1,6 +1,8 @@
 //! The window's root view: owns what's loaded, the camera, and what is
 //! focused or selected, and turns pointer and key input into changes.
 
+mod writes;
+
 use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -8,16 +10,19 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, FontWeight,
-    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle,
-    ScrollWheelEvent, SharedString, Subscription, Task, UniformListScrollHandle, Window, canvas,
-    div, point, prelude::*, px,
+    Action, AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, Entity, FocusHandle,
+    FontWeight, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, Task, UniformListScrollHandle,
+    Window, canvas, div, point, prelude::*, px,
 };
+use hyakume_core::api::NodeKind;
+use hyakume_core::ids::{IdentityId, RelationTypeId};
 use hyakume_core::model::is_unsafe_char;
 use tokio::sync::mpsc;
 
 use crate::canvas::{self, Camera, Frame, Hit, Side, Spot};
 use crate::clock::LocalTime;
+use crate::edit::{Conflict, Dialog, Editor, Target};
 use crate::glyphs;
 use crate::inspector::{self, Detail};
 use crate::keys::{self, *};
@@ -29,6 +34,7 @@ use crate::scene::{Dir, NodeKey, Scene, Shape, ThreadKind};
 use crate::sources::{self, SourceKey, SourceState, Status};
 use crate::text_input::{Changed, TextInput};
 use crate::theme::Theme;
+use writes::Pending;
 
 const HEADER_H: f32 = 64.0;
 /// Below this canvas width the legend no longer fits beside the zoom
@@ -75,6 +81,18 @@ struct Drag {
     start: Point<Pixels>,
     last: Point<Pixels>,
     moved: bool,
+    /// What the press landed on, if it moves that rather than the view.
+    grab: Option<Grab>,
+    /// It started on a web or eye but pans, because Ctrl wasn't held.
+    could_grab: bool,
+}
+
+/// A drag that moves something: an eye, or a web on the overview held at
+/// `offset` from its center, so it doesn't jump to the pointer.
+#[derive(Clone)]
+enum Grab {
+    Eye(NodeKey),
+    Web(NodeKey, Vec2),
 }
 
 pub struct Hyakume {
@@ -117,6 +135,20 @@ pub struct Hyakume {
     /// what's drawn changes; every position stays where it was.
     hidden_stages: BTreeSet<String>,
     hidden: Option<Rc<Vec<bool>>>,
+    /// The task form, for an edit or a new task.
+    editor: Option<Editor>,
+    /// A save someone else beat, shown for review.
+    conflict: Option<Conflict>,
+    dialog: Option<Dialog>,
+    /// The comment box and the task it's for.
+    composer: Option<(NodeKey, Entity<TextInput>)>,
+    write_request: u64,
+    pending: HashMap<u64, Pending>,
+    /// The link type picked, waiting for the task at the other end.
+    link_type: Option<(RelationTypeId, bool, String)>,
+    /// The workspace column whose roles the palette is changing, and the
+    /// person once picked.
+    roles_for: Option<(NodeKey, Option<IdentityId>)>,
     _picker_input: Option<Subscription>,
     /// A short message and when it goes away.
     notice: Option<(SharedString, Instant)>,
@@ -126,6 +158,7 @@ pub struct Hyakume {
     /// for keyboard use, the way browsers treat `:focus-visible`.
     keyboard: bool,
     drag: Option<Drag>,
+    told_ctrl_drag: bool,
     /// Set while painting, read by input handlers to turn window coordinates
     /// into canvas coordinates.
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -158,9 +191,11 @@ impl Hyakume {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let receive = cx.spawn(async move |this, cx| {
+        // In the window, since a saved form hands focus back to the canvas.
+        let receive = cx.spawn_in(window, async move |this, cx| {
             while let Some(update) = updates.recv().await {
-                if this.update(cx, |this, cx| this.apply(update, cx)).is_err() {
+                let applied = this.update_in(cx, |this, window, cx| this.apply(update, window, cx));
+                if applied.is_err() {
                     return;
                 }
             }
@@ -237,11 +272,20 @@ impl Hyakume {
             matches: None,
             hidden_stages: BTreeSet::new(),
             hidden: None,
+            editor: None,
+            conflict: None,
+            dialog: None,
+            composer: None,
+            write_request: 0,
+            pending: HashMap::new(),
+            link_type: None,
+            roles_for: None,
             _picker_input: None,
             notice: None,
             keys_file,
             keyboard: false,
             drag: None,
+            told_ctrl_drag: false,
             canvas_bounds: Rc::default(),
             focus_handle,
             user_moved: false,
@@ -259,8 +303,21 @@ impl Hyakume {
         this
     }
 
-    fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
+    fn apply(&mut self, update: Update, window: &mut Window, cx: &mut Context<Self>) {
         match update {
+            Update::Wrote {
+                source,
+                request,
+                result,
+            } => self.wrote(source, request, result, window, cx),
+            Update::LayoutUnsaved {
+                source,
+                nodes,
+                reason,
+            } => {
+                self.layout.unsent(&source, &nodes);
+                self.note(format!("Positions didn't save to {source}: {reason}"));
+            }
             Update::Source(state) => {
                 let key = state.key.clone();
                 match self.sources.iter_mut().find(|s| s.key == key) {
@@ -306,6 +363,7 @@ impl Hyakume {
         self.fitted_for = None;
         self.names_measured = false;
         let scene = Scene::build(&self.sources);
+        self.layout.apply_saved(&scene, &self.sources);
         self.placement = Rc::new(self.layout.place(&scene));
         self.scene = Rc::new(scene);
         self.apply_stage_filter();
@@ -366,7 +424,17 @@ impl Hyakume {
     }
 
     fn relayout(&mut self) {
-        self.placement = Rc::new(self.layout.relayout(&self.scene));
+        let (placement, moved) = self.layout.relayout(&self.scene);
+        self.placement = Rc::new(placement);
+        for (key, node) in moved {
+            let cluster = match node.kind {
+                NodeKind::Task => self.scene.eye(&key).map(|e| self.scene.eyes[e].cluster),
+                NodeKind::Project => self.scene.cluster(&key),
+            };
+            if let Some(cluster) = cluster {
+                self.save_node(cluster, node);
+            }
+        }
         self.names_measured = false;
         if let Some(c) = self.focus.as_ref().and_then(|k| self.scene.cluster(k)) {
             self.stubs = Rc::new(canvas::stub_positions(&self.scene, &self.placement, c));
@@ -644,12 +712,18 @@ impl Hyakume {
             return;
         };
         self.detail_request += 1;
+        let cluster = &self.scene.clusters[self.scene.eyes[eye].cluster];
+        let offline = matches!(
+            self.scene.columns[cluster.column].status,
+            Status::Offline { .. } | Status::Loading
+        );
         let task = &self.scene.eyes[eye].task;
         self.runtime.send(Command::LoadDetail {
             source: key.source.clone(),
             task: task.id,
             reference: task.reference.clone(),
             request: self.detail_request,
+            offline,
         });
     }
 
@@ -791,10 +865,26 @@ impl Hyakume {
         _: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        let frame = self.frame();
+        let at = self.local(event.position);
+        // Webs fill most of the overview, so a plain drag there pans and
+        // Ctrl picks up what's under the pointer. Inside a project eyes are
+        // small enough that dragging one never gets in the way of panning.
+        let hold = self.focus.is_some() || event.modifiers.control;
+        let grab = match canvas::hit(&frame, at) {
+            Hit::Eye(eye) => Some(Grab::Eye(self.scene.eyes[eye].key.clone())),
+            Hit::Cluster(c) if self.focus.is_none() => {
+                let offset = self.placement.clusters[c].0 - self.camera.to_world(at);
+                Some(Grab::Web(self.scene.clusters[c].key.clone(), offset))
+            }
+            _ => None,
+        };
         self.drag = Some(Drag {
             start: event.position,
             last: event.position,
             moved: false,
+            could_grab: grab.is_some() && !hold,
+            grab: grab.filter(|_| hold),
         });
     }
 
@@ -815,6 +905,7 @@ impl Hyakume {
             }
             return;
         }
+        let local = self.local(event.position);
         let Some(drag) = &mut self.drag else { return };
         let delta = event.position - drag.last;
         drag.last = event.position;
@@ -822,17 +913,62 @@ impl Hyakume {
         if f32::from(travelled.x).hypot(f32::from(travelled.y)) > CLICK_SLOP {
             drag.moved = true;
         }
-        if drag.moved {
-            self.user_moved = true;
-            self.camera
-                .pan(Vec2::new(f32::from(delta.x), f32::from(delta.y)));
-            cx.notify();
+        if !drag.moved {
+            return;
         }
+        self.user_moved = true;
+        let world = self.camera.to_world(local);
+        match drag.grab.clone() {
+            Some(Grab::Eye(key)) => {
+                if let Some(eye) = self.scene.eye(&key) {
+                    self.layout
+                        .move_eye(&self.scene, &self.placement, eye, world);
+                    self.replace();
+                }
+            }
+            Some(Grab::Web(key, offset)) => {
+                if let Some(c) = self.scene.cluster(&key) {
+                    self.layout
+                        .move_cluster(&self.scene, &self.placement, c, world + offset);
+                    self.replace();
+                }
+            }
+            None => self
+                .camera
+                .pan(Vec2::new(f32::from(delta.x), f32::from(delta.y))),
+        }
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.drag.take() else { return };
         if drag.moved {
+            // A moved eye or web stays pinned where it was let go, and saves.
+            let moved = match &drag.grab {
+                Some(Grab::Eye(key)) => self.scene.eye(key).map(|eye| {
+                    let at = self.placement.eyes[eye];
+                    let node = self.layout.move_eye(&self.scene, &self.placement, eye, at);
+                    (self.scene.eyes[eye].cluster, node)
+                }),
+                Some(Grab::Web(key, _)) => self.scene.cluster(key).map(|c| {
+                    let at = self.placement.clusters[c].0;
+                    (
+                        c,
+                        self.layout
+                            .move_cluster(&self.scene, &self.placement, c, at),
+                    )
+                }),
+                None => None,
+            };
+            if let Some((cluster, node)) = moved {
+                self.after_move(cluster, node);
+                cx.notify();
+            } else if drag.could_grab && !self.told_ctrl_drag {
+                // Once a session, for someone who tried to drag a web.
+                self.told_ctrl_drag = true;
+                self.note("Hold Ctrl while dragging to move a web");
+                cx.notify();
+            }
             return;
         }
         match canvas::hit(&self.frame(), self.local(event.position)) {
@@ -958,11 +1094,15 @@ impl Hyakume {
         }
     }
 
-    /// Escape steps back one level: the inspector, then the ring, then the
+    /// Escape steps back one level: the form, the details with their task
+    /// (like clicking that task again), a ring left by the arrows, the
     /// focused project (whose web keeps the arrow cursor), then that cursor.
     fn back_step(&mut self) {
-        if self.inspector_open() {
+        if self.editor.is_some() {
+            self.editor = None;
+        } else if self.inspector_open() {
             self.inspecting = false;
+            self.selected = None;
         } else if self.selected.is_some() {
             self.selected = None;
         } else if let Some(project) = self.focus.clone() {
@@ -1016,6 +1156,8 @@ impl Hyakume {
                 .and_then(|k| self.scene.eye(k))
                 .map(|eye| picker::link_items(&self.scene, eye, dir, |e| !self.is_hidden(e)))
                 .unwrap_or_default(),
+            Mode::Members | Mode::MemberRoles => self.role_items(mode),
+            mode => self.change_items(mode),
         }
     }
 
@@ -1036,6 +1178,18 @@ impl Hyakume {
         if self.selected.is_some() {
             command("Follow a link out of this task", Box::new(FollowOut));
             command("Follow a link into this task", Box::new(FollowIn));
+            command("Edit this task", Box::new(EditTask));
+            command("Move this task to a stage", Box::new(MoveToStage));
+            command("Assign this task", Box::new(AssignTask));
+            command("Set this task's priority", Box::new(SetPriority));
+            command("Link this task to another", Box::new(LinkTask));
+            command("Remove a link from this task", Box::new(UnlinkTask));
+            command("Comment on this task", Box::new(CommentOnTask));
+            command("Pin or unpin this task", Box::new(TogglePin));
+            command("Delete this task", Box::new(DeleteTask));
+        }
+        if self.focus.is_some() || self.selected.is_some() || self.web_cursor.is_some() {
+            command("New task here", Box::new(NewTask));
         }
         if self.focus.is_some() {
             command("Back to all workspaces", Box::new(ShowOverview));
@@ -1062,8 +1216,45 @@ impl Hyakume {
                 format!("{verb} tasks in {name}"),
                 "Stage filter".into(),
                 "stage filter",
-                Pick::Stage(key),
+                Pick::Filter(key),
             ));
+        }
+        for column in self.scene.columns.iter().filter(|c| c.workspace.is_some()) {
+            let place = format!("{} / {}", column.chip, column.title);
+            if column.allows(
+                hyakume_core::permission::Permission::ConfigureProjects,
+                None,
+            ) {
+                items.push(Item::new(
+                    format!("New relationship type in {place}"),
+                    "Workspace setup".into(),
+                    "link relation type custom",
+                    Pick::NewDialog {
+                        role: false,
+                        column: column.key.clone(),
+                    },
+                ));
+            }
+            // Local work has one person, so roles would grant nothing there.
+            if column.source != SourceKey::Local
+                && column.allows(hyakume_core::permission::Permission::ManageRoles, None)
+            {
+                items.push(Item::new(
+                    format!("New role in {place}"),
+                    "Workspace setup".into(),
+                    "role permissions custom",
+                    Pick::NewDialog {
+                        role: true,
+                        column: column.key.clone(),
+                    },
+                ));
+                items.push(Item::new(
+                    format!("Change someone's roles in {place}"),
+                    "Workspace setup".into(),
+                    "role member give take assign people",
+                    Pick::Roles(column.key.clone()),
+                ));
+            }
         }
         if let Some(file) = &self.keys_file {
             items.push(Item::new(
@@ -1196,6 +1387,8 @@ impl Hyakume {
     }
 
     fn dismiss_picker(&mut self, window: &mut Window) {
+        self.link_type = None;
+        self.roles_for = None;
         self.picker = None;
         self._picker_input = None;
         self.end_find();
@@ -1222,6 +1415,9 @@ impl Hyakume {
         self.before_find = None;
         // Always the canvas: Enter's key-up would click a focused button.
         window.focus(&self.focus_handle);
+        if self.apply_change(mode, &item.pick, window, cx) {
+            return;
+        }
         match item.pick {
             Pick::Action(action) => window.dispatch_action(action, cx),
             Pick::Project(key) => {
@@ -1231,7 +1427,17 @@ impl Hyakume {
             }
             Pick::Workspace(key) => self.show_workspace(&key),
             Pick::Retry(source) => self.runtime.send(Command::Retry(source)),
-            Pick::Stage(key) => self.toggle_stage(key),
+            Pick::Filter(key) => self.toggle_stage(key),
+            Pick::NewDialog { role, column } => self.open_dialog(role, Some(column), window, cx),
+            // Handled by apply_change above.
+            Pick::SetStage(_)
+            | Pick::SetAssignee(_)
+            | Pick::SetPriority(_)
+            | Pick::LinkType { .. }
+            | Pick::Unlink(_)
+            | Pick::Roles(_)
+            | Pick::Member(_)
+            | Pick::ToggleRole(_) => {}
             Pick::Task(key) => {
                 if let Some(eye) = self.scene.eye(&key) {
                     match mode {
@@ -1382,6 +1588,58 @@ impl Render for Hyakume {
                 this.show_every_stage();
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &EditTask, window, cx| {
+                this.start_edit(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NewTask, window, cx| {
+                this.start_create(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MoveToStage, window, cx| {
+                this.open_change(Mode::Stage, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &AssignTask, window, cx| {
+                this.open_change(Mode::Assignee, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SetPriority, window, cx| {
+                this.open_change(Mode::Priority, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &LinkTask, window, cx| {
+                this.open_change(Mode::LinkType, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &UnlinkTask, window, cx| {
+                this.open_change(Mode::Unlink, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &CommentOnTask, window, cx| {
+                this.focus_composer(window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TogglePin, _, cx| {
+                this.toggle_pin();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NewRelationType, window, cx| {
+                this.open_dialog(false, None, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NewRole, window, cx| {
+                this.open_dialog(true, None, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SetRoles, window, cx| {
+                this.open_roles(None, window, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &DeleteTask, window, cx| {
+                this.ask_delete(window, cx);
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ShowOverview, window, cx| {
                 this.back_to_overview();
                 window.focus(&this.focus_handle);
@@ -1502,6 +1760,22 @@ impl Render for Hyakume {
                 this.pan_by(0.0, -PAN_STEP);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &NudgeLeft, _, cx| {
+                this.nudge(-1.0, 0.0);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NudgeRight, _, cx| {
+                this.nudge(1.0, 0.0);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NudgeUp, _, cx| {
+                this.nudge(0.0, -1.0);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NudgeDown, _, cx| {
+                this.nudge(0.0, 1.0);
+                cx.notify();
+            }))
             .child(world);
 
         let mut area = div()
@@ -1569,12 +1843,17 @@ impl Render for Hyakume {
         }
 
         let mut body = div().flex_1().min_h_0().flex().flex_row().child(area);
+        let creating = self.create_panel(inspector_width(window_w), ring, window, cx);
+        let creating_now = creating.is_some();
+        body = body.children(creating);
         if let Some(eye) = self
             .selected
             .as_ref()
             .and_then(|k| self.scene.eye(k))
-            .filter(|_| self.inspecting)
+            .filter(|_| self.inspecting && !creating_now)
         {
+            // Made before anything borrows the details, as it may add a box.
+            let composer_input = self.composer_for(eye, cx);
             let detail = self.selected.as_ref().and_then(|k| self.details.get(k));
             let close = cx.listener(|this: &mut Self, _: &ClickEvent, window, cx| {
                 this.selected = None;
@@ -1588,6 +1867,17 @@ impl Render for Hyakume {
                 cx.notify();
             });
             self.inspector_stops.prepare(&self.scene, eye, cx);
+            let key = self.scene.eyes[eye].key.clone();
+            let editing = self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.key.as_ref() == Some(&key) && e.target != Target::Create);
+            let form = editing
+                .then(|| self.editor_panel(ring, window, cx))
+                .flatten();
+            let read_only = self.read_only(eye);
+            let actions = read_only.is_none().then(|| self.task_actions(ring, cx));
+            let composer = composer_input.map(|input| self.composer_view(input, ring, window, cx));
             body = body.child(inspector::panel(
                 &self.scene,
                 eye,
@@ -1601,10 +1891,16 @@ impl Render for Hyakume {
                     ring,
                     on_close: Box::new(close),
                     on_follow: Rc::new(move |eye, window, cx| follow(&eye, window, cx)),
+                    form,
+                    actions,
+                    composer,
+                    read_only,
                 },
             ));
         }
-        let root = root.child(body);
+        let root = root
+            .child(body)
+            .children(self.modal(window_w, ring, window, cx));
         match &self.picker {
             Some(picker) => root.child(self.picker_overlay(picker, window_w, cx)),
             None => root,
@@ -2159,7 +2455,11 @@ fn pill(t: &Theme) -> gpui::Div {
 
 /// A button reachable with Tab. `ring` is the focus ring color while the
 /// keyboard is in use; Enter or Space on a focused button clicks it.
-fn button(t: &Theme, id: impl Into<SharedString>, ring: Option<Hsla>) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn button(
+    t: &Theme,
+    id: impl Into<SharedString>,
+    ring: Option<Hsla>,
+) -> gpui::Stateful<gpui::Div> {
     let raised = t.raised;
     div()
         .id(id.into())

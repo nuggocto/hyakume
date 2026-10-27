@@ -1,4 +1,5 @@
-//! The side panel for one selected task. Read-only until editing arrives.
+//! The side panel for one selected task: its fields, or the form editing
+//! them, then its blockers, links, and comments.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -7,7 +8,6 @@ use gpui::{
     AnyElement, App, Bounds, ClickEvent, FocusHandle, FontWeight, Hsla, IntoElement, ParentElement,
     Pixels, ScrollHandle, SharedString, Styled, Window, canvas, div, point, prelude::*, px,
 };
-use hyakume_core::api::TaskDetail;
 use hyakume_core::model::is_unsafe_char;
 use time::OffsetDateTime;
 use time::format_description::BorrowedFormatItem;
@@ -15,6 +15,7 @@ use time::macros::format_description;
 
 use crate::clock::LocalTime;
 use crate::glyphs;
+use crate::runtime::Fetched;
 use crate::scene::Scene;
 use crate::theme::Theme;
 
@@ -32,7 +33,8 @@ pub fn posted_at(at: OffsetDateTime, local: &LocalTime) -> String {
 
 pub enum Detail {
     Loading,
-    Loaded(Box<TaskDetail>),
+    /// Fresh, or the copy kept from when it was last fetched.
+    Loaded(Box<Fetched>),
     Failed(String),
 }
 
@@ -139,6 +141,14 @@ pub struct Hooks {
     pub on_close: OnClick,
     /// Go to the eye at the other end of a link.
     pub on_follow: OnEye,
+    /// The edit form, shown instead of the fields while editing.
+    pub form: Option<AnyElement>,
+    /// Buttons for changing the task, under its title.
+    pub actions: Option<AnyElement>,
+    /// The box for a new comment, under the comments.
+    pub composer: Option<AnyElement>,
+    /// Why the task can't be changed from here, if it can't.
+    pub read_only: Option<&'static str>,
 }
 
 pub fn panel(
@@ -167,7 +177,7 @@ pub fn panel(
                 .text_color(t.muted)
                 .child(clean(&task.reference, false)),
         )
-        .child(chip("Read-only".into(), &t))
+        .children(hooks.read_only.map(|why| chip(why.into(), &t)))
         .child(div().flex_1())
         .child(
             div()
@@ -285,9 +295,12 @@ pub fn panel(
         .border_l_1()
         .border_color(t.line)
         .text_color(t.ink)
-        .child(header)
-        .child(title)
-        .child(grid);
+        .child(header);
+    let editing = hooks.form.is_some();
+    body = match hooks.form {
+        Some(form) => body.child(form),
+        None => body.child(title).children(hooks.actions).child(grid),
+    };
 
     if !e.blocked_by.is_empty() {
         let lines = e.blocked_by.iter().map(|b| {
@@ -327,7 +340,7 @@ pub fn panel(
         );
     }
 
-    if !task.fields.description.trim().is_empty() {
+    if !editing && !task.fields.description.trim().is_empty() {
         body = body.child(section(
             "Description",
             div()
@@ -396,12 +409,17 @@ pub fn panel(
     let comments: AnyElement = match detail {
         None | Some(Detail::Loading) => muted("Loading comments…", &t),
         Some(Detail::Failed(reason)) => muted(&format!("Comments aren't available: {reason}"), &t),
-        Some(Detail::Loaded(detail)) if detail.comments.is_empty() => muted("No comments yet.", &t),
-        Some(Detail::Loaded(detail)) => div()
+        Some(Detail::Loaded(fetched)) if fetched.detail.comments.is_empty() => {
+            muted(&saved_note(fetched, "No comments", local), &t)
+        }
+        Some(Detail::Loaded(fetched)) => div()
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .children(detail.comments.iter().map(|comment| {
+            .when(fetched.saved_at.is_some(), |d| {
+                d.child(muted(&saved_note(fetched, "Comments", local), &t))
+            })
+            .children(fetched.detail.comments.iter().map(|comment| {
                 let who = comment
                     .author
                     .and_then(|id| column.people.get(&id).cloned())
@@ -438,7 +456,27 @@ pub fn panel(
             }))
             .into_any_element(),
     };
-    body.child(section("Comments", comments, &t))
+    body.child(section(
+        "Comments",
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(comments)
+            .children(hooks.composer),
+        &t,
+    ))
+}
+
+/// "No comments yet.", or when offline, the age of what's shown.
+fn saved_note(fetched: &Fetched, what: &str, local: &LocalTime) -> String {
+    match fetched.saved_at {
+        None => format!("{what} yet."),
+        Some(at) => format!(
+            "{what} as of {}, the last time you opened this task. The server can't be reached.",
+            posted_at(at, local)
+        ),
+    }
 }
 
 fn text(value: &str, t: &Theme) -> AnyElement {

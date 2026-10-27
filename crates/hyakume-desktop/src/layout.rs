@@ -1,11 +1,14 @@
 //! Where things sit, in world units. Positions stick: a refresh only places
-//! what is new, and only an explicit re-layout moves what was already there.
-//! Everything is deterministic, so the same data always lands the same way.
+//! what is new, and only an explicit re-layout moves what was already there,
+//! never what the person placed by hand. Same data, same layout, every time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
+use hyakume_core::api::{LayoutNode, NodeKind};
+
 use crate::scene::{NodeKey, Scene};
+use crate::sources::{SourceKey, SourceState};
 
 /// Eye width in world units; the eye is 28×20 in its own drawing units.
 pub const EYE_W: f32 = 24.0;
@@ -92,6 +95,8 @@ pub struct Placement {
     /// Center and radius.
     pub clusters: Vec<(Vec2, f32)>,
     pub eyes: Vec<Vec2>,
+    /// Eyes the person placed by hand, which re-layout leaves alone.
+    pub pinned: Vec<bool>,
 }
 
 impl Placement {
@@ -128,23 +133,173 @@ pub struct Layout {
     /// How wide each column came out last time, so `widen` knows how far
     /// to slide its webs to keep them in the middle.
     widths: HashMap<NodeKey, f32>,
+    /// Eyes and webs placed by hand. Re-layout keeps them where they are.
+    pinned: HashSet<NodeKey>,
+    /// Saved positions as last applied, so a refresh that carries the same
+    /// saved layout doesn't drag back something moved since.
+    applied: HashMap<NodeKey, LayoutNode>,
+    /// The last position this device sent per node, until it comes back.
+    /// Any other saved value seen meanwhile is older than it.
+    sent: HashMap<NodeKey, LayoutNode>,
 }
 
 impl Layout {
     /// Forgets every position, then places everything fresh. The widths the
-    /// names need are measurements, not positions, so they stay.
-    pub fn relayout(&mut self, scene: &Scene) -> Placement {
-        let min_widths = std::mem::take(&mut self.min_widths);
+    /// names need are measurements, not positions, so they stay. Also hands
+    /// back the saved, unpinned positions it moved: unsaved, the next start
+    /// or another device would put them back.
+    pub fn relayout(&mut self, scene: &Scene) -> (Placement, Vec<(NodeKey, LayoutNode)>) {
+        let mut saved: HashMap<NodeKey, LayoutNode> = self.applied.clone();
+        saved.extend(self.sent.clone());
+        let pinned = std::mem::take(&mut self.pinned);
+        let mut eyes = std::mem::take(&mut self.eyes);
+        let mut clusters = std::mem::take(&mut self.clusters);
+        eyes.retain(|k, _| pinned.contains(k));
+        clusters.retain(|k, _| pinned.contains(k));
         *self = Self {
-            min_widths,
+            min_widths: std::mem::take(&mut self.min_widths),
+            applied: std::mem::take(&mut self.applied),
+            sent: std::mem::take(&mut self.sent),
+            eyes,
+            clusters,
+            pinned,
             ..Self::default()
         };
-        self.place(scene)
+        let placement = self.place(scene);
+        let mut moved = Vec::new();
+        for (key, node) in saved.into_iter().filter(|(_, n)| !n.pinned) {
+            let at = match node.kind {
+                NodeKind::Task => self.eyes.get(&key).copied(),
+                NodeKind::Project => self.clusters.get(&key).map(|&(at, _)| at),
+            };
+            if let Some(at) = at.filter(|at| (f64::from(at.x), f64::from(at.y)) != (node.x, node.y))
+            {
+                moved.push((key.clone(), self.remember(key, node.kind, at, false)));
+            }
+        }
+        (placement, moved)
+    }
+
+    /// Takes in positions saved on the server or in local.db: ones this
+    /// device hasn't applied yet, such as a move made on another device.
+    pub fn apply_saved(&mut self, scene: &Scene, sources: &[SourceState]) {
+        for source in sources {
+            for node in source.workspaces.iter().flat_map(|w| &w.layout) {
+                let key = NodeKey {
+                    source: source.key.clone(),
+                    id: node.id,
+                };
+                match self.sent.get(&key) {
+                    Some(sent) if sent != node => continue,
+                    Some(_) => _ = self.sent.remove(&key),
+                    None => {}
+                }
+                if self.applied.get(&key) == Some(node) {
+                    continue;
+                }
+                let at = Vec2::new(node.x as f32, node.y as f32);
+                match node.kind {
+                    NodeKind::Task => {
+                        self.eyes.insert(key.clone(), at);
+                    }
+                    NodeKind::Project => {
+                        // A web keeps its size; only where it sits was saved.
+                        let r = match self.clusters.get(&key) {
+                            Some(&(_, r)) => r,
+                            None => scene
+                                .cluster(&key)
+                                .map_or(0.0, |c| cluster_radius(scene.clusters[c].eyes.len())),
+                        };
+                        self.clusters.insert(key.clone(), (at, r));
+                    }
+                }
+                match node.pinned {
+                    true => self.pinned.insert(key.clone()),
+                    false => self.pinned.remove(&key),
+                };
+                self.applied.insert(key, node.clone());
+            }
+        }
+    }
+
+    /// A save that failed won't come back, so other devices' moves of these
+    /// nodes may land again. A newer save of the same node still waits.
+    pub fn unsent(&mut self, source: &SourceKey, nodes: &[LayoutNode]) {
+        for node in nodes {
+            let key = NodeKey {
+                source: source.clone(),
+                id: node.id,
+            };
+            if self.sent.get(&key) == Some(node) {
+                self.sent.remove(&key);
+            }
+        }
+    }
+
+    /// Puts eye `eye` at `world`, kept on its own web, and pins it. Returns
+    /// the position to save.
+    pub fn move_eye(
+        &mut self,
+        scene: &Scene,
+        placement: &Placement,
+        eye: usize,
+        world: Vec2,
+    ) -> LayoutNode {
+        let (center, r) = placement.clusters[scene.eyes[eye].cluster];
+        let at = clamp_len(world - center, r * 0.8);
+        let key = scene.eyes[eye].key.clone();
+        self.eyes.insert(key.clone(), at);
+        self.pinned.insert(key.clone());
+        self.remember(key, NodeKind::Task, at, true)
+    }
+
+    /// Puts web `cluster` with its center at `world` and pins it.
+    pub fn move_cluster(
+        &mut self,
+        scene: &Scene,
+        placement: &Placement,
+        cluster: usize,
+        world: Vec2,
+    ) -> LayoutNode {
+        let (left, _) = placement.columns[scene.clusters[cluster].column];
+        let (_, r) = placement.clusters[cluster];
+        // The column grows rightward to hold a pinned web, never leftward.
+        let at = Vec2::new((world.x - left).max(r + 30.0), world.y);
+        let key = scene.clusters[cluster].key.clone();
+        self.clusters.insert(key.clone(), (at, r));
+        self.pinned.insert(key.clone());
+        self.remember(key, NodeKind::Project, at, true)
+    }
+
+    /// Pins or unpins an eye where it is now. Returns the position to save.
+    pub fn toggle_pin(&mut self, scene: &Scene, eye: usize) -> Option<LayoutNode> {
+        let key = scene.eyes[eye].key.clone();
+        let at = *self.eyes.get(&key)?;
+        let pinned = !self.pinned.remove(&key);
+        if pinned {
+            self.pinned.insert(key.clone());
+        }
+        Some(self.remember(key, NodeKind::Task, at, pinned))
+    }
+
+    /// The position to save, held in `sent` until its echo comes back: a
+    /// refresh fetched before the save landed, or the echo of an earlier
+    /// nudge, still carries an older spot, which must not win.
+    fn remember(&mut self, key: NodeKey, kind: NodeKind, at: Vec2, pinned: bool) -> LayoutNode {
+        let node = LayoutNode {
+            kind,
+            id: key.id,
+            x: f64::from(at.x),
+            y: f64::from(at.y),
+            pinned,
+        };
+        self.sent.insert(key, node.clone());
+        node
     }
 
     /// Asks for column `column` of `scene` to be at least `width` wide from
     /// the next `place`. True if that's wider than before. Its webs slide by
-    /// half the growth, so they stay mid-column without being placed afresh.
+    /// half the growth to stay mid-column; pinned ones stay where they were put.
     pub fn widen(&mut self, scene: &Scene, column: usize, width: f32) -> bool {
         let column = &scene.columns[column];
         let known = self.min_widths.get(&column.key).copied().unwrap_or(0.0);
@@ -155,7 +310,11 @@ impl Layout {
         let drawn = self.widths.get(&column.key).copied().unwrap_or(width);
         let slide = ((width - drawn) / 2.0).max(0.0);
         for c in column.clusters.clone() {
-            if let Some((at, _)) = self.clusters.get_mut(&scene.clusters[c].key) {
+            let key = &scene.clusters[c].key;
+            if self.pinned.contains(key) {
+                continue;
+            }
+            if let Some((at, _)) = self.clusters.get_mut(key) {
                 at.x += slide;
             }
         }
@@ -168,7 +327,17 @@ impl Layout {
             .clusters
             .iter()
             .map(|c| {
-                let needed = cluster_radius(c.eyes.len());
+                // Room for every pinned eye where it was put, too: a web that
+                // lost tasks would otherwise shrink and pull them inward.
+                let held = c
+                    .eyes
+                    .clone()
+                    .map(|e| &scene.eyes[e].key)
+                    .filter(|k| self.pinned.contains(*k))
+                    .filter_map(|k| self.eyes.get(k))
+                    .map(|p| p.len() / 0.8 + 1.0)
+                    .fold(0.0, f32::max);
+                let needed = cluster_radius(c.eyes.len()).max(held);
                 match self.clusters.get(&c.key) {
                     Some(&(_, r)) if needed <= r + GROWTH_SLACK => r,
                     Some(_) => needed + GROWTH_SLACK,
@@ -180,15 +349,27 @@ impl Layout {
             columns: Vec::with_capacity(scene.columns.len()),
             clusters: vec![(Vec2::default(), 0.0); scene.clusters.len()],
             eyes: vec![Vec2::default(); scene.eyes.len()],
+            pinned: scene
+                .eyes
+                .iter()
+                .map(|e| self.pinned.contains(&e.key))
+                .collect(),
         };
 
+        let pinned = |c: usize| self.pinned.contains(&scene.clusters[c].key);
         let mut right = 0.0_f32;
         for column in &scene.columns {
             let named = self.min_widths.get(&column.key).copied().unwrap_or(0.0);
+            // Wide enough for the widest web, its names, and every web
+            // placed by hand right where it was put.
+            let held = |c: usize| match self.clusters.get(&scene.clusters[c].key) {
+                Some(&(at, _)) if pinned(c) => at.x + radii[c] + 60.0,
+                _ => 0.0,
+            };
             let widest = column
                 .clusters
                 .clone()
-                .map(|c| 2.0 * radii[c] + 120.0)
+                .map(|c| (2.0 * radii[c] + 120.0).max(held(c)))
                 .fold(COLUMN_MIN_W.max(named), f32::max);
             // A column that grew pushes the ones after it right, never over them.
             let x = self
@@ -215,6 +396,7 @@ impl Layout {
                 let r = radii[c];
                 let room = (widest / 2.0 - r - 30.0).max(0.0);
                 let at = match self.clusters.get(&scene.clusters[c].key) {
+                    Some(&(at, _)) if pinned(c) => at,
                     // Anchored to the left edge, so a web that grows doesn't drag
                     // its neighbours; only `widen` slides them, for names.
                     Some(&(at, _)) => {
@@ -233,14 +415,29 @@ impl Layout {
                 wanted.push((c, at));
             }
             // One pass from the top pushes down any web that would overlap the
-            // one above it, so neither equal centers nor a web that grew past
-            // its neighbour can leave two on top of each other.
+            // one above it. Pinned webs never move; the rest also slide past
+            // any pinned web they'd land on.
             wanted.sort_by(|a, b| a.1.y.total_cmp(&b.1.y).then(a.0.cmp(&b.0)));
+            let pins: Vec<(f32, f32)> = wanted
+                .iter()
+                .filter(|&&(c, _)| pinned(c))
+                .map(|&(c, at)| (at.y, radii[c]))
+                .collect();
             let mut free_from = COLUMN_HEAD;
             for (c, mut at) in wanted {
                 let r = radii[c];
-                at.y = at.y.max(free_from + r);
-                free_from = at.y + r + CLUSTER_GAP;
+                if !pinned(c) {
+                    at.y = at.y.max(free_from + r);
+                    // One pass, top down: moving below a pin can only meet the
+                    // pins further down, and re-checking the same pin could spin
+                    // forever on a rounding error.
+                    for &(py, pr) in &pins {
+                        if at.y - r < py + pr + CLUSTER_GAP && at.y + r + CLUSTER_GAP > py - pr {
+                            at.y = py + pr + CLUSTER_GAP + r;
+                        }
+                    }
+                }
+                free_from = free_from.max(at.y + r + CLUSTER_GAP);
                 self.clusters.insert(scene.clusters[c].key.clone(), (at, r));
                 placement.clusters[c] = (Vec2::new(x + at.x, at.y), r);
             }
@@ -405,6 +602,208 @@ mod tests {
             let drift = (on_web(&after) - on_web(&before)).len();
             assert!(drift < 0.01, "eye {e} moved {drift} on its web");
         }
+    }
+
+    #[test]
+    fn re_layout_moves_everything_but_what_was_placed_by_hand() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "WEB", 6);
+        project(&mut ws, "API", 3);
+        let scene = Scene::build(&[ws.source()]);
+        let mut layout = Layout::default();
+        let before = layout.place(&scene);
+        let target = before.clusters[0].0 + Vec2::new(40.0, -30.0);
+        layout.move_eye(&scene, &before, 2, target);
+        let moved_web = before.clusters[1].0 + Vec2::new(0.0, 300.0);
+        layout.move_cluster(&scene, &before, 1, moved_web);
+        let placed = layout.place(&scene);
+
+        let (after, _) = layout.relayout(&scene);
+
+        // Eyes sit relative to their web, which re-layout may move.
+        let on_web = |p: &Placement, e: usize| p.eyes[e] - p.clusters[0].0;
+        assert_eq!(
+            on_web(&after, 2),
+            on_web(&placed, 2),
+            "the dragged eye stays"
+        );
+        assert_eq!(
+            after.clusters[1].0, placed.clusters[1].0,
+            "the dragged web stays"
+        );
+        assert!(after.pinned[2] && !after.pinned[0]);
+        let fresh = Layout::default().place(&scene);
+        assert_ne!(
+            on_web(&after, 0),
+            on_web(&placed, 0),
+            "the rest is placed again"
+        );
+        assert_ne!(
+            on_web(&fresh, 0),
+            on_web(&after, 0),
+            "around the pinned eye"
+        );
+    }
+
+    #[test]
+    fn a_position_saved_elsewhere_lands_once_and_never_undoes_a_later_move() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "WEB", 4);
+        let scene = Scene::build(&[ws.source()]);
+        let mut layout = Layout::default();
+        let first = layout.place(&scene);
+        let center = first.clusters[0].0;
+
+        // Another device put WEB-1 here and saved it.
+        let mut source = ws.source();
+        source.workspaces[0].layout = vec![LayoutNode {
+            kind: NodeKind::Task,
+            id: scene.eyes[0].key.id,
+            x: 50.0,
+            y: 20.0,
+            pinned: true,
+        }];
+        layout.apply_saved(&scene, std::slice::from_ref(&source));
+        let synced = layout.place(&scene);
+        assert_eq!(synced.eyes[0], center + Vec2::new(50.0, 20.0));
+        assert!(synced.pinned[0]);
+
+        // Then it's dragged here; a refresh carrying the old save leaves it.
+        layout.move_eye(&scene, &synced, 0, center + Vec2::new(-40.0, 10.0));
+        layout.apply_saved(&scene, std::slice::from_ref(&source));
+        let refreshed = layout.place(&scene);
+        assert_eq!(refreshed.eyes[0], center + Vec2::new(-40.0, 10.0));
+    }
+
+    #[test]
+    fn an_older_save_coming_back_never_undoes_a_newer_move() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "WEB", 4);
+        let scene = Scene::build(&[ws.source()]);
+        let mut layout = Layout::default();
+        let placed = layout.place(&scene);
+        let center = placed.clusters[0].0;
+        let echo = |nodes: Vec<LayoutNode>| {
+            let mut source = ws.source();
+            source.workspaces[0].layout = nodes;
+            source
+        };
+
+        // Two nudges, both saving; the first save's echo arrives between them.
+        let first = layout.move_eye(&scene, &placed, 0, center + Vec2::new(16.0, 0.0));
+        let second = layout.move_eye(&scene, &placed, 0, center + Vec2::new(32.0, 0.0));
+        layout.apply_saved(&scene, &[echo(vec![first])]);
+        assert_eq!(layout.place(&scene).eyes[0], center + Vec2::new(32.0, 0.0));
+
+        // Once its own last save is back, other devices' moves land again.
+        layout.apply_saved(&scene, &[echo(vec![second.clone()])]);
+        let elsewhere = LayoutNode { x: -20.0, ..second };
+        layout.apply_saved(&scene, &[echo(vec![elsewhere])]);
+        assert_eq!(layout.place(&scene).eyes[0], center + Vec2::new(-20.0, 0.0));
+    }
+
+    #[test]
+    fn re_layout_keeps_room_for_an_eye_pinned_near_the_edge_of_a_shrunk_web() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "WEB", 40);
+        let scene = Scene::build(&[ws.source()]);
+        let mut layout = Layout::default();
+        let placed = layout.place(&scene);
+        let (center, r) = placed.clusters[0];
+        let key = scene.eyes[0].key.clone();
+        let out = Vec2::new(r * 0.75, 0.0);
+        layout.move_eye(&scene, &placed, 0, center + out);
+
+        // Most of the project is deleted, so a fresh web would be far smaller.
+        ws.snapshots[0].tasks.truncate(3);
+        let scene = Scene::build(&[ws.source()]);
+        let (after, _) = layout.relayout(&scene);
+
+        let eye = scene.eye(&key).unwrap();
+        let on_web = after.eyes[eye] - after.clusters[0].0;
+        assert!(
+            (on_web - out).len() < 0.01,
+            "pinned eye moved to {on_web:?}"
+        );
+    }
+
+    #[test]
+    fn re_layout_hands_back_the_saved_positions_it_moved() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "WEB", 6);
+        let scene = Scene::build(&[ws.source()]);
+        let mut layout = Layout::default();
+        let placed = layout.place(&scene);
+        let center = placed.clusters[0].0;
+        // Dragged, then unpinned with P: saved, but re-layout may move it.
+        layout.move_eye(&scene, &placed, 2, center + Vec2::new(60.0, 60.0));
+        let saved = layout.toggle_pin(&scene, 2).unwrap();
+        let mut source = ws.source();
+        source.workspaces[0].layout = vec![saved];
+        layout.apply_saved(&scene, &[source]);
+
+        let (after, moved) = layout.relayout(&scene);
+
+        let [(key, node)] = moved.as_slice() else {
+            panic!("expected one moved node, got {moved:?}");
+        };
+        assert_eq!(*key, scene.eyes[2].key);
+        assert!(!node.pinned);
+        let on_web = after.eyes[2] - after.clusters[0].0;
+        let saved = Vec2::new(node.x as f32, node.y as f32);
+        assert!(
+            (saved - on_web).len() < 0.01,
+            "saved {saved:?}, drawn {on_web:?}"
+        );
+        assert_ne!(on_web, Vec2::new(60.0, 60.0), "it did move");
+    }
+
+    #[test]
+    fn a_pinned_web_stays_put_when_the_web_above_it_moves_closer() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "API", 3);
+        project(&mut ws, "WEB", 3);
+        let scene = Scene::build(&[ws.source()]);
+        let mut layout = Layout::default();
+        let before = layout.place(&scene);
+        let (lower, upper) = (before.clusters[1].0, before.clusters[0].0);
+        layout.move_cluster(&scene, &before, 1, lower);
+
+        // Nudged down, the upper web ends up closer than the usual gap.
+        layout.move_cluster(&scene, &before, 0, upper + Vec2::new(0.0, 16.0));
+        let after = layout.place(&scene);
+
+        assert_eq!(after.clusters[1].0, lower, "the pinned web was pushed");
+        assert_eq!(after.clusters[0].0, upper + Vec2::new(0.0, 16.0));
+    }
+
+    #[test]
+    fn a_pinned_web_keeps_its_saved_spot_when_its_column_is_sized() {
+        let mut ws = Fixture::new();
+        project(&mut ws, "WEB", 3);
+        let scene = Scene::build(&[ws.source()]);
+        let mut source = ws.source();
+        source.workspaces[0].layout = vec![LayoutNode {
+            kind: NodeKind::Project,
+            id: scene.clusters[0].key.id,
+            x: 448.0,
+            y: 600.0,
+            pinned: true,
+        }];
+        let mut layout = Layout::default();
+        layout.apply_saved(&scene, std::slice::from_ref(&source));
+        layout.place(&scene);
+        // What the app does once it has measured the names.
+        layout.widen(&scene, 0, 900.0);
+        let placed = layout.place(&scene);
+
+        let (left, width) = placed.columns[0];
+        let (center, r) = placed.clusters[0];
+        assert_eq!(center, Vec2::new(left + 448.0, 600.0));
+        assert!(
+            448.0 + r <= width,
+            "the column holds the web it was saved with"
+        );
     }
 
     #[test]

@@ -52,6 +52,9 @@ pub enum Command {
     Role(RoleCommand),
     #[command(subcommand)]
     Member(MemberCommand),
+    /// Carry local work to another computer as one file.
+    #[command(subcommand)]
+    Local(LocalCommand),
 }
 
 #[derive(Subcommand)]
@@ -257,5 +260,23 @@ pub enum MemberCommand {
         identity: String,
         #[arg(required = true)]
         roles: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LocalCommand {
+    /// Write all local work, with its comments, links, and your canvas
+    /// positions, to FILE. It holds your own work: keep it private.
+    Export { file: std::path::PathBuf },
+    /// Put FILE's work in place of local work. Nothing is merged: with
+    /// --replace, local projects that aren't in FILE are deleted.
+    Import {
+        file: std::path::PathBuf,
+        /// Allowed even when local work already has projects.
+        #[arg(long)]
+        replace: bool,
+        /// Skip the confirmation for --replace. Required when not run from a terminal.
+        #[arg(long, requires = "replace")]
+        yes: bool,
     },
 }

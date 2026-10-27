@@ -3,6 +3,8 @@
 use hyakume_core::api::{Layout, LayoutNode, NodeKind};
 use hyakume_core::ids::{IdentityId, WorkspaceId};
 
+use sqlx::SqliteConnection;
+
 use crate::convert::{id, now_ms};
 use crate::{Store, StoreError};
 
@@ -12,27 +14,7 @@ impl Store {
         identity: IdentityId,
         workspace: WorkspaceId,
     ) -> Result<Layout, StoreError> {
-        let rows: Vec<(String, String, f64, f64, bool)> = sqlx::query_as(
-            "SELECT node_kind, node_id, x, y, pinned FROM layouts \
-             WHERE identity_id = ? AND workspace_id = ? ORDER BY node_kind, node_id",
-        )
-        .bind(identity.to_string())
-        .bind(workspace.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        let nodes = rows
-            .into_iter()
-            .map(|(kind, node_id, x, y, pinned)| {
-                Ok(LayoutNode {
-                    kind: NodeKind::parse(&kind)
-                        .ok_or_else(|| StoreError::Corrupt(format!("node kind {kind:?}")))?,
-                    id: id(&node_id)?,
-                    x,
-                    y,
-                    pinned,
-                })
-            })
-            .collect::<Result<_, StoreError>>()?;
+        let nodes = fetch_layout(&mut *self.pool.acquire().await?, identity, workspace).await?;
         Ok(Layout { nodes })
     }
 
@@ -88,4 +70,31 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+}
+
+pub(crate) async fn fetch_layout(
+    conn: &mut SqliteConnection,
+    identity: IdentityId,
+    workspace: WorkspaceId,
+) -> Result<Vec<LayoutNode>, StoreError> {
+    let rows: Vec<(String, String, f64, f64, bool)> = sqlx::query_as(
+        "SELECT node_kind, node_id, x, y, pinned FROM layouts \
+         WHERE identity_id = ? AND workspace_id = ? ORDER BY node_kind, node_id",
+    )
+    .bind(identity.to_string())
+    .bind(workspace.to_string())
+    .fetch_all(conn)
+    .await?;
+    rows.into_iter()
+        .map(|(kind, node_id, x, y, pinned)| {
+            Ok(LayoutNode {
+                kind: NodeKind::parse(&kind)
+                    .ok_or_else(|| StoreError::Corrupt(format!("node kind {kind:?}")))?,
+                id: id(&node_id)?,
+                x,
+                y,
+                pinned,
+            })
+        })
+        .collect()
 }

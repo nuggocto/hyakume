@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use hyakume_client::remote::Remote;
 use hyakume_client::{Client, ClientError, DataDir, OpenWorkspace};
-use hyakume_core::api::{Event, ProjectSnapshot, WorkspaceSummary};
+use hyakume_core::api::{Event, LayoutNode, ProjectSnapshot, WorkspaceSummary};
 use hyakume_core::ids::{ProjectId, WorkspaceId};
-use hyakume_storage::ChangeWatcher;
+use hyakume_storage::{Cache, ChangeWatcher};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 
 /// How often local.db is checked for commits from the CLI or another app.
@@ -58,18 +59,24 @@ pub struct SourceState {
     pub workspaces: Vec<WorkspaceData>,
 }
 
-#[derive(Clone, Debug)]
+/// Also what `cache.db` keeps, as JSON. A copy that no longer parses after
+/// an upgrade is skipped, and the next load from the server replaces it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceData {
     pub summary: WorkspaceSummary,
     /// One per visible project, in key order.
     pub snapshots: Vec<ProjectSnapshot>,
+    /// This person's own saved positions here.
+    #[serde(default)]
+    pub layout: Vec<LayoutNode>,
 }
 
 /// What a detail request needs to reach a source after it has loaded.
 #[derive(Clone)]
 pub enum Backend {
     Local(Arc<OpenWorkspace>),
-    Server(Remote),
+    /// With the key its offline copies file under, as it signed in.
+    Server(Remote, Option<Arc<str>>),
 }
 
 pub type Backends = Arc<Mutex<Vec<(SourceKey, Backend)>>>;
@@ -173,7 +180,12 @@ async fn load_local(open: &OpenWorkspace) -> Result<WorkspaceData, ClientError> 
     for project in &summary.projects {
         snapshots.push(open.snapshot(project.id).await?);
     }
-    Ok(WorkspaceData { summary, snapshots })
+    let layout = open.layout().await?.nodes;
+    Ok(WorkspaceData {
+        summary,
+        snapshots,
+        layout,
+    })
 }
 
 /// Keeps one server's workspaces current: subscribe, load, follow events,
@@ -184,6 +196,7 @@ pub async fn run_server(
     address: String,
     retry: Arc<Notify>,
     backends: Backends,
+    cache: Option<Cache>,
     out: Sink,
 ) {
     let key = SourceKey::Server(name.clone());
@@ -193,10 +206,23 @@ pub async fn run_server(
         status: Status::Loading,
         workspaces: Vec::new(),
     };
+    // Sent before anything awaits: columns appear in the order sources
+    // first report, and that order follows client.toml only this way.
     let _ = out.send(state.clone());
+    // The copy from last time shows while connecting, and stays up
+    // read-only if the server doesn't answer.
+    let copies = Copies {
+        cache,
+        data: data.clone(),
+        name: name.clone(),
+    };
+    state.workspaces = copies.load().await;
+    if !state.workspaces.is_empty() {
+        let _ = out.send(state.clone());
+    }
     let mut backoff = Duration::from_secs(1);
     loop {
-        let err = session(&data, &name, &mut state, &backends, &out).await;
+        let err = session(&data, &name, &mut state, &backends, &copies, &out).await;
         if out.is_closed() {
             return;
         }
@@ -216,13 +242,17 @@ pub async fn run_server(
                 }
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
+            // A refusal isn't an outage: what this sign-in could see, the
+            // copy included, leaves the screen until a connection works again.
             ClientError::Unauthorized(reason) => {
                 state.status = Status::SignedOut(reason);
+                state.workspaces.clear();
                 let _ = out.send(state.clone());
                 retry.notified().await;
             }
             other => {
                 state.status = Status::Failed(other.to_string());
+                state.workspaces.clear();
                 let _ = out.send(state.clone());
                 retry.notified().await;
             }
@@ -236,9 +266,10 @@ async fn session(
     name: &str,
     state: &mut SourceState,
     backends: &Backends,
+    copies: &Copies,
     out: &Sink,
 ) -> ClientError {
-    match follow(data, name, state, backends, out).await {
+    match follow(data, name, state, backends, copies, out).await {
         Ok(()) => ClientError::Unreachable {
             server: name.to_owned(),
             reason: "the event stream ended".into(),
@@ -252,10 +283,14 @@ async fn follow(
     name: &str,
     state: &mut SourceState,
     backends: &Backends,
+    copies: &Copies,
     out: &Sink,
 ) -> Result<(), ClientError> {
     // Reloaded on every attempt, so a sign-in done with the CLI meanwhile is picked up.
     let client = Client::load(data.clone())?;
+    // Read once with the session's token: if the CLI signs this profile in as
+    // someone else meanwhile, this connection's data still files under its own.
+    let key = cache_key(&client, name);
     let remote = client.server(name).await?;
     if !remote.has_session() {
         return Err(ClientError::Unauthorized(format!(
@@ -274,12 +309,18 @@ async fn follow(
             ));
         }
     }
-    set_backend(backends, &state.key, Backend::Server(remote.clone()));
+    let copy_key = key.as_deref().map(Arc::from);
+    set_backend(
+        backends,
+        &state.key,
+        Backend::Server(remote.clone(), copy_key),
+    );
     state.workspaces = load_all(&remote).await?;
     state.status = Status::Live;
     if out.send(state.clone()).is_err() {
         return Ok(());
     }
+    copies.save(key.as_deref(), &state.workspaces).await;
     while let Some(event) = events.next().await {
         match event? {
             Event::ProjectChanged {
@@ -289,15 +330,89 @@ async fn follow(
             Event::WorkspaceChanged { workspace_id } => {
                 refresh_workspace(&remote, state, workspace_id).await?
             }
-            // Saved layouts arrive with dragging in step 8.
-            Event::LayoutChanged { .. } => continue,
+            // Positions saved on this person's other devices, or this one.
+            Event::LayoutChanged { workspace_id } => {
+                if let Some(ws) = state
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.summary.workspace.id == workspace_id)
+                {
+                    ws.layout = remote.layout(workspace_id).await?.nodes;
+                }
+            }
             Event::Resync | Event::Subscribed => state.workspaces = load_all(&remote).await?,
         }
         if out.send(state.clone()).is_err() {
             return Ok(());
         }
+        copies.save(key.as_deref(), &state.workspaces).await;
     }
     Ok(())
+}
+
+/// The server's URL and the identity signed in there: whose copy this is.
+fn cache_key(client: &Client, name: &str) -> Option<String> {
+    let entry = client.config.server(name).ok()?;
+    Some(format!("{} {}", entry.url, entry.identity.as_deref()?))
+}
+
+/// The key for whoever client.toml says is signed in now, for reading a
+/// copy before any connection has been made.
+pub fn current_cache_key(data: &DataDir, name: &str) -> Option<String> {
+    let client = Client::load(data.clone()).ok()?;
+    cache_key(&client, name)
+}
+
+/// One server's offline copies in `cache.db`. Saves go under the key the
+/// connection was made with; the startup load reads client.toml as it is.
+struct Copies {
+    cache: Option<Cache>,
+    data: DataDir,
+    name: Arc<str>,
+}
+
+impl Copies {
+    /// The copy for whoever is signed in now, shown before connecting.
+    async fn load(&self) -> Vec<WorkspaceData> {
+        let key = current_cache_key(&self.data, &self.name);
+        let (Some(cache), Some(key)) = (&self.cache, key) else {
+            return Vec::new();
+        };
+        match cache.load(&key).await {
+            Ok(bodies) => bodies
+                .iter()
+                .filter_map(|b| serde_json::from_str(b).ok())
+                .collect(),
+            Err(err) => {
+                eprintln!("hyakume: reading the offline copy of {}: {err}", self.name);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Files `workspaces` under `key`, the connection's own. A failed save
+    /// costs only the copy, so it's reported and dropped.
+    async fn save(&self, key: Option<&str>, workspaces: &[WorkspaceData]) {
+        let (Some(cache), Some(key)) = (&self.cache, key) else {
+            return;
+        };
+        let rows: Vec<(String, String)> = workspaces
+            .iter()
+            .filter_map(|w| {
+                let body = serde_json::to_string(w).ok()?;
+                Some((w.summary.workspace.id.to_string(), body))
+            })
+            .collect();
+        let tasks: Vec<String> = workspaces
+            .iter()
+            .flat_map(|w| &w.snapshots)
+            .flat_map(|s| &s.tasks)
+            .map(|t| t.id.to_string())
+            .collect();
+        if let Err(err) = cache.replace(key, &rows, &tasks).await {
+            eprintln!("hyakume: saving the offline copy of {}: {err}", self.name);
+        }
+    }
 }
 
 async fn load_all(remote: &Remote) -> Result<Vec<WorkspaceData>, ClientError> {
@@ -335,7 +450,16 @@ async fn load_workspace(
     summary
         .projects
         .retain(|p| snapshots.iter().any(|s| s.project.id == p.id));
-    Ok(Some(WorkspaceData { summary, snapshots }))
+    let layout = match remote.layout(id).await {
+        Ok(layout) => layout.nodes,
+        Err(ClientError::NotFound(_) | ClientError::Forbidden(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(Some(WorkspaceData {
+        summary,
+        snapshots,
+        layout,
+    }))
 }
 
 async fn refresh_workspace(

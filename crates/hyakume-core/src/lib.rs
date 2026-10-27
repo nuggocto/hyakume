@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod blocking;
+pub mod export;
 pub mod ids;
 pub mod model;
 pub mod permission;

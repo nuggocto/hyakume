@@ -4,9 +4,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 
+use hyakume_core::api::{Member, Role};
 use hyakume_core::blocking::unfinished_blockers;
-use hyakume_core::ids::{IdentityId, TaskId};
-use hyakume_core::model::{BuiltinRelation, Stage, Task, name_key};
+use hyakume_core::ids::{IdentityId, ProjectId, RelationId, TaskId, WorkspaceId};
+use hyakume_core::model::{BuiltinRelation, RelationType, Stage, Task, name_key};
+use hyakume_core::permission::{Access, Permission};
 use uuid::Uuid;
 
 use crate::sources::{SourceKey, SourceState, Status, WorkspaceData};
@@ -61,11 +63,34 @@ pub struct Column {
     pub status: Status,
     pub clusters: Range<usize>,
     pub people: HashMap<IdentityId, String>,
+    /// None for a source that has no workspace to show.
+    pub workspace: Option<WorkspaceId>,
+    /// What this person may do here; None along with `workspace`.
+    pub access: Option<Access>,
+    pub relation_types: Vec<RelationType>,
+    pub roles: Vec<Role>,
+    /// Who's in the workspace and which roles each holds.
+    pub members: Vec<Member>,
+}
+
+impl Column {
+    /// Changes go through only while the source is live: offline, what's
+    /// on screen is the last copy loaded, and it stays read-only.
+    pub fn allows(&self, permission: Permission, project: Option<ProjectId>) -> bool {
+        matches!(self.status, Status::Live)
+            && self
+                .access
+                .as_ref()
+                .is_some_and(|a| a.allows(permission, project))
+    }
 }
 
 pub struct Cluster {
     pub key: NodeKey,
+    pub project: ProjectId,
     pub column: usize,
+    /// In workflow order.
+    pub stages: Vec<Stage>,
     pub project_key: String,
     pub name: String,
     pub eyes: Range<usize>,
@@ -89,6 +114,7 @@ pub struct Blocker {
 }
 
 pub struct Thread {
+    pub relation: RelationId,
     pub from: usize,
     pub to: usize,
     pub kind: ThreadKind,
@@ -128,6 +154,11 @@ impl Scene {
                     status: source.status.clone(),
                     clusters: 0..0,
                     people: HashMap::new(),
+                    workspace: None,
+                    access: None,
+                    relation_types: Vec::new(),
+                    roles: Vec::new(),
+                    members: Vec::new(),
                 });
             }
             for workspace in &source.workspaces {
@@ -162,7 +193,9 @@ impl Scene {
             }
             self.clusters.push(Cluster {
                 key: NodeKey::new(key, snapshot.project.id.0),
+                project: snapshot.project.id,
                 column,
+                stages: stages.iter().map(|s| (*s).clone()).collect(),
                 project_key: snapshot.project.key.to_string(),
                 name: snapshot.project.name.clone(),
                 eyes: start..self.eyes.len(),
@@ -248,6 +281,7 @@ impl Scene {
                 continue;
             };
             self.threads.push(Thread {
+                relation: relation.id,
                 from,
                 to,
                 kind: match (kind.builtin, kind.directed) {
@@ -277,6 +311,11 @@ impl Scene {
                 .iter()
                 .map(|m| (m.identity.id, m.identity.display_name.clone()))
                 .collect(),
+            workspace: Some(data.summary.workspace.id),
+            access: Some(data.summary.access.clone()),
+            relation_types: data.summary.relation_types.clone(),
+            roles: data.summary.roles.clone(),
+            members: data.summary.members.clone(),
         });
         for i in first_eye..self.eyes.len() {
             self.eye_index.insert(self.eyes[i].key.clone(), i);
@@ -534,6 +573,7 @@ pub(crate) mod tests {
                         members: Vec::new(),
                     },
                     snapshots: self.snapshots.clone(),
+                    layout: Vec::new(),
                 }],
             }
         }

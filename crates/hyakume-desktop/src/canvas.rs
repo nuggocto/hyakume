@@ -1739,6 +1739,18 @@ fn eyes(
             );
         }
         glyphs::eye(window, eye.shape, at, w, theme);
+        // A small dot on the upper left: placed by hand, so re-layout won't move it.
+        if frame.placement.pinned.get(i) == Some(&true) && !stub && w >= 9.0 {
+            let d = (w * EYE_BODY + 3.0) * std::f32::consts::FRAC_1_SQRT_2;
+            let pin = point(at.x - px(d), at.y - px(d));
+            glyphs::circle(
+                window,
+                pin,
+                3.5,
+                theme.muted,
+                Some((1.0, theme.bg, BorderStyle::Solid)),
+            );
+        }
         if !eye.blocked_by.is_empty() && !stub && w >= 9.0 {
             // On the body's upper right, so it stays on the eye when zoomed in.
             let d = (w * EYE_BODY + 4.0) * std::f32::consts::FRAC_1_SQRT_2;

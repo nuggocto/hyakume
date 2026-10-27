@@ -2965,6 +2965,8 @@ dependencies = [
  "hyakume-client",
  "hyakume-core",
  "hyakume-storage",
+ "serde",
+ "serde_json",
  "time",
  "tokio",
  "toml 1.1.8+spec-1.1.0",

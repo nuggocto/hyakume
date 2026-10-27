@@ -9,6 +9,11 @@ use gpui::{
     div, prelude::*, px, uniform_list,
 };
 
+use hyakume_core::api::{Member, Role};
+use hyakume_core::ids::{IdentityId, RelationId, RelationTypeId, RoleId, StageId};
+use hyakume_core::model::Priority;
+
+use crate::edit::priority_name;
 use crate::inspector;
 use crate::scene::{Dir, NodeKey, Scene};
 use crate::sources::SourceKey;
@@ -28,6 +33,15 @@ pub enum Mode {
     Commands,
     Find,
     Follow(Dir),
+    Stage,
+    Assignee,
+    Priority,
+    LinkType,
+    LinkTarget,
+    Unlink,
+    /// Whose roles to change, then which role to give or take.
+    Members,
+    MemberRoles,
 }
 
 pub enum Pick {
@@ -37,7 +51,27 @@ pub enum Pick {
     Retry(SourceKey),
     Task(NodeKey),
     /// Hides or shows every task in the stage with this name key.
-    Stage(String),
+    Filter(String),
+    SetStage(StageId),
+    SetAssignee(Option<IdentityId>),
+    SetPriority(Option<Priority>),
+    /// `forward` links from this task to the one picked next.
+    LinkType {
+        id: RelationTypeId,
+        forward: bool,
+        name: String,
+    },
+    Unlink(RelationId),
+    /// A dialog for workspace `column`: a role, or a relationship type.
+    NewDialog {
+        role: bool,
+        column: NodeKey,
+    },
+    /// Change people's roles in workspace `column`.
+    Roles(NodeKey),
+    Member(IdentityId),
+    /// Gives the role, or takes it if they have it.
+    ToggleRole(RoleId),
 }
 
 pub struct Item {
@@ -175,12 +209,178 @@ pub fn link_items(scene: &Scene, eye: usize, dir: Dir, shown: impl Fn(usize) -> 
         .collect()
 }
 
+/// The stages of the project web `cluster`, current one marked.
+pub fn stage_items(scene: &Scene, cluster: usize, current: StageId) -> Vec<Item> {
+    scene.clusters[cluster]
+        .stages
+        .iter()
+        .map(|s| {
+            let detail = match (s.id == current, s.finished) {
+                (true, _) => "Now",
+                (false, true) => "Counts as finished",
+                (false, false) => "",
+            };
+            Item::new(s.name.clone(), detail.into(), "", Pick::SetStage(s.id))
+        })
+        .collect()
+}
+
+/// Everyone in the column's workspace, by name, after "Unassigned".
+pub fn assignee_items(scene: &Scene, column: usize, current: Option<IdentityId>) -> Vec<Item> {
+    let mark = |who: Option<IdentityId>| if who == current { "Now" } else { "" };
+    let mut people: Vec<(&IdentityId, &String)> = scene.columns[column].people.iter().collect();
+    people.sort_by(|a, b| a.1.cmp(b.1));
+    let mut items = vec![Item::new(
+        "Unassigned".into(),
+        mark(None).into(),
+        "nobody none",
+        Pick::SetAssignee(None),
+    )];
+    items.extend(people.into_iter().map(|(&id, name)| {
+        Item::new(
+            name.clone(),
+            mark(Some(id)).into(),
+            "",
+            Pick::SetAssignee(Some(id)),
+        )
+    }));
+    items
+}
+
+/// Everyone in the workspace, with the roles they hold now.
+pub fn member_items(members: &[Member], roles: &[Role]) -> Vec<Item> {
+    let mut items: Vec<Item> = members
+        .iter()
+        .map(|m| {
+            let mut held: Vec<&str> = roles
+                .iter()
+                .filter(|r| m.roles.contains(&r.id))
+                .map(|r| r.name.as_str())
+                .collect();
+            if m.is_owner {
+                held.insert(0, "Owner of the workspace");
+            }
+            let detail = match held.is_empty() {
+                true => "No roles".to_owned(),
+                false => held.join(", "),
+            };
+            let name = &m.identity.display_name;
+            Item::new(
+                name.clone(),
+                detail,
+                &m.identity.name,
+                Pick::Member(m.identity.id),
+            )
+        })
+        .collect();
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items
+}
+
+/// Every role, marked where `member` holds it already.
+pub fn member_role_items(member: &Member, roles: &[Role]) -> Vec<Item> {
+    roles
+        .iter()
+        .map(|r| {
+            let detail = match member.roles.contains(&r.id) {
+                true => "Has it · Enter takes it",
+                false => "",
+            };
+            Item::new(r.name.clone(), detail.into(), "", Pick::ToggleRole(r.id))
+        })
+        .collect()
+}
+
+pub fn priority_items(current: Option<Priority>) -> Vec<Item> {
+    [
+        None,
+        Some(Priority::Low),
+        Some(Priority::Medium),
+        Some(Priority::High),
+        Some(Priority::Urgent),
+    ]
+    .into_iter()
+    .map(|p| {
+        let detail = if p == current { "Now" } else { "" };
+        Item::new(
+            priority_name(p).into(),
+            detail.into(),
+            "",
+            Pick::SetPriority(p),
+        )
+    })
+    .collect()
+}
+
+/// Each way a link can read from this task: a directed type twice ("blocks"
+/// and "blocked by"), an undirected one once.
+pub fn link_type_items(scene: &Scene, column: usize) -> Vec<Item> {
+    let mut items = Vec::new();
+    for t in &scene.columns[column].relation_types {
+        let mut add = |name: &str, forward: bool| {
+            items.push(Item::new(
+                format!("{name} …"),
+                "Then pick the other task".into(),
+                "",
+                Pick::LinkType {
+                    id: t.id,
+                    forward,
+                    name: name.to_owned(),
+                },
+            ));
+        };
+        add(&t.name, true);
+        if let Some(reverse) = t.reverse_name.as_deref().filter(|_| t.directed) {
+            add(reverse, false);
+        }
+    }
+    items
+}
+
+/// Tasks a link from `eye` can reach: its own workspace's, not itself.
+pub fn link_target_items(scene: &Scene, eye: usize, shown: impl Fn(usize) -> bool) -> Vec<Item> {
+    let column = scene.clusters[scene.eyes[eye].cluster].column;
+    task_items(scene, None, |e| {
+        e != eye && shown(e) && scene.clusters[scene.eyes[e].cluster].column == column
+    })
+}
+
+/// The links touching `eye`, for removing one.
+pub fn unlink_items(scene: &Scene, eye: usize) -> Vec<Item> {
+    scene
+        .threads
+        .iter()
+        .filter_map(|t| {
+            let (name, other) = match (t.from == eye, t.to == eye) {
+                (true, _) => (&t.name, t.to),
+                (_, true) => (&t.reverse, t.from),
+                _ => return None,
+            };
+            let task = &scene.eyes[other].task;
+            Some(Item::new(
+                format!("{name}  {}  {}", task.reference, task.fields.title),
+                "Remove this link".into(),
+                "",
+                Pick::Unlink(t.relation),
+            ))
+        })
+        .collect()
+}
+
 pub fn placeholder(mode: Mode) -> &'static str {
     match mode {
         Mode::Commands => "Type a command, project, or workspace",
         Mode::Find => "Find a task by title, reference, label, stage, or person",
         Mode::Follow(Dir::Out) => "Follow which link?",
         Mode::Follow(Dir::In) => "Follow which incoming link?",
+        Mode::Stage => "Move to which stage?",
+        Mode::Assignee => "Assign to whom?",
+        Mode::Priority => "Which priority?",
+        Mode::LinkType => "What kind of link?",
+        Mode::LinkTarget => "Link to which task?",
+        Mode::Unlink => "Remove which link?",
+        Mode::Members => "Change whose roles?",
+        Mode::MemberRoles => "Give or take which role?",
     }
 }
 
@@ -264,8 +464,12 @@ pub fn view(
             .text_color(t.muted)
             .child(match picker.mode {
                 Mode::Commands => "No command matches.",
-                Mode::Find => "No task matches.",
-                Mode::Follow(_) => "No link matches.",
+                Mode::Find | Mode::LinkTarget => "No task matches.",
+                Mode::Follow(_) | Mode::Unlink | Mode::LinkType => "No link matches.",
+                Mode::Stage => "No stage matches.",
+                Mode::Assignee | Mode::Members => "Nobody matches.",
+                Mode::MemberRoles => "No role matches.",
+                Mode::Priority => "No priority matches.",
             })
     });
     div()

@@ -4,6 +4,7 @@ use hyakume_core::api::{
     CreateProject, CreateRelation, CreateRelationType, CreateRole, CreateTask, Layout,
     ProjectSnapshot, Role, SetMemberRoles, TaskDetail, UpdateTask, WorkspaceSummary,
 };
+use hyakume_core::export::LocalExport;
 use hyakume_core::ids::{IdentityId, ProjectId, RelationId, TaskId};
 use hyakume_core::model::{
     Comment, Identity, Project, Relation, RelationType, Task, TaskRef, Workspace,
@@ -12,6 +13,9 @@ use hyakume_core::permission::Access;
 use hyakume_storage::Store;
 
 use crate::ClientError;
+
+/// Shared work lives on its server, which every device already reaches.
+const SHARED_STAYS: &str = "only local work moves by file; shared work stays on its server";
 use crate::remote::Remote;
 
 pub struct OpenWorkspace {
@@ -201,6 +205,27 @@ impl OpenWorkspace {
         match &self.backend {
             Backend::Local { store, me } => Ok(store.layout(me.id, self.workspace.id).await?),
             Backend::Remote(remote) => remote.layout(self.workspace.id).await,
+        }
+    }
+
+    /// All of local work and its positions, to carry to another computer.
+    pub async fn export(&self) -> Result<LocalExport, ClientError> {
+        match &self.backend {
+            Backend::Local { store, me } => {
+                Ok(store.export_workspace(self.workspace.id, me.id).await?)
+            }
+            Backend::Remote(_) => Err(ClientError::Invalid(SHARED_STAYS.into())),
+        }
+    }
+
+    /// Puts an export in local work's place. Fails if local work has
+    /// projects, unless `replace` says they may go.
+    pub async fn import(&self, export: &LocalExport, replace: bool) -> Result<(), ClientError> {
+        match &self.backend {
+            Backend::Local { store, me } => Ok(store
+                .import_workspace(self.workspace.id, me.id, export, replace)
+                .await?),
+            Backend::Remote(_) => Err(ClientError::Invalid(SHARED_STAYS.into())),
         }
     }
 

@@ -7,6 +7,7 @@ use hyakume_core::api::{
     CreateProject, CreateRelation, CreateRelationType, CreateRole, CreateTask, ProjectSnapshot,
     Role, SetMemberRoles, UpdateTask, WorkspaceSummary,
 };
+use hyakume_core::export::LocalExport;
 use hyakume_core::ids::IdentityId;
 use hyakume_core::model::{
     Priority, Project, RelationType, Stage, TaskFields, TaskRef, name_key, relation_endpoints,
@@ -28,6 +29,7 @@ pub async fn run(cli: Cli) -> Result<(), ClientError> {
         Command::Server(command) => server(&mut client, command, &out),
         Command::Auth(command) => auth(&mut client, command, &out).await,
         Command::Workspace(command) => workspace(&mut client, command, &out).await,
+        Command::Local(command) => local(&client, cli.workspace.as_deref(), command, &out).await,
         command => {
             let ws = client.open(cli.workspace.as_deref()).await?;
             let summary = ws.summary().await?;
@@ -349,6 +351,127 @@ fn parse_date(s: &str) -> Result<Date, ClientError> {
         .map_err(|_| ClientError::Invalid(format!("{s:?} is not a date like 2026-11-01")))
 }
 
+/// Local work by file. `--workspace` doesn't apply: only local work moves
+/// this way, since shared work already lives on a server every device reaches.
+async fn local(
+    client: &Client,
+    selector: Option<&str>,
+    command: LocalCommand,
+    out: &Output,
+) -> Result<(), ClientError> {
+    if selector.is_some_and(|s| s != hyakume_client::LOCAL) {
+        return Err(ClientError::Invalid(
+            "only local work moves by file; shared work stays on its server".into(),
+        ));
+    }
+    let ws = client.open_local().await?;
+    match command {
+        LocalCommand::Export { file } => {
+            let export = ws.export().await?;
+            let body = serde_json::to_vec_pretty(&export)
+                .map_err(|e| ClientError::Internal(format!("encoding the export: {e}")))?;
+            write_private(&file, &body)?;
+            let counts = json!({
+                "file": file,
+                "projects": export.projects.len(),
+                "tasks": export.task_count(),
+                "comments": export.comment_count(),
+            });
+            out.show(&counts, || {
+                format!("Exported {} to {}", contents(&export), file.display())
+            });
+        }
+        LocalCommand::Import { file, replace, yes } => {
+            let body = std::fs::read(&file)
+                .map_err(|e| ClientError::Invalid(format!("reading {}: {e}", file.display())))?;
+            let export = read_export(&file, &body)?;
+            let here = ws.summary().await?.projects;
+            if !here.is_empty() {
+                if !replace {
+                    return Err(ClientError::Invalid(format!(
+                        "local work already has {} projects. Imports never merge: \
+                         add --replace to put the file's work in their place",
+                        here.len()
+                    )));
+                }
+                let keys: Vec<String> = here.iter().map(|p| p.key.to_string()).collect();
+                confirm(
+                    &format!(
+                        "Delete local projects {} and everything in them, then import {}?",
+                        keys.join(", "),
+                        file.display()
+                    ),
+                    yes,
+                )?;
+            }
+            ws.import(&export, replace).await?;
+            let counts = json!({
+                "projects": export.projects.len(),
+                "tasks": export.task_count(),
+                "comments": export.comment_count(),
+            });
+            out.show(&counts, || format!("Imported {}", contents(&export)));
+        }
+    }
+    Ok(())
+}
+
+/// The format number first: a file from a newer version should say so,
+/// not fail on whichever new field serde trips over.
+fn read_export(file: &std::path::Path, body: &[u8]) -> Result<LocalExport, ClientError> {
+    #[derive(serde::Deserialize)]
+    struct Format {
+        format: u32,
+    }
+    let not_export = |e: serde_json::Error| {
+        ClientError::Invalid(format!("{} isn't a Hyakume export: {e}", file.display()))
+    };
+    let Format { format } = serde_json::from_slice(body).map_err(not_export)?;
+    if format != hyakume_core::export::FORMAT {
+        return Err(ClientError::Invalid(format!(
+            "{} is export format {format}, and this version reads only {}",
+            file.display(),
+            hyakume_core::export::FORMAT
+        )));
+    }
+    serde_json::from_slice(body).map_err(not_export)
+}
+
+/// "2 projects, 1 task, and 3 comments".
+fn contents(export: &LocalExport) -> String {
+    let count = |n: usize, one: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {one}s"),
+    };
+    format!(
+        "{}, {}, and {}",
+        count(export.projects.len(), "project"),
+        count(export.task_count(), "task"),
+        count(export.comment_count(), "comment")
+    )
+}
+
+/// The export is someone's own work, so other users on the machine
+/// shouldn't be able to read it. `mode` only applies to a new file, so one
+/// being overwritten is made private too, before anything goes in it.
+fn write_private(path: &std::path::Path, body: &[u8]) -> Result<(), ClientError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let failed =
+        |e: std::io::Error| ClientError::Invalid(format!("writing {}: {e}", path.display()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(failed)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(failed)?;
+    file.write_all(body).map_err(failed)?;
+    file.sync_all().map_err(failed)
+}
+
 /// Destructive commands ask on a terminal and require `--yes` otherwise.
 fn confirm(question: &str, yes: bool) -> Result<(), ClientError> {
     if yes {
@@ -518,7 +641,7 @@ async fn work(ctx: &Ctx, command: Command) -> Result<(), ClientError> {
                 format!("{identity} now has roles: {}", names.join(", "))
             });
         }
-        Command::Server(_) | Command::Auth(_) | Command::Workspace(_) => {
+        Command::Server(_) | Command::Auth(_) | Command::Workspace(_) | Command::Local(_) => {
             unreachable!("handled before opening a workspace")
         }
     }

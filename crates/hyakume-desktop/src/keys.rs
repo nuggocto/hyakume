@@ -1,7 +1,7 @@
-//! Every shortcut: the built-in table, plus `keys.toml` on top for anyone who
-//! wants their own. Hints read GPUI's live keymap, so remapped keys show up.
-//! Contexts: `Hyakume` is the whole window, `Canvas` the canvas while it has
-//! focus, `Picker` the palette, `TextInput` any text field.
+//! Every shortcut: the built-in table, then `keys.toml` on top, with hints
+//! read from GPUI's live keymap. Contexts: `Hyakume` is the window, `Canvas`
+//! the focused canvas, `Picker` the palette, `Form` a form or dialog, and
+//! `TextInput` any text field.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -42,6 +42,28 @@ actions!(
         Open,
         FollowOut,
         FollowIn,
+        EditTask,
+        NewTask,
+        MoveToStage,
+        AssignTask,
+        SetPriority,
+        LinkTask,
+        UnlinkTask,
+        CommentOnTask,
+        TogglePin,
+        DeleteTask,
+        SetRoles,
+        NudgeLeft,
+        NudgeRight,
+        NudgeUp,
+        NudgeDown,
+        NewRelationType,
+        NewRole,
+        SaveForm,
+        CancelForm,
+        FormEnter,
+        FormUp,
+        FormDown,
         PickerUp,
         PickerDown,
         PickerConfirm,
@@ -76,17 +98,25 @@ enum Section {
     Window,
     Canvas,
     Palette,
+    Form,
     Text,
 }
 
 impl Section {
-    const ALL: [Self; 4] = [Self::Window, Self::Canvas, Self::Palette, Self::Text];
+    const ALL: [Self; 5] = [
+        Self::Window,
+        Self::Canvas,
+        Self::Palette,
+        Self::Form,
+        Self::Text,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             Self::Window => "window",
             Self::Canvas => "canvas",
             Self::Palette => "palette",
+            Self::Form => "form",
             Self::Text => "text",
         }
     }
@@ -96,6 +126,7 @@ impl Section {
             Self::Window => "Hyakume",
             Self::Canvas => "Canvas",
             Self::Palette => "Picker",
+            Self::Form => "Form",
             Self::Text => "TextInput",
         }
     }
@@ -107,6 +138,7 @@ impl Section {
         let path: &[&str] = match self {
             Self::Window | Self::Canvas => &["Hyakume", "Canvas"],
             Self::Palette | Self::Text => &["Hyakume", "Picker", "TextInput"],
+            Self::Form => &["Hyakume", "Form", "TextInput"],
         };
         path.iter()
             .map(|c| KeyContext::parse(c).expect("contexts are plain identifiers"))
@@ -142,6 +174,28 @@ fn actions() -> Vec<(Section, Box<dyn Action>)> {
         (Window, Box::new(Open)),
         (Window, Box::new(FollowOut)),
         (Window, Box::new(FollowIn)),
+        (Window, Box::new(EditTask)),
+        (Window, Box::new(NewTask)),
+        (Window, Box::new(MoveToStage)),
+        (Window, Box::new(AssignTask)),
+        (Window, Box::new(SetPriority)),
+        (Window, Box::new(LinkTask)),
+        (Window, Box::new(UnlinkTask)),
+        (Window, Box::new(CommentOnTask)),
+        (Window, Box::new(TogglePin)),
+        (Window, Box::new(DeleteTask)),
+        (Window, Box::new(SetRoles)),
+        (Window, Box::new(NewRelationType)),
+        (Window, Box::new(NewRole)),
+        (Canvas, Box::new(NudgeLeft)),
+        (Canvas, Box::new(NudgeRight)),
+        (Canvas, Box::new(NudgeUp)),
+        (Canvas, Box::new(NudgeDown)),
+        (Form, Box::new(SaveForm)),
+        (Form, Box::new(CancelForm)),
+        (Form, Box::new(FormEnter)),
+        (Form, Box::new(FormUp)),
+        (Form, Box::new(FormDown)),
         (Canvas, Box::new(MoveLeft)),
         (Canvas, Box::new(MoveRight)),
         (Canvas, Box::new(MoveUp)),
@@ -185,6 +239,7 @@ pub fn bindings() -> Vec<KeyBinding> {
     let window = Some("Hyakume");
     let canvas = Some("Canvas");
     let picker = Some("Picker");
+    let form = Some("Form");
     let input = Some("TextInput");
     vec![
         KeyBinding::new("ctrl-shift-p", OpenPalette, window),
@@ -209,6 +264,23 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", Open, canvas),
         KeyBinding::new("o", FollowOut, canvas),
         KeyBinding::new("i", FollowIn, canvas),
+        KeyBinding::new("e", EditTask, canvas),
+        KeyBinding::new("n", NewTask, canvas),
+        KeyBinding::new("m", MoveToStage, canvas),
+        KeyBinding::new("a", AssignTask, canvas),
+        KeyBinding::new("l", LinkTask, canvas),
+        KeyBinding::new("c", CommentOnTask, canvas),
+        KeyBinding::new("p", TogglePin, canvas),
+        KeyBinding::new("delete", DeleteTask, canvas),
+        KeyBinding::new("alt-left", NudgeLeft, canvas),
+        KeyBinding::new("alt-right", NudgeRight, canvas),
+        KeyBinding::new("alt-up", NudgeUp, canvas),
+        KeyBinding::new("alt-down", NudgeDown, canvas),
+        KeyBinding::new("ctrl-enter", SaveForm, form),
+        KeyBinding::new("escape", CancelForm, form),
+        KeyBinding::new("enter", FormEnter, form),
+        KeyBinding::new("up", FormUp, form),
+        KeyBinding::new("down", FormDown, form),
         KeyBinding::new("shift-tab", PickerUp, picker),
         KeyBinding::new("tab", PickerDown, picker),
         KeyBinding::new("up", PickerUp, picker),
@@ -284,7 +356,7 @@ pub fn parse(text: &str) -> Custom {
         };
         let Some(section) = Section::ALL.into_iter().find(|s| s.name() == name) else {
             custom.problems.push(format!(
-                "[{name}] isn't a section; use [window], [canvas], [palette], or [text]"
+                "[{name}] isn't a section; use [window], [canvas], [palette], [form], or [text]"
             ));
             continue;
         };
@@ -439,6 +511,7 @@ fn hint_in(keymap: &Keymap, action: &dyn Action) -> Option<String> {
 fn key_name(key: &str) -> String {
     match key {
         "escape" => "Esc".into(),
+        "delete" => "Del".into(),
         "enter" => "Enter".into(),
         "tab" => "Tab".into(),
         "space" => "Space".into(),
@@ -472,6 +545,8 @@ pub fn canvas_hint(cx: &App) -> String {
         parts.push(format!("{} move", moves.join(" ")));
     }
     parts.extend(h(&Open).map(|k| format!("{k} opens")));
+    parts.extend(h(&EditTask).map(|k| format!("{k} edits")));
+    parts.extend(h(&NewTask).map(|k| format!("{k} adds a task")));
     if !follow.is_empty() {
         parts.push(format!("{} follow links", follow.join(" / ")));
     }

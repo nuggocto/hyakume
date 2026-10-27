@@ -2,6 +2,7 @@
 //! the same queries; permission checks happen in the caller, not here.
 
 mod access;
+mod cache;
 mod convert;
 mod layout;
 mod watch;
@@ -14,6 +15,7 @@ use hyakume_core::model::{Task, ValidationError};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{SqlitePool, migrate::Migrator};
 
+pub use cache::Cache;
 pub use watch::ChangeWatcher;
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/work");
@@ -29,19 +31,7 @@ impl Store {
     /// A failed migration returns an error, so callers never run against an
     /// older or partially upgraded schema.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            // NORMAL is durable across application crashes in WAL mode; only
-            // an OS crash or power loss can drop the last commits.
-            .synchronous(SqliteSynchronous::Normal)
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(options)
-            .await?;
+        let pool = pool(path, 8).await?;
         MIGRATOR.run(&pool).await?;
         Ok(Self { pool })
     }
@@ -56,6 +46,23 @@ impl Store {
     async fn write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StoreError> {
         Ok(self.pool.begin_with("BEGIN IMMEDIATE").await?)
     }
+}
+
+/// One pool per database file, set up the same way for every kind.
+async fn pool(path: &Path, connections: u32) -> Result<SqlitePool, StoreError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        // NORMAL is durable across application crashes in WAL mode; only
+        // an OS crash or power loss can drop the last commits.
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+    Ok(SqlitePoolOptions::new()
+        .max_connections(connections)
+        .connect_with(options)
+        .await?)
 }
 
 #[derive(Debug, thiserror::Error)]

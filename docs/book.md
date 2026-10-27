@@ -171,8 +171,8 @@ OpenWorkspace
 └── Remote(Remote)         → /v1 over reqwest, events over tokio-tungstenite
 ```
 
-A **profile** is a data directory (`client.toml`, `local.db`, and with the
-dev-file store, `credentials/`). `HYAKUME_DATA_DIR` picks one, which is how
+A **profile** is a data directory (`client.toml`, `local.db`, `cache.db`
+for offline copies, and with the dev-file store, `credentials/`). `HYAKUME_DATA_DIR` picks one, which is how
 Alice and Bob run side by side. Credentials go to the OS keyring. If it's
 unreachable, sign-in fails with an explanation and writes nothing.
 
@@ -215,11 +215,13 @@ crates/hyakume-desktop/src/
     ├── scene.rs                 # what to draw, rebuilt per update (no GPUI)
     ├── layout.rs                # where it goes; positions stick (no GPUI)
     ├── app.rs                   # root view: state, input, header, notes
+    ├── app/writes.rs            # every change the window sends, and its answer
+    ├── edit.rs                  # drafts: task form, conflict review, dialogs
     ├── canvas.rs                # camera, painting, hit testing, label placement
     ├── glyphs.rs                # eyes, webs, threads, text
     ├── inspector.rs             # the side panel for one task
     ├── keys.rs, picker.rs       # shortcuts, the palette
-    ├── text_input.rs            # a one-line text field
+    ├── text_input.rs            # a text field, one line or several
     └── meme.rs, theme.rs        # Meme, light and dark palettes
 ```
 
@@ -234,9 +236,11 @@ executor ([D8](decisions.md#d8-a-tokio-thread-and-a-painted-canvas-2026-10-25)).
  GPUI main thread                       hyakume-io thread (Tokio)
 ┌──────────────────┐   Command        ┌─────────────────────────────┐
 │ Hyakume (app.rs) │━━━━━━━━━━━━━━━━━▶│  ├─ run_local  ─→ local.db  │
-│  Scene, Layout,  │  Retry, Detail   │  ├─ run_server a ─→ :7878   │
-│  camera, focus   │◀━━━━━━━━━━━━━━━━━│  └─ run_server b ─→ :7879   │
-└──────────────────┘   Update         └─────────────────────────────┘
+│  Scene, Layout,  │  Retry, Detail,  │  ├─ run_server a ─→ :7878   │
+│  camera, focus   │  Write, Layout   │  ├─ run_server b ─→ :7879   │
+│                  │◀━━━━━━━━━━━━━━━━━│  └─ cache.db (offline copy) │
+└──────────────────┘  Source, Wrote,  └─────────────────────────────┘
+                      Notice
 ```
 
 Each server loop subscribes, waits for `subscribed`, and only then loads.
@@ -387,8 +391,10 @@ nearest(from, arrow, candidates)
   best inside the 45° cone wins; nothing in the cone → best anywhere ahead
 ```
 
-Escape steps back one level per press: details, then the selection, then the
-opened project, then the cursor. The palette (Ctrl+Shift+P) lists the commands
+Escape steps back one level per press: an open edit form, then the details
+together with their task (as clicking that task again does), then the opened
+project, then the cursor. A task picked with the arrows and no details open
+is let go on its own press. The palette (Ctrl+Shift+P) lists the commands
 that apply right now, with their shortcuts, plus every project and workspace.
 Find (Ctrl+F) uses the same list for tasks, fading the ones that don't match
 until you pick one or press Escape.
@@ -460,6 +466,263 @@ hint(action)
     what would GPUI run for these keys where focus usually is? → action? show it
 ```
 
+### Changing work
+
+Step 8 made the window more than a viewer. Every change goes the same way:
+the window sends a `Write` with a request number, the I/O thread runs it
+through the same `OpenWorkspace` and `Remote` calls the CLI uses, and an
+`Update::Wrote` comes back with that number
+([D18](decisions.md#d18-the-window-edits-through-the-clis-calls-2026-10-26)).
+
+```diagram
+key or click ──▶ check: source live? role allows it? ──no──▶ notice, nothing sent
+                    │ yes
+                    ▼
+     pending[request] = what it was for (draft kept)
+                    │  Command::Write
+                    ▼
+     I/O thread: update_task / create_task / add_comment / create_relation …
+                    │  Update::Wrote { request, result }
+                    ▼
+  Ok(task)        → put it on screen now; the change event refetches the rest
+  Conflict(latest)→ review: latest and draft side by side
+  Failed(why)     → the form shows why, and keeps the draft
+```
+
+**What you can do, and with which keys.** All of it also works from the
+palette and, for the mouse, from buttons under a task's title.
+
+```text
+E  edit the task in the side panel     Ctrl+Enter saves, Esc cancels
+N  new task in the project you're in   Enter in a one-line field saves too
+M  move to a stage   A  assign   (palette: priority)
+L  link: pick how it reads ("blocks", "blocked by"), then the other task
+C  comment           (palette: remove a link)
+P  pin or unpin      Alt+arrows nudge the selected eye (or a web on the overview)
+Del  delete the task, after a question   Ctrl+Enter deletes, Esc keeps it
+(palette: change someone's roles in a shared workspace)
+```
+
+**Deleting asks first.** Del opens a small dialog naming the task and
+saying its links and comments go too, with no undo. Escape keeps the task,
+since a stray key shouldn't cost work; Ctrl+Enter or the Delete button
+deletes it. The task leaves the screen when the server answers, not before,
+along with its links and any draft or comment box open on it.
+
+**Roles from the palette.** "Change someone's roles in a / Acme" lists the
+people with the roles each holds, then every role marked where they have it.
+Picking one gives it, or takes it if they had it:
+
+```text
+palette ─▶ Change someone's roles in a / Acme
+        ─▶ Bob         Member
+        ─▶ Reviewer    (Member shows "Has it · Enter takes it")
+        ─▶ SetRoles { bob, [Member, Reviewer] }  ─▶ "Gave Bob the Reviewer role"
+```
+
+The server takes the whole set, so the window sends the roles the person
+had when last loaded, plus or minus the one picked. Two admins changing
+the same person's roles at the same moment could undo each other's pick;
+the change event right after shows what stuck. Local work has no roles.
+
+The form takes its stage, assignee, and priority from the palette instead of
+drop-downs, since the palette is already searchable and keyboard-driven.
+Picked while the form is on screen, they change the draft; otherwise the
+change saves straight away against the version on screen. A draft left open
+on another task (you moved on with Find, say) waits there untouched, so a
+quick change never lands in a form you can't see. Enter adds a line in a
+description or comment, and submits from any one-line field.
+
+Whenever the form puts the caret in its title, the panel scrolls back to
+the top first. It may still be scrolled down to the comment box, and typing
+into a title nobody can see would change it unnoticed.
+
+**Typing while a save is on its way.** The form stays editable while it
+saves, so the answer can find it changed. Each pending write keeps what it
+sent, and the answer compares:
+
+```text
+answer to a save from the form
+  form still holds exactly what was sent ─▶ close it
+  form was typed into since             ─▶ keep it open, now based on
+                                            the version just saved
+  refused, someone saved first          ─▶ review shows the form as it is now,
+                                            and "Keep editing" brings back that
+                                            same form, not the copy that was sent
+```
+
+A new task works the same way: if the form changed while it was being
+created, it turns into an edit of the new task with the extra text still in
+it. Comments follow the same rule: a posted comment clears its box only if
+the box still holds what was sent. Until the answer comes, a second
+Ctrl+Enter on the same text does nothing, so a double press can't post it
+twice. The answer reloads the comments only if that task is still open:
+reloading another one would replace the request of the task open now, which
+would then be stuck on "Loading comments…". A dialog's answer only touches the dialog
+that sent it; if that one was cancelled and another opened, the newer
+dialog is left alone and the result shows as a notice.
+
+**Labels go one per line.** A label may contain a comma ("design,
+research"), but never a newline, since the server refuses control
+characters in labels. So the labels field is a small multiline field with
+one label per line, and saving any other field hands back exactly the
+labels it was given.
+
+**Conflicts.** A save names the version it started from. If someone saved in
+between, the server refuses it as a whole and sends the task as it is now.
+The review shows both, marks the fields that differ, and stacks them in a
+narrow window. "Keep editing my draft" puts the draft back in the form,
+now based on the latest version, so the next save goes through unless
+someone beats it again. Escape does the same: losing a draft takes a
+deliberate click on "Discard my draft".
+
+**Read-only.** A source that isn't live is read-only: the panel says
+"Offline, read-only", the shortcuts explain why instead of acting, and a
+draft already open keeps its text and shows why it can't save. A role that
+can only view gets a "Read-only" chip and no edit buttons. The server
+checks permissions again either way; the window just doesn't offer what
+would be refused.
+
+**The multiline field.** `text_input.rs` grew a multiline mode for
+descriptions, labels, and comments. GPUI's `shape_text` splits the text at
+newlines and wraps each paragraph to the field's width. The field keeps
+where each paragraph starts in the text and on screen, which is all that
+clicks, the caret, Up and Down, selection bands, and the input method need.
+It shows a set number of rows (six, three for labels) and scrolls to keep
+the caret in view.
+
+### Placing things by hand
+
+Inside a project, dragging an eye moves it on its web. On the overview a
+plain drag always pans, since webs cover most of it; Ctrl+drag picks up the
+web or eye under the pointer and moves it. The first plain drag that starts
+on a web says so in a notice. Either way the node is pinned, which a small
+dot on its upper left shows, and Re-layout places everything else again
+around it.
+
+```text
+drag / Alt+arrows / P ─▶ Layout.move_* (pins) ─▶ SaveLayout ─▶ server or local.db
+                                                                  │
+other device ◀── LayoutChanged event ◀────────────────────────────┘
+     └─ refetch layout ─▶ apply_saved: a node it hasn't applied yet moves
+```
+
+Positions are personal. A server project's are stored on that server under
+your identity, so they follow you to your other devices and nobody else
+sees them. Local projects' stay in local.db, and move to another computer
+with the rest of local work (see [Moving local work](#moving-local-work)).
+
+A saved position comes back to the device that saved it, and an older
+one can still be on its way when it does: a refresh fetched just before
+the save landed, or the echo of the previous nudge. Two rules keep those
+from dragging the eye back. Saves to one source go one at a time, in the
+order they were made, and whatever piles up during a save goes out as one
+batch with only the latest spot per node. The layout also remembers what
+it last sent per node, and until that exact value comes back, any other
+saved value for the node is older and is skipped:
+
+```text
+Alt+← ×3 ─▶ sent[WEB-1] = third spot
+               │
+               ▼
+queue for server a ─▶ first spot ─▶ (second + third, batched) ─▶ third spot
+               │
+echo of the first spot  ─▶ ≠ sent ─▶ skipped, it's older
+echo of the third spot  ━▶ = sent ━▶ applied, sent cleared
+                                      later moves from other devices land again
+```
+
+A save that fails clears its `sent` entry, since its echo will never come.
+
+Re-layout moves every node that isn't pinned, including ones saved
+unpinned with P, and saves where those went. Without that, a restart or
+another device would put them back where they were. A web also keeps room
+for its pinned eyes: one that lost most of its tasks shrinks no further
+than its furthest pinned eye, which would otherwise be pulled inward.
+
+A pinned web is never moved by placement either. Webs that aren't pinned
+are pushed down past it, a column grows to hold it where it was put, and
+widening a column for its names slides only the unpinned webs:
+
+```diff
+ place(column)
+   width = widest web, or the names
++          or a pinned web's x + radius + room
+   for each web, top to bottom
+-    push below the one above
++    pinned → stays exactly where it was put
++    else   → push below the one above, then below any pinned web it meets
+ widen(column)
+-  slide every web by half the growth
++  slide every unpinned web by half the growth
+```
+
+### Offline copies
+
+Each server's workspaces, layouts included, are written to `cache.db` after
+every load. On the next start that copy shows while the server connects,
+and stays up greyed and read-only if it doesn't answer
+([D19](decisions.md#d19-offline-copies-in-cachedb-2026-10-26)). The copy is
+keyed by server URL and signed-in identity, so renaming a server in
+client.toml or signing in as someone else never shows another person's
+copy. The key is read once, when a connection signs in, together with its
+token: if the CLI signs the same profile in as someone else while the app
+is connected, the app's data still goes under the identity it was fetched
+as.
+
+Comments are kept for the tasks you open. Each time the panel loads a
+task from a server, the answer is saved in `cache.db` next to the copy.
+Offline, the panel shows that saved answer with when it was saved:
+
+```text
+open a task ─▶ source live?  ─yes─▶ server ─▶ show it, save it under (key, task)
+                    │ no                 └─ unreachable ─┐
+                    ▼                                    ▼
+             saved answer for (key, task)? ─yes─▶ "Comments as of Oct 27, 12:38 AM …"
+                    │ no
+                    ▼
+             "Comments aren't available: a isn't connected"
+```
+
+Only reaching the server falls back; a refusal or a deleted task never
+shows the old copy. The same goes for the workspaces themselves: when the
+server says the session isn't valid, or the source fails for any reason
+other than not reaching the server, the copy leaves the screen and the
+column shows only "Not signed in" (or the error) and Retry. When the workspace copy is replaced, comments of tasks
+no longer in it go too, so lost access or a deletion leaves nothing behind.
+The window tells the I/O thread a source is offline, so it reads the copy
+straight away instead of waiting out a five-second connect timeout.
+
+### Moving local work
+
+Local work lives in local.db on one computer. `hyakume local export FILE`
+writes all of it to one JSON file: projects, stages, tasks, comments, link
+types, links, and your positions on its canvas. `hyakume local import FILE`
+on the other computer puts it there
+([D21](decisions.md#d21-local-work-moves-by-file-2026-10-27)).
+
+```diagram
+laptop                                   desktop
+local.db ──export──▶ work.json ━━carry━━▶ import ──▶ local.db
+                    (0600, format 1)        ┃
+                                            ┣━ ids kept: links and positions still match
+                                            ┣━ "me" in the file → this computer's "me"
+                                            ┗━ built-in link types → this computer's own
+```
+
+An import never merges. Into empty local work it just goes in. If local
+work has projects, it needs `--replace`, which asks first (or takes
+`--yes`) and deletes what's there. The whole import is one transaction: a
+file that breaks a rule, like a link to a task it doesn't hold, changes
+nothing. Every field goes through the same checks as a normal save, since
+a file is input like any other. A file from a newer format is refused by
+its format number before anything else is read. The desktop app sees an
+import like any other commit to local.db and redraws.
+
+The export file is the person's own work, so it's written 0600. Opening
+with that mode only sets it on a new file, so an export over an existing
+one also sets the mode on the open file before writing anything into it.
+
 ### Meme
 
 Meme is painted with `PathBuilder` from the mockup's geometry, not shipped as
@@ -481,7 +744,13 @@ drawings as a risk with no time left to save.
 - **CI** (`mise run ci`, also on GitHub Actions): formatting, Clippy with
   warnings denied, and every test. Tests cover behaviour that would really
   break: version conflicts, permission and event visibility, the change
-  watcher, stable layouts, arrow-key neighbours, keymap rules and hints, link
+  watcher, offline copies replaced per identity, offline comments pruned
+  with their task, local work carried whole between two databases (and
+  refused or rolled back whole), positions removed with
+  their task, pins surviving re-layout, synced positions applied once,
+  an older save's echo never undoing a newer move, pinned eyes kept in
+  place when their web shrinks, re-layout handing back what it moved,
+  label and due-date parsing, stable layouts, arrow-key neighbours, keymap rules and hints, link
   lighting and bundling, routing around text and inside columns, stub spacing,
   zoom anchoring, and thread ends meeting drawn outlines. Where it was
   practical, a new test was first shown to fail on the old code.
