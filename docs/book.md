@@ -788,6 +788,10 @@ drawings as a risk with no time left to save.
   lighting and bundling, routing around text and inside columns, stub spacing,
   zoom anchoring, and thread ends meeting drawn outlines. Where it was
   practical, a new test was first shown to fail on the old code.
+  GitHub keeps the build cache between runs, so a run takes about two
+  minutes instead of fifteen. The job removes every Rust toolchain except
+  the pinned one first: the cache key hashes all of them, and a new runner
+  image shipping a newer Rust used to empty the cache.
 - **The real app**, driven on a private X11 display (Xvfb, software Vulkan,
   xdotool) against copies of the demo on separate ports. This sends real
   pointer and key events, including key-ups, which GPUI keeps private from

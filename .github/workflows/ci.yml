@@ -30,8 +30,15 @@ jobs:
             pkg-config libfontconfig1-dev libfreetype-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev
 
+      # rust-cache hashes every installed toolchain into its key, so the
+      # runner image's own Rust going 1.99.0 to 1.99.1 threw the cache away.
+      # Keeping only the pinned one makes the key follow rust-toolchain.toml.
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          pinned=$(rustup show active-toolchain | cut -d' ' -f1)
+          rustup toolchain list --quiet | grep -vxF "$pinned" | xargs -r -n1 rustup toolchain uninstall
+          rustup toolchain list
 
       - uses: Swatinem/rust-cache@v2
 
