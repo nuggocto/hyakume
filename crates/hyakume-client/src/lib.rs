@@ -45,6 +45,19 @@ impl DataDir {
         &self.0
     }
 
+    /// Creates the directory owner-only. local.db and cache.db get the
+    /// umask's 0644, so the directory is what keeps other users out of
+    /// someone's work and their team's copies. An existing one is left as is.
+    pub fn create(&self) -> Result<(), ClientError> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.0)
+            .map_err(|e| ClientError::Config(format!("creating {}: {e}", self.0.display())))
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.0.join("client.toml")
     }
@@ -83,13 +96,12 @@ impl Client {
     }
 
     pub fn save_config(&self) -> Result<(), ClientError> {
+        self.data.create()?;
         self.config.save(&self.data.config_file())
     }
 
     pub async fn open_local(&self) -> Result<OpenWorkspace, ClientError> {
-        std::fs::create_dir_all(self.data.path()).map_err(|e| {
-            ClientError::Config(format!("creating {}: {e}", self.data.path().display()))
-        })?;
+        self.data.create()?;
         let store = Store::open(&self.data.local_db()).await?;
         local::open(store).await
     }

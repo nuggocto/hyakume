@@ -314,7 +314,9 @@ server is unreachable shows that copy, greyed and read-only. A row that no
 longer parses after an upgrade is skipped and replaced by the next load.
 
 It's a separate file from local.db, so personal work and team copies never
-share a table, and deleting it only loses the copies.
+share a table, and deleting it only loses the copies. Both files take the
+umask's 0644, so Hyakume creates the data directory 0700: that's what keeps
+other users on the machine out. A directory that already exists keeps its mode.
 
 Update 2026-10-27: comments are kept for the tasks a person opened, one
 row per task with the server's whole answer, under the same key. Offline,

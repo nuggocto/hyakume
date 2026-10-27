@@ -162,7 +162,13 @@ async fn run(
         }
     };
     let backends = Backends::default();
-    let cache = match hyakume_storage::Cache::open(&client.data.cache_db()).await {
+    let opened = match client.data.create() {
+        Ok(()) => hyakume_storage::Cache::open(&client.data.cache_db())
+            .await
+            .map_err(|e| e.to_string()),
+        Err(err) => Err(err.to_string()),
+    };
+    let cache = match opened {
         Ok(cache) => Some(cache),
         Err(err) => {
             eprintln!("hyakume: no offline copies this run: {err}");

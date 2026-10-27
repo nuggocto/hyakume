@@ -665,7 +665,9 @@ and stays up greyed and read-only if it doesn't answer
 ([D19](decisions.md#d19-offline-copies-in-cachedb-2026-10-26)). The copy is
 keyed by server URL and signed-in identity, so renaming a server in
 client.toml or signing in as someone else never shows another person's
-copy. The key is read once, when a connection signs in, together with its
+copy. Like local.db, it lives in the data directory, which Hyakume creates
+owner-only (0700), so other users on the computer can't read the copies.
+The key is read once, when a connection signs in, together with its
 token: if the CLI signs the same profile in as someone else while the app
 is connected, the app's data still goes under the identity it was fetched
 as.
