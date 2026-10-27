@@ -45,17 +45,29 @@ impl DataDir {
         &self.0
     }
 
-    /// Creates the directory owner-only. local.db and cache.db get the
-    /// umask's 0644, so the directory is what keeps other users out of
-    /// someone's work and their team's copies. An existing one is left as is.
+    /// Makes the directory owner-only. local.db and cache.db get the umask's
+    /// 0644, so the directory is what keeps other users out of someone's work
+    /// and their team's copies. Older builds left it at the umask's 0755, so
+    /// an open directory you own gets tightened too.
     pub fn create(&self) -> Result<(), ClientError> {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
+        let failed = |e| ClientError::Config(format!("creating {}: {e}", self.0.display()));
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&self.0)
-            .map_err(|e| ClientError::Config(format!("creating {}: {e}", self.0.display())))
+            .map_err(failed)?;
+        let mode = std::fs::metadata(&self.0)
+            .map_err(failed)?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            // Only the owner may chmod. Someone else's directory isn't ours
+            // to change, and the files in it still open fine.
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
     }
 
     pub fn config_file(&self) -> PathBuf {

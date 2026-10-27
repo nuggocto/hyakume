@@ -316,7 +316,15 @@ longer parses after an upgrade is skipped and replaced by the next load.
 It's a separate file from local.db, so personal work and team copies never
 share a table, and deleting it only loses the copies. Both files take the
 umask's 0644, so Hyakume creates the data directory 0700: that's what keeps
-other users on the machine out. A directory that already exists keeps its mode.
+other users on the machine out.
+
+Update 2026-10-27: an existing directory used to keep its mode, which left
+profiles made by older builds at 0755. Now any directory with group or other
+access is set to 0700 on open. The chmod only works for the directory's
+owner, so someone else's directory is left as it is. Rejected: creating the
+database files 0600 as well. With the directory closed they add nothing, and
+SQLite makes the -wal and -shm files itself, so it would mean a process-wide
+umask change.
 
 Update 2026-10-27: comments are kept for the tasks a person opened, one
 row per task with the server's whole answer, under the same key. Offline,

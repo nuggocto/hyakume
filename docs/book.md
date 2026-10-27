@@ -665,8 +665,10 @@ and stays up greyed and read-only if it doesn't answer
 ([D19](decisions.md#d19-offline-copies-in-cachedb-2026-10-26)). The copy is
 keyed by server URL and signed-in identity, so renaming a server in
 client.toml or signing in as someone else never shows another person's
-copy. Like local.db, it lives in the data directory, which Hyakume creates
+copy. Like local.db, it lives in the data directory, which Hyakume keeps
 owner-only (0700), so other users on the computer can't read the copies.
+A new directory is created that way. One an older build left at 0755 is
+tightened the next time the profile opens, as long as you own it.
 The key is read once, when a connection signs in, together with its
 token: if the CLI signs the same profile in as someone else while the app
 is connected, the app's data still goes under the identity it was fetched
@@ -750,6 +752,7 @@ drawings as a risk with no time left to save.
   with their task, local work carried whole between two databases (and
   refused or rolled back whole), positions removed with
   their task, pins surviving re-layout, synced positions applied once,
+  a profile directory left open by an older build closed to 0700,
   an older save's echo never undoing a newer move, pinned eyes kept in
   place when their web shrinks, re-layout handing back what it moved,
   label and due-date parsing, stable layouts, arrow-key neighbours, keymap rules and hints, link
