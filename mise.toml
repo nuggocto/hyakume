@@ -102,6 +102,56 @@ description = "Run a hyakume command as Gwen, a guest who only sees WEB"
 quiet = true
 run = "cargo build -q --locked -p hyakume-cli && HYAKUME_DATA_DIR=dev/data/profiles/gwen ./target/debug/hyakume"
 
+[tasks.lan-servers]
+description = "Run both dev servers for another computer on the network until Ctrl+C, e.g. `mise run lan-servers 192.168.1.42`"
+shell = "bash -c"
+usage = 'arg "<peer>" help="Address of the other computer, the only one the firewall lets in"'
+run = '''
+set -e
+cargo build --locked -p hyakume-server -p hyakume-cli -p hyakume-desktop
+peer="$usage_peer"
+# Dev login lets anyone who reaches the ports sign in as anyone, so the
+# firewall opens them to the one test computer and closes them on exit.
+rule=(allow from "$peer" to any port 7878:7879 proto tcp)
+sudo ufw "${rule[@]}"
+trap 'kill $(jobs -p) 2>/dev/null; sudo ufw delete "${rule[@]}"' EXIT
+export HYAKUME_SERVER_DEV_ALLOW_REMOTE=true
+HYAKUME_SERVER_BIND=0.0.0.0:7878 ./target/debug/hyakume-server --config dev/server-a.toml &
+HYAKUME_SERVER_BIND=0.0.0.0:7879 ./target/debug/hyakume-server --config dev/server-b.toml &
+echo "On $peer, run: mise run lan-profile bob $(ip -4 route get "$peer" | grep -o 'src [0-9.]*' | cut -d' ' -f2)"
+# If either server stops (a port in use, a bad config), stop the other too.
+wait -n
+'''
+
+[tasks.lan-profile]
+description = "Sign a test person in to the dev servers on another computer, e.g. `mise run lan-profile bob 192.168.1.95`"
+usage = '''
+arg "<who>" help="alice, bob, or gwen" {
+  choices "alice" "bob" "gwen"
+}
+arg "[server]" help="Address of the computer running `mise run lan-servers`" default="127.0.0.1"
+'''
+run = '''
+set -e
+cargo build -q --locked -p hyakume-cli -p hyakume-desktop
+who="$usage_who"
+dir="dev/data/profiles/$who"
+rm -rf "$dir"
+mkdir -p "$dir"
+echo 'credential_store = "dev-file"' > "$dir/client.toml"
+as() { HYAKUME_DATA_DIR="$dir" ./target/debug/hyakume "$@"; }
+as server add a "http://$usage_server:7878"
+as auth dev-login "$who" --server a \
+  || { echo "Can't sign in. Is \`mise run lan-servers\` running on $usage_server?" >&2; exit 1; }
+# Gwen is a guest on server a only.
+if [ "$who" != gwen ]; then
+  as server add b "http://$usage_server:7879"
+  as auth dev-login "$who" --server b
+fi
+as workspace use a/acme
+echo "Ready. Open the app with: mise run $who"
+'''
+
 [tasks.reset]
 description = "Delete the dev server databases and profiles (stop `mise run servers` first)"
 run = "rm -rf dev/data"

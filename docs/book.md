@@ -196,6 +196,8 @@ mise run demo-setup    alice, bob, gwen profiles, signed in
 mise run demo-data     the mockup's tasks, plus the 150-task Scale workspace
 mise run alice         the app as Alice; `mise run alice -- task list` for the CLI
 mise run reset         delete dev/data (stop the servers first)
+mise run lan-servers   both servers for one other computer, firewall included
+mise run lan-profile   one person signed in to them, from this computer or that one
 ```
 
 Profiles use the `dev-file` credential store, so test sign-ins never touch the
@@ -206,6 +208,33 @@ Rust rather than a shell script so the repository stays one language and CI
 builds it. Its links follow fixed patterns rather than random picks, so every
 run builds the same workspace. It exists to check that a real team's
 tracker stays readable and fast.
+
+### On two computers
+
+The real test is a person on the laptop and another on the desktop, both
+talking to the same servers. The desktop runs them, and the laptop reaches
+them over the home network:
+
+```diagram
+laptop                                    desktop
+mise run lan-profile bob DESKTOP_IP       mise run lan-servers LAPTOP_IP
+mise run bob ━━━━━━━ :7878, :7879 ━━━━━━▶ server a, server b (0.0.0.0)
+                     ┃                    mise run lan-profile alice
+                     ┃                    mise run alice
+                     ┗━ ufw lets in LAPTOP_IP only, until Ctrl+C
+```
+
+`lan-servers` binds both servers to every interface. Dev mode refuses that
+on its own, so the task sets `HYAKUME_SERVER_DEV_ALLOW_REMOTE`. Dev login
+lets anyone who reaches the ports sign in as anyone, so the task also opens
+the firewall to the one address you give it and closes it again on exit.
+Closing the terminal skips that cleanup: `sudo ufw status numbered` shows a
+rule left behind.
+
+`lan-profile` replaces one profile in `dev/data/profiles` and signs it in
+to both servers (Gwen only to a, where she's a guest). The address defaults
+to 127.0.0.1, which is right on the desktop. Afterwards `mise run bob` opens
+the app as Bob, the same as in the one-computer demo.
 
 ## The desktop app
 
