@@ -30,3 +30,7 @@
 - Test actual implementation, do not duplicate logic into tests.
 - Before adding complexity for a speculative or vanishingly unlikely race or security edge case, explain the concrete failure mode, likelihood, and complexity cost to the user and get their buy-in. Do not silently expand scope for theoretical robustness.
 - Do not spawn sub-agents unless the current work or user request requires it.
+- Stop every server, app, and display you start before you finish. Never
+  detach them (`setsid`, `nohup`, `disown`) so they outlive your session. If
+  one stops while you work, including because the user stopped it, ask before
+  starting it again.
