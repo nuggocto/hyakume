@@ -212,6 +212,16 @@ async fn an_import_replaces_local_work_only_when_asked_and_never_half_way() {
     );
     assert_eq!(projects(desk.clone()).await, ["HOME"]);
 
+    // A task number with no next number after it is refused, not a crash.
+    let mut huge = export.clone();
+    huge.projects[0].tasks[0].number = i64::MAX;
+    let refused = desk.import_workspace(ws.id, me, &huge, true).await;
+    assert!(
+        matches!(refused, Err(StoreError::Invalid(_))),
+        "{refused:?}"
+    );
+    assert_eq!(projects(desk.clone()).await, ["HOME"]);
+
     desk.import_workspace(ws.id, me, &export, true)
         .await
         .unwrap();

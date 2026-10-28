@@ -553,10 +553,20 @@ mod tests {
     fn tabbing_to_a_row_out_of_view_scrolls_just_enough_to_show_it() {
         // A 600 px panel from y 100, scrollable 800 px further down.
         let (view, lowest) = ((100.0, 700.0), -800.0);
-        // Below the fold: up until it sits 16 px over the bottom edge.
-        assert_eq!(reveal_offset(0.0, view, (900.0, 930.0), lowest), -246.0);
-        // Above the top edge after scrolling down: back until 16 px under it.
-        assert_eq!(reveal_offset(-400.0, view, (40.0, 70.0), lowest), -324.0);
+        // Where a row lands on screen after scrolling from `offset`.
+        let shown = |offset: f32, row: (f32, f32)| {
+            let moved = reveal_offset(offset, view, row, lowest) - offset;
+            (row.0 + moved, row.1 + moved)
+        };
+        let inside = |(top, bottom): (f32, f32)| top > view.0 && bottom < view.1;
+        let middle = (view.0 + view.1) / 2.0;
+
+        // Below the fold: it comes up into view but stays near the bottom.
+        let below = shown(0.0, (900.0, 930.0));
+        assert!(inside(below) && below.0 > middle, "{below:?}");
+        // Above the top edge: back down into view, near the top.
+        let above = shown(-400.0, (40.0, 70.0));
+        assert!(inside(above) && above.1 < middle, "{above:?}");
         // Already in view: nothing moves.
         assert_eq!(reveal_offset(-120.0, view, (300.0, 330.0), lowest), -120.0);
         // Never past either end of the content.

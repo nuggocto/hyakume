@@ -304,6 +304,14 @@ and the palette already searches), a field-by-field merge on conflict
 the server answers (an edit the server refuses would have to be undone on
 screen).
 
+Update 2026-10-28, after review: one review at a time, never replaced. A
+quick change on a task whose save is still on its way is refused with
+"Still saving", since it could only conflict with that save. A refusal for
+another task while a review is open stays in its form if it came from one,
+or is named in a note once the review closes. Rejected: a queue of reviews
+(more state in the review flow for a case that needs a slow server and two
+people editing at once).
+
 ## D19. Offline copies in cache.db (2026-10-26)
 
 Each server's workspaces are stored as JSON in `cache.db`, one row per
@@ -378,6 +386,10 @@ Update 2026-10-27, after review:
 - Re-layout saves the new spots of nodes saved unpinned, and a web keeps
   room for its pinned eyes, so neither a restart nor a smaller web moves
   something it shouldn't.
+
+Update 2026-10-28: a drag saves wherever the button comes up, over the
+inspector, the header, or outside the window. A release the canvas never
+saw used to leave the node moved, unsaved, and deaf to other devices.
 
 
 ## D21. Local work moves by file (2026-10-27)

@@ -139,6 +139,9 @@ pub struct Hyakume {
     editor: Option<Editor>,
     /// A save someone else beat, shown for review.
     conflict: Option<Conflict>,
+    /// Quick changes that also lost while the review was open. The review
+    /// covers notes, so they're named once it closes.
+    unsaved: Vec<String>,
     dialog: Option<Dialog>,
     /// The comment box and the task it's for.
     composer: Option<(NodeKey, Entity<TextInput>)>,
@@ -274,6 +277,7 @@ impl Hyakume {
             hidden: None,
             editor: None,
             conflict: None,
+            unsaved: Vec::new(),
             dialog: None,
             composer: None,
             write_request: 0,
@@ -448,13 +452,18 @@ impl Hyakume {
 
     fn viewport(&self, window: &Window) -> Vec2 {
         let size = window.viewport_size();
-        let inspector = if self.inspector_open() {
+        // The new-task form takes the inspector's place, with or without a selection.
+        let creating = self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.target == Target::Create);
+        let panel = if self.inspector_open() || creating {
             inspector_width(f32::from(size.width))
         } else {
             0.0
         };
         Vec2::new(
-            f32::from(size.width) - inspector,
+            f32::from(size.width) - panel,
             f32::from(size.height) - HEADER_H,
         )
     }
@@ -891,7 +900,9 @@ impl Hyakume {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         // A release outside the window never reaches us; this ends that drag.
         if event.pressed_button != Some(MouseButton::Left) {
-            self.drag = None;
+            if let Some(drag) = self.drag.take() {
+                self.let_go(drag, cx);
+            }
             let hovered = match canvas::hit(&self.frame(), self.local(event.position)) {
                 Hit::Eye(eye) | Hit::Stub(eye) => Some(Spot::Eye(eye)),
                 // An opened project's own web would light everything.
@@ -943,32 +954,7 @@ impl Hyakume {
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.drag.take() else { return };
         if drag.moved {
-            // A moved eye or web stays pinned where it was let go, and saves.
-            let moved = match &drag.grab {
-                Some(Grab::Eye(key)) => self.scene.eye(key).map(|eye| {
-                    let at = self.placement.eyes[eye];
-                    let node = self.layout.move_eye(&self.scene, &self.placement, eye, at);
-                    (self.scene.eyes[eye].cluster, node)
-                }),
-                Some(Grab::Web(key, _)) => self.scene.cluster(key).map(|c| {
-                    let at = self.placement.clusters[c].0;
-                    (
-                        c,
-                        self.layout
-                            .move_cluster(&self.scene, &self.placement, c, at),
-                    )
-                }),
-                None => None,
-            };
-            if let Some((cluster, node)) = moved {
-                self.after_move(cluster, node);
-                cx.notify();
-            } else if drag.could_grab && !self.told_ctrl_drag {
-                // Once a session, for someone who tried to drag a web.
-                self.told_ctrl_drag = true;
-                self.note("Hold Ctrl while dragging to move a web");
-                cx.notify();
-            }
+            self.let_go(drag, cx);
             return;
         }
         match canvas::hit(&self.frame(), self.local(event.position)) {
@@ -995,6 +981,47 @@ impl Hyakume {
             }
         }
         cx.notify();
+    }
+
+    /// Let go over the inspector or the header: GPUI only sends the canvas a
+    /// release over itself. Not a click there, but a moved node still saves.
+    fn on_mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(drag) = self.drag.take() {
+            self.let_go(drag, cx);
+        }
+    }
+
+    /// Ends a drag wherever the button came up. A moved eye or web stays
+    /// pinned where it was let go and saves; until then it's only on screen.
+    fn let_go(&mut self, drag: Drag, cx: &mut Context<Self>) {
+        if !drag.moved {
+            return;
+        }
+        let moved = match &drag.grab {
+            Some(Grab::Eye(key)) => self.scene.eye(key).map(|eye| {
+                let at = self.placement.eyes[eye];
+                let node = self.layout.move_eye(&self.scene, &self.placement, eye, at);
+                (self.scene.eyes[eye].cluster, node)
+            }),
+            Some(Grab::Web(key, _)) => self.scene.cluster(key).map(|c| {
+                let at = self.placement.clusters[c].0;
+                (
+                    c,
+                    self.layout
+                        .move_cluster(&self.scene, &self.placement, c, at),
+                )
+            }),
+            None => None,
+        };
+        if let Some((cluster, node)) = moved {
+            self.after_move(cluster, node);
+            cx.notify();
+        } else if drag.could_grab && !self.told_ctrl_drag {
+            // Once a session, for someone who tried to drag a web.
+            self.told_ctrl_drag = true;
+            self.note("Hold Ctrl while dragging to move a web");
+            cx.notify();
+        }
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1793,6 +1820,7 @@ impl Render for Hyakume {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out))
             .on_hover(cx.listener(|this, inside: &bool, _, cx| {
                 if !inside && this.hovered.take().is_some() {
                     cx.notify();

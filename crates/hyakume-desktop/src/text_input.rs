@@ -395,25 +395,29 @@ impl TextInput {
     }
 
     /// Replaces `range` (or the composition, or the selection) with `text`.
-    /// Control characters never get in; newlines and tabs only into a
-    /// multiline field, the same rule the server holds descriptions to.
     fn splice(&mut self, range: Option<Range<usize>>, text: &str) -> Range<usize> {
         let range = range
             .or(self.marked.clone())
             .unwrap_or(self.selected.clone());
-        let multiline = self.multiline;
-        let text: String = text
-            .chars()
-            .map(|c| match c {
-                '\r' if multiline => '\n',
-                '\n' | '\t' | '\r' if !multiline => ' ',
-                c => c,
-            })
-            .filter(|&c| matches!(c, '\n' | '\t') || !is_unsafe_char(c))
-            .collect();
+        let text = clean(text, self.multiline);
         self.content.replace_range(range.clone(), &text);
         range.start..range.start + text.len()
     }
+}
+
+/// Control characters never get in; newlines and tabs only into a multiline
+/// field, the same rule the server holds descriptions to. Text pasted from
+/// Windows ends lines with \r\n, which is one line break, not two.
+fn clean(text: &str, multiline: bool) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .map(|c| match c {
+            '\r' if multiline => '\n',
+            '\n' | '\t' | '\r' if !multiline => ' ',
+            c => c,
+        })
+        .filter(|&c| matches!(c, '\n' | '\t') || !is_unsafe_char(c))
+        .collect()
 }
 
 impl EntityInputHandler for TextInput {
@@ -995,7 +999,18 @@ impl Element for Lines {
 
 #[cfg(test)]
 mod tests {
-    use super::follow_caret;
+    use super::{clean, follow_caret};
+
+    #[test]
+    fn pasted_line_breaks_stay_one_break_whatever_system_wrote_them() {
+        for text in ["first\r\nsecond", "first\nsecond", "first\rsecond"] {
+            assert_eq!(clean(text, true), "first\nsecond", "{text:?}");
+            assert_eq!(clean(text, false), "first second", "{text:?}");
+        }
+        // A tab survives only where newlines do; other control characters never.
+        assert_eq!(clean("a\tb\u{7}c", true), "a\tbc");
+        assert_eq!(clean("a\tb\u{7}c", false), "a bc");
+    }
 
     #[test]
     fn a_long_line_scrolls_to_keep_the_caret_in_the_field() {

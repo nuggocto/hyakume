@@ -260,7 +260,10 @@ async fn import_project(
     let key = project.key.as_str();
     // Numbers already used stay used, even if the file's counter says less.
     let highest = exported.tasks.iter().map(|t| t.number).max().unwrap_or(0);
-    let next = exported.next_task_number.max(highest + 1);
+    let next = highest
+        .checked_add(1)
+        .ok_or_else(|| StoreError::invalid(format!("a task in {key} has a number too large")))?
+        .max(exported.next_task_number);
     sqlx::query(
         "INSERT INTO projects (id, workspace_id, key, name, next_task_number, created_at) \
          VALUES (?, ?, ?, ?, ?, ?)",

@@ -3,6 +3,8 @@
 //! Each write goes to the I/O thread and comes back as `Update::Wrote`,
 //! matched by request number.
 
+use std::time::Duration;
+
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, FocusHandle, Hsla, MouseButton, MouseDownEvent,
     Window, div, prelude::*, px,
@@ -347,6 +349,13 @@ impl Hyakume {
             return;
         };
         let e = &self.scene.eyes[eye];
+        // Its version on screen is the one the save in flight replaces, so a
+        // second change now would only conflict with the first.
+        let saving = |p: &Pending| matches!(p, Pending::Save { key: Some(k), .. } if *k == e.key);
+        if self.pending.values().any(saving) {
+            self.note(format!("Still saving {}", e.task.reference));
+            return;
+        }
         let mut draft = e.task.fields.clone();
         change(&mut draft);
         if draft == e.task.fields {
@@ -671,6 +680,22 @@ impl Hyakume {
                     false => format!("Created {}", task.reference),
                 });
             }
+            // One review at a time, and it's never replaced: this draft waits
+            // in its form, or a note says it didn't save once the review closes.
+            (Pending::Save { label, .. }, Err(WriteError::Conflict(latest)))
+                if self.conflict.is_some() =>
+            {
+                self.patch_task(&source, &latest);
+                match &mut self.editor {
+                    Some(editor) if mine(editor.saving) => {
+                        editor.saving = None;
+                        editor.problem = Some(format!(
+                            "{label} changed meanwhile. Save again to review it"
+                        ));
+                    }
+                    _ => self.unsaved.push(label),
+                }
+            }
             (
                 Pending::Save {
                     place,
@@ -813,6 +838,13 @@ impl Hyakume {
         let Some(conflict) = self.conflict.take() else {
             return;
         };
+        if !self.unsaved.is_empty() {
+            let unsaved = std::mem::take(&mut self.unsaved).join(", ");
+            self.note_for(
+                format!("{unsaved} also changed meanwhile, so your change there wasn't saved"),
+                Duration::from_secs(10),
+            );
+        }
         match event {
             FormEvent::Discard => {
                 window.focus(&self.focus_handle);

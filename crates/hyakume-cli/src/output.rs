@@ -89,6 +89,7 @@ pub struct ProjectContext<'a> {
     members: HashMap<IdentityId, &'a str>,
     /// Reference, title, and finished state for own and linked tasks.
     tasks: HashMap<TaskId, (&'a str, &'a str, bool)>,
+    blocked_by: HashMap<TaskId, Vec<TaskId>>,
 }
 
 impl<'a> ProjectContext<'a> {
@@ -111,9 +112,20 @@ impl<'a> ProjectContext<'a> {
                 (stub.reference.as_str(), stub.title.as_str(), stub.finished),
             );
         }
+        let blocked_by = summary
+            .relation_types
+            .iter()
+            .find(|t| t.builtin == Some(BuiltinRelation::Blocks))
+            .map(|blocks| {
+                unfinished_blockers(&snapshot.relations, blocks.id, |id| {
+                    tasks.get(&id).map(|(_, _, done)| *done)
+                })
+            })
+            .unwrap_or_default();
         Self {
             summary,
             snapshot,
+            blocked_by,
             members: summary
                 .members
                 .iter()
@@ -133,26 +145,17 @@ impl<'a> ProjectContext<'a> {
             .stages
             .iter()
             .find(|s| s.id == task.fields.stage_id);
-        let blocks = self
-            .summary
-            .relation_types
-            .iter()
-            .find(|t| t.builtin == Some(BuiltinRelation::Blocks));
-        let blocked_by = match blocks {
-            Some(blocks) => {
-                unfinished_blockers(task.id, &self.snapshot.relations, blocks.id, |id| {
-                    self.tasks.get(&id).map(|(_, _, done)| *done)
-                })
-                .into_iter()
-                .map(|id| {
-                    self.tasks
-                        .get(&id)
-                        .map_or_else(|| id.to_string(), |t| t.0.to_owned())
-                })
-                .collect()
-            }
-            None => Vec::new(),
-        };
+        let blocked_by = self
+            .blocked_by
+            .get(&task.id)
+            .into_iter()
+            .flatten()
+            .map(|id| {
+                self.tasks
+                    .get(id)
+                    .map_or_else(|| id.to_string(), |t| t.0.to_owned())
+            })
+            .collect();
         TaskView {
             task: task.clone(),
             project: self.snapshot.project.key.to_string(),

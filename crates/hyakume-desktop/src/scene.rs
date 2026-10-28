@@ -237,9 +237,11 @@ impl Scene {
             .map(|t| t.id);
         let mut blocked: Vec<(usize, Vec<Blocker>)> = Vec::new();
         if let Some(blocks_type) = blocks_type {
+            let mut found = unfinished_blockers(&relations, blocks_type, is_finished);
             for i in first_eye..self.eyes.len() {
-                let found =
-                    unfinished_blockers(self.eyes[i].task.id, &relations, blocks_type, is_finished);
+                let Some(found) = found.remove(&self.eyes[i].task.id) else {
+                    continue;
+                };
                 let blockers: Vec<Blocker> = found
                     .into_iter()
                     .map(|id| match by_task.get(&id) {

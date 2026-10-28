@@ -605,6 +605,24 @@ now based on the latest version, so the next save goes through unless
 someone beats it again. Escape does the same: losing a draft takes a
 deliberate click on "Discard my draft".
 
+Only one review shows at a time, and a second refusal never replaces it.
+A quick change saves against the version on screen, so a second one on the
+same task before the first is answered would only conflict with the first.
+The window says "Still saving WEB-1" instead of sending it. Refusals for
+other tasks can still arrive while a review is open:
+
+```text
+refused while a review is open
+  it came from the form   ─▶ form keeps its text: "changed meanwhile.
+                              Save again to review it"
+  it was a quick change   ─▶ held, then named once the review closes:
+                              "WEB-4 also changed meanwhile, so your
+                               change there wasn't saved"
+```
+
+The note waits for the review because the review covers notes, and a
+three-second note behind it would never be read.
+
 **Read-only.** A source that isn't live is read-only: the panel says
 "Offline, read-only", the shortcuts explain why instead of acting, and a
 draft already open keeps its text and shows why it can't save. A role that
@@ -618,7 +636,9 @@ newlines and wraps each paragraph to the field's width. The field keeps
 where each paragraph starts in the text and on screen, which is all that
 clicks, the caret, Up and Down, selection bands, and the input method need.
 It shows a set number of rows (six, three for labels) and scrolls to keep
-the caret in view.
+the caret in view. Text pasted from Windows ends lines with `\r\n`, which
+counts as one line break: turning each `\r` into a newline on its own gave
+every pasted line a blank one after it.
 
 ### Placing things by hand
 
@@ -635,6 +655,14 @@ drag / Alt+arrows / P ─▶ Layout.move_* (pins) ─▶ SaveLayout ─▶ serve
 other device ◀── LayoutChanged event ◀────────────────────────────┘
      └─ refetch layout ─▶ apply_saved: a node it hasn't applied yet moves
 ```
+
+A drag ends wherever the button comes up. Released over the inspector or
+the header, it still saves: GPUI only tells the canvas about a release over
+itself, so the canvas also listens for one outside (`on_mouse_up_out`).
+Released outside the window, it saves on the next pointer move with no
+button held. Before, either case left the node moved on screen, never
+saved, and marked as waiting for its own echo, so even moves from other
+devices skipped it.
 
 Positions are personal. A server project's are stored on that server under
 your identity, so they follow you to your other devices and nobody else
@@ -752,6 +780,10 @@ a file is input like any other. A file from a newer format is refused by
 its format number before anything else is read. The desktop app sees an
 import like any other commit to local.db and redraws.
 
+A file is checked before anything goes in, and that includes task numbers:
+one so large there's no number after it is refused as invalid instead of
+overflowing when the project's next number is worked out.
+
 The export file is the person's own work, so it's written 0600. Opening
 with that mode only sets it on a new file, so an export over an existing
 one also sets the mode on the open file before writing anything into it.
@@ -772,6 +804,20 @@ frames 25 ms ([D16](decisions.md#d16-libraries-optimized-in-debug-builds-2026-10
 Labels and routes are computed fresh each frame. Caching them would add stale
 drawings as a risk with no time left to save.
 
+The scene is rebuilt on every change from a source. Finding each task's
+unfinished blockers used to scan every link once per task, which is fine at
+150 tasks and quadratic at the 10,000 PROJECT.md aims for. Now one pass over
+the links builds a map from task to blockers, and the CLI uses the same map.
+`Scene::build` with 10,000 tasks in a chain of 9,990 "blocks" links, median
+of 15 optimized runs:
+
+```text
+             before    after
+150 tasks    0.08 ms   0.13 ms   (noise at this size)
+10,000       66 ms     5 ms
+10,000, 0 links: 2 ms either way
+```
+
 ## How it's checked
 
 - **CI** (`mise run ci`, also on GitHub Actions): formatting, Clippy with
@@ -782,6 +828,8 @@ drawings as a risk with no time left to save.
   refused or rolled back whole), positions removed with
   their task, pins surviving re-layout, synced positions applied once,
   a profile directory left open by an older build closed to 0700,
+  pasted Windows line breaks kept single, an import with an impossible
+  task number refused,
   an older save's echo never undoing a newer move, pinned eyes kept in
   place when their web shrinks, re-layout handing back what it moved,
   label and due-date parsing, stable layouts, arrow-key neighbours, keymap rules and hints, link
